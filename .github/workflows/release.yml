@@ -85,12 +85,19 @@ jobs:
             CHANNEL=stable
           fi
 
+          # One-line summary for the "update available" row in the UI. Comes from
+          # the annotated tag so it is written deliberately when cutting a
+          # release, rather than improvised from a commit subject.
+          SUMMARY=$(git tag -l --format='%(contents:subject)' "v${VERSION}" 2>/dev/null || true)
+          [ -n "$SUMMARY" ] || SUMMARY="Apollo ${VERSION}"
+
           {
             echo "version=$VERSION"
             echo "channel=$CHANNEL"
             echo "tag=v${VERSION}"          # derived, never the raw ref
             echo "tarball=apollo-${VERSION}-aarch64.tar.zst"
             echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "summary=$SUMMARY"
           } >> "$GITHUB_OUTPUT"
           echo "Building $VERSION on channel $CHANNEL"
 
@@ -195,6 +202,7 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
           TARBALL: ${{ steps.meta.outputs.tarball }}
           BUILD_TIME: ${{ steps.meta.outputs.build_time }}
+          SUMMARY: ${{ steps.meta.outputs.summary }}
           SHA: ${{ steps.pack.outputs.sha256 }}
           SIZE: ${{ steps.pack.outputs.size }}
           SERVER_URL: ${{ github.server_url }}
@@ -221,13 +229,21 @@ jobs:
             --arg workflow_ref "$WORKFLOW_REF" \
             --arg git_sha "$GITHUB_SHA" \
             --arg build_time "$BUILD_TIME" \
+            --arg summary "$SUMMARY" \
+            --arg notes_url "${SERVER_URL}/${REPOSITORY}/releases/tag/${TAG}" \
             '{version: $version, channel: $channel, sha256: $sha256, size: $size,
               min_from_version: $min_from, url: $url, signature_url: $sig,
               certificate_url: $cert,
+              summary: $summary, notes_url: $notes_url,
               signing_identity: {issuer: $issuer, repository: $repository,
                                  workflow_ref: $workflow_ref},
               git_sha: $git_sha, build_time: $build_time}' \
             > "apollo-${VERSION}-manifest.json"
+
+          # The channel manifest is what a device actually polls. The per-version
+          # file above is useless for discovery: you must already know the version
+          # to fetch it. Same content, published at a stable well-known URL.
+          cp "apollo-${VERSION}-manifest.json" "${CHANNEL}.json"
 
           cat "apollo-${VERSION}-manifest.json"
 
@@ -263,3 +279,26 @@ jobs:
             --target "${GITHUB_SHA}" \
             "$TARBALL" "${TARBALL}.sig" "${TARBALL}.pem" \
             "apollo-${VERSION}-manifest.json"
+
+      - name: Point the channel at this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          # What a device actually polls. A release under a fixed tag gives the
+          # channel manifest a URL that never changes, so the device asks one
+          # well-known address instead of having to discover releases first.
+          # If hosting later moves to updates.futurebit.io, that is a config
+          # change on the device — the pipeline keeps publishing here.
+          POINTER="channel-${CHANNEL}"
+
+          if ! gh release view "$POINTER" >/dev/null 2>&1; then
+            gh release create "$POINTER" --prerelease \
+              --title "Channel: ${CHANNEL}" \
+              --notes "Moving pointer to the latest ${CHANNEL} build. Not a release: the assets here are replaced on every build."
+          fi
+
+          gh release upload "$POINTER" "${CHANNEL}.json" --clobber
+          echo "channel manifest now points at ${VERSION}"
