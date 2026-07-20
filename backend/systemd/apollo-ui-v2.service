@@ -12,13 +12,19 @@ Environment=PATH=/usr/local/nvm/versions/node/v21.6.2/bin:/usr/local/sbin:/usr/l
 # `next start`, which needs the full node_modules tree beside it. The standalone
 # bundle is ~73 MB against ~700 MB of node_modules, and needs no build step.
 #
+# WorkingDirectory stays on the UI root and NOT on .next/standalone: the updater
+# does `rm -rf .next` before rebuilding, and systemd cannot chdir into a directory
+# that no longer exists — a failed build would leave this unit active on a deleted
+# working directory and unable to restart. server.js does process.chdir(__dirname)
+# itself, so it finds its own files either way.
+#
 # HOSTNAME is set explicitly on purpose: server.js binds to `process.env.HOSTNAME
 # || '0.0.0.0'`, and on Linux that variable is often already the machine name — in
 # which case the UI would bind to the loopback and vanish from the LAN.
-WorkingDirectory=/opt/apolloapi/apolloui-v2/.next/standalone
+WorkingDirectory=/opt/apolloapi/apolloui-v2
 Environment=HOSTNAME=0.0.0.0
 Environment=PORT=3000
-ExecStart=/usr/local/nvm/versions/node/v21.6.2/bin/node server.js
+ExecStart=/usr/local/nvm/versions/node/v21.6.2/bin/node .next/standalone/server.js
 Restart=always
 SyslogIdentifier=ApolloUIv2
 

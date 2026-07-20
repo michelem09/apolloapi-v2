@@ -18,6 +18,10 @@ permissions:
   contents: write   # create the Release and upload assets
   id-token: write   # OIDC token for cosign keyless signing
 
+env:
+  # The one place that decides what counts as an official build.
+  OFFICIAL_OWNER: jstefanop
+
 jobs:
   release:
     runs-on: ubuntu-24.04-arm
@@ -32,9 +36,10 @@ jobs:
         # .gitmodules stays pinned to the upstream repo so a fork URL is never
         # proposed upstream. Overriding it locally makes the build work unchanged
         # on a fork and on the official repo.
+        env:
+          OWNER: ${{ github.repository_owner }}
         run: |
-          git config submodule.apolloui-v2.url \
-            "https://github.com/${{ github.repository_owner }}/apolloui-v2.git"
+          git config submodule.apolloui-v2.url "https://github.com/${OWNER}/apolloui-v2.git"
           git submodule update --init --depth 1
           git -C apolloui-v2 log --oneline -1
 
@@ -42,48 +47,80 @@ jobs:
         with:
           node-version-file: .nvmrc   # must match the device ABI for sqlite3
 
-      - name: Derive version and channel
+      - name: Derive version, channel and tag
         id: meta
+        # Every value below is read from env, never interpolated into the script
+        # body: `${{ }}` is substituted textually before bash parses the line, and
+        # git happily allows backticks, `$`, `;` and quotes in a tag name.
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
+          set -Eeuo pipefail
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
           else
-            VERSION="${GITHUB_REF_NAME#v}"
+            VERSION="${REF_NAME#v}"
+          fi
+
+          # Strict gate. Everything downstream — shell, JSON, the tag we publish
+          # to — is derived from VERSION, so validating it once here is what makes
+          # the rest safe, and a malformed tag fails the build instead of running.
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$'; then
+            echo "refusing version '$VERSION' — expected 1.2.3 or 1.2.3-rc1" >&2
+            exit 1
           fi
 
           # Artifacts built anywhere other than the official repo are always 'dev'.
-          # A fork's cosign identity differs, so a fork build must never be able to
-          # present itself as something a production device would accept.
-          if [ "${{ github.repository_owner }}" != "jstefanop" ]; then
+          # A fork signs with a different keyless identity, so this keeps a fork
+          # build from presenting itself as something a production device accepts.
+          if [ "$OWNER" != "$OFFICIAL_OWNER" ]; then
             CHANNEL=dev
-          elif printf '%s' "$VERSION" | grep -qE '(-rc|-beta)'; then
+          elif printf '%s' "$VERSION" | grep -qiE '(-rc|-beta|-alpha)'; then
             CHANNEL=beta
           else
             CHANNEL=stable
           fi
 
-          echo "version=$VERSION"   >> "$GITHUB_OUTPUT"
-          echo "channel=$CHANNEL"   >> "$GITHUB_OUTPUT"
-          echo "tarball=apollo-${VERSION}-aarch64.tar.zst" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "channel=$CHANNEL"
+            echo "tag=v${VERSION}"          # derived, never the raw ref
+            echo "tarball=apollo-${VERSION}-aarch64.tar.zst"
+            echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
           echo "Building $VERSION on channel $CHANNEL"
 
-      - name: Backend production dependencies
-        run: yarn install --frozen-lockfile --production
+      - name: Install dependencies
+        run: |
+          yarn install --frozen-lockfile
+          yarn --cwd apolloui-v2 install --frozen-lockfile --ignore-engines
+
+      - name: Test
+        # A signature attests provenance, not that the code works. Refusing to
+        # publish a failing build is the only thing standing between a bad commit
+        # and a signed artifact the fleet would happily install.
+        run: |
+          yarn test
+          yarn --cwd apolloui-v2 test
 
       - name: Build the UI
-        working-directory: apolloui-v2
-        run: |
-          yarn install --frozen-lockfile --ignore-engines
-          yarn build
-          # standalone ships neither of these; without them the UI serves no assets
-          cp -r .next/static .next/standalone/.next/static
-          cp -r public .next/standalone/public
+        # postbuild (scripts/assemble-standalone.sh) folds in .next/static, public
+        # and the .env symlink.
+        run: yarn --cwd apolloui-v2 build
+
+      - name: Prune to production dependencies
+        run: yarn install --frozen-lockfile --production
 
       - name: Stage the release tree
         id: stage
         env:
           VERSION: ${{ steps.meta.outputs.version }}
           CHANNEL: ${{ steps.meta.outputs.channel }}
+          BUILD_TIME: ${{ steps.meta.outputs.build_time }}
         run: |
           set -Eeuo pipefail
           STAGE="$RUNNER_TEMP/stage"
@@ -91,10 +128,13 @@ jobs:
 
           cp -r src config migrations knexfile.js package.json node_modules "$STAGE/"
 
-          # Only the assembled UI bundle travels, not the build tree or its devDeps.
-          cp -r apolloui-v2/.next/standalone/. "$STAGE/apolloui-v2/"
-          cp -r apolloui-v2/.next/static        "$STAGE/apolloui-v2/.next/static"
-          cp -r apolloui-v2/public              "$STAGE/apolloui-v2/public"
+          # Keep the nesting: apollo-ui-v2.service runs
+          # `node .next/standalone/server.js` relative to the UI root, and
+          # OTA_UPDATE_REDESIGN.md §2.3 documents this same layout. Flattening it
+          # here would leave the unit looking for a server.js that is one level up.
+          # static/ and public/ already live inside standalone (postbuild), so
+          # copying them again would nest them a second time.
+          cp -r apolloui-v2/.next/standalone "$STAGE/apolloui-v2/.next/standalone"
 
           # backend/ carries the launch scripts, systemd units and the small
           # miner/ckpool binaries. bitcoind (backend/node/bin, ~214 MB across four
@@ -103,18 +143,19 @@ jobs:
           mkdir -p "$STAGE/backend"
           tar -C backend --exclude='node/bin' -cf - . | tar -C "$STAGE/backend" -xf -
 
-          # These arrive with steps 4 and 5; include them once they exist.
+          # These arrive with steps 4 and 5; included automatically once they exist.
           [ -f bin/apollo-update ] && install -Dm755 bin/apollo-update "$STAGE/bin/apollo-update" || true
           [ -f bootstrap.sh ]      && install -Dm755 bootstrap.sh      "$STAGE/bootstrap.sh"      || true
 
-          cat > "$STAGE/version.json" <<JSON
-          {
-            "version": "${VERSION}",
-            "git_sha": "${GITHUB_SHA}",
-            "build_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "channel": "${CHANNEL}"
-          }
-          JSON
+          # jq, not a heredoc: routing values through env: protects against shell
+          # metacharacters but not against a quote landing inside a JSON string.
+          jq -n \
+            --arg version "$VERSION" \
+            --arg git_sha "$GITHUB_SHA" \
+            --arg build_time "$BUILD_TIME" \
+            --arg channel "$CHANNEL" \
+            '{version: $version, git_sha: $git_sha, build_time: $build_time, channel: $channel}' \
+            > "$STAGE/version.json"
 
           echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
           du -sh "$STAGE"
@@ -151,30 +192,43 @@ jobs:
         env:
           VERSION: ${{ steps.meta.outputs.version }}
           CHANNEL: ${{ steps.meta.outputs.channel }}
+          TAG: ${{ steps.meta.outputs.tag }}
           TARBALL: ${{ steps.meta.outputs.tarball }}
+          BUILD_TIME: ${{ steps.meta.outputs.build_time }}
           SHA: ${{ steps.pack.outputs.sha256 }}
           SIZE: ${{ steps.pack.outputs.size }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
-          BASE="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}"
-          cat > "apollo-${VERSION}-manifest.json" <<JSON
-          {
-            "version": "${VERSION}",
-            "channel": "${CHANNEL}",
-            "sha256": "${SHA}",
-            "size": ${SIZE},
-            "min_from_version": "2.1.0",
-            "url": "${BASE}/${TARBALL}",
-            "signature_url": "${BASE}/${TARBALL}.sig",
-            "certificate_url": "${BASE}/${TARBALL}.pem",
-            "signing_identity": {
-              "issuer": "https://token.actions.githubusercontent.com",
-              "repository": "${{ github.repository }}",
-              "workflow_ref": "${{ github.workflow_ref }}"
-            },
-            "git_sha": "${GITHUB_SHA}",
-            "build_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          JSON
+          set -Eeuo pipefail
+          # Built from the derived TAG, which is also what the release is published
+          # to — using the raw ref here made manual dispatch emit a manifest whose
+          # URLs pointed at a tag that was never created.
+          BASE="${SERVER_URL}/${REPOSITORY}/releases/download/${TAG}"
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg channel "$CHANNEL" \
+            --arg sha256 "$SHA" \
+            --argjson size "$SIZE" \
+            --arg min_from "2.1.0" \
+            --arg url "${BASE}/${TARBALL}" \
+            --arg sig "${BASE}/${TARBALL}.sig" \
+            --arg cert "${BASE}/${TARBALL}.pem" \
+            --arg issuer "https://token.actions.githubusercontent.com" \
+            --arg repository "$REPOSITORY" \
+            --arg workflow_ref "$WORKFLOW_REF" \
+            --arg git_sha "$GITHUB_SHA" \
+            --arg build_time "$BUILD_TIME" \
+            '{version: $version, channel: $channel, sha256: $sha256, size: $size,
+              min_from_version: $min_from, url: $url, signature_url: $sig,
+              certificate_url: $cert,
+              signing_identity: {issuer: $issuer, repository: $repository,
+                                 workflow_ref: $workflow_ref},
+              git_sha: $git_sha, build_time: $build_time}' \
+            > "apollo-${VERSION}-manifest.json"
+
           cat "apollo-${VERSION}-manifest.json"
 
       - name: Publish the Release
@@ -182,16 +236,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.meta.outputs.version }}
           CHANNEL: ${{ steps.meta.outputs.channel }}
+          TAG: ${{ steps.meta.outputs.tag }}
           TARBALL: ${{ steps.meta.outputs.tarball }}
+          SHA: ${{ steps.pack.outputs.sha256 }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -Eeuo pipefail
-          TAG="${{ github.ref_name }}"
-          [ "${{ github.event_name }}" = "workflow_dispatch" ] && TAG="v${VERSION}"
 
           NOTES=$(mktemp)
           {
-            printf 'Channel: `%s` · sha256 `%s`\n\n' "$CHANNEL" "${{ steps.pack.outputs.sha256 }}"
-            printf 'Signed with cosign keyless, bound to `%s`.\n' "${{ github.repository }}"
+            printf 'Channel: `%s` · sha256 `%s`\n\n' "$CHANNEL" "$SHA"
+            printf 'Signed with cosign keyless, bound to `%s`.\n' "$REPOSITORY"
             if [ "$CHANNEL" = "dev" ]; then
               printf '\n> **Development build.** Built outside the official repository, so its\n'
               printf '> signing identity differs and production devices reject it by design.\n'

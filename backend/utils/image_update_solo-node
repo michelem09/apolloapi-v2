@@ -79,11 +79,6 @@ echo -e "${YELLOW} ---> Building UI (could take a few minutes)${NC}"
 rm -rf .next
 yarn build
 
-# `next build` with output: 'standalone' emits a self-contained server but does
-# NOT copy these two into it; without them the UI serves HTML and no assets.
-# The release tarball will do the same assembly — until then the device does it.
-cp -r .next/static .next/standalone/.next/static
-cp -r public .next/standalone/public
 yarn cache clean
 
 chown -R futurebit:futurebit "$APOLLO_DIR"
