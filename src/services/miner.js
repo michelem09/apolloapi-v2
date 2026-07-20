@@ -4,7 +4,7 @@ const { exec } = require('child_process');
 const _ = require('lodash');
 const moment = require('moment');
 const { GraphQLError } = require('graphql');
-const { getMinerRuntimeDir } = require('../paths');
+const { getMinerRuntimeDir, getCkpoolLogsDir } = require('../paths');
 
 // Import the dev miner service for development mode
 const devMinerService =
@@ -248,10 +248,7 @@ class MinerService {
   // Reset the block found flag
   async resetBlockFoundFlag() {
     try {
-      const blockFoundFlagFile = path.resolve(
-        __dirname,
-        '../../backend/ckpool/logs/BLOCKFOUND.log'
-      );
+      const blockFoundFlagFile = path.join(getCkpoolLogsDir(), 'BLOCKFOUND.log');
 
       try {
         // Check if file exists before attempting to delete it
@@ -516,26 +513,14 @@ class MinerService {
 
         try {
           if (settings?.nodeEnableSoloMining) {
-            const ckpoolPoolStatsFile = path.resolve(
-              __dirname,
-              '../../backend/ckpool/logs/pool/pool.status'
-            );
+            const ckpoolPoolStatsFile = path.join(getCkpoolLogsDir(), 'pool/pool.status');
 
-            const ckpoolUsersStatsDir = path.resolve(
-              __dirname,
-              '../../backend/ckpool/logs/users/'
-            );
+            const ckpoolUsersStatsDir = path.join(getCkpoolLogsDir(), 'users/');
 
             // Check for block found in ckpool log
-            const ckpoolLogFile = path.resolve(
-              __dirname,
-              '../../backend/ckpool/logs/ckpool.log'
-            );
+            const ckpoolLogFile = path.join(getCkpoolLogsDir(), 'ckpool.log');
 
-            const blockFoundFlagFile = path.resolve(
-              __dirname,
-              '../../backend/ckpool/logs/BLOCKFOUND.log'
-            );
+            const blockFoundFlagFile = path.join(getCkpoolLogsDir(), 'BLOCKFOUND.log');
 
             try {
               // Check if block found flag exists

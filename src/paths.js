@@ -53,6 +53,18 @@ function moveFile(from, to) {
   }
 }
 
+// Same as moveFile but for a directory tree: copyFileSync cannot handle one, so
+// the cross-filesystem fallback has to recurse.
+function moveDir(from, to) {
+  try {
+    fs.renameSync(from, to);
+  } catch (err) {
+    if (err.code !== 'EXDEV') throw err;
+    fs.cpSync(from, to, { recursive: true });
+    fs.rmSync(from, { recursive: true, force: true });
+  }
+}
+
 function rewriteEnvDatabaseUrl(envPath, dbUrl) {
   let contents = '';
   try {
@@ -125,15 +137,51 @@ function ensureMinerRuntimeDir({ legacyDir = getLegacyMinerDir() } = {}) {
   }
 }
 
+// ckpool writes its logs, pool status and per-user stats here. They are runtime
+// state, so they live outside the checkout like everything else.
+function getCkpoolRuntimeDir(stateDir = getStateDir()) {
+  return path.join(stateDir, 'ckpool');
+}
+
+function getCkpoolLogsDir(stateDir = getStateDir()) {
+  return path.join(getCkpoolRuntimeDir(stateDir), 'logs');
+}
+
+function getLegacyCkpoolLogsDir() {
+  return path.join(__dirname, '..', 'backend', 'ckpool', 'logs');
+}
+
+// Create the ckpool logs dir and, on first boot after an upgrade, move the
+// existing logs out of the checkout. Worth moving rather than starting fresh:
+// `users/` holds each worker's cumulative stats (best share ever), and
+// BLOCKFOUND.log is the found-block marker the UI reads. Idempotent; no-op in dev.
+function ensureCkpoolRuntimeDir({ legacyDir = getLegacyCkpoolLogsDir() } = {}) {
+  if (!isManagedStateDir()) return;
+  const logsDir = getCkpoolLogsDir();
+  if (fs.existsSync(logsDir)) {
+    return; // already relocated
+  }
+  fs.mkdirSync(path.dirname(logsDir), { recursive: true, mode: 0o700 });
+  if (fs.existsSync(legacyDir)) {
+    moveDir(legacyDir, logsDir);
+  } else {
+    fs.mkdirSync(logsDir, { recursive: true, mode: 0o700 });
+  }
+}
+
 module.exports = {
   getStateDir,
   getDbPath,
   getMinerRuntimeDir,
+  getCkpoolRuntimeDir,
+  getCkpoolLogsDir,
   getLegacyDbPath,
   getLegacyMinerDir,
+  getLegacyCkpoolLogsDir,
   isManagedStateDir,
   defaultEnvPath,
   defaultDatabaseUrl,
   ensureDbLocation,
   ensureMinerRuntimeDir,
+  ensureCkpoolRuntimeDir,
 };

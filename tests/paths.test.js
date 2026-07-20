@@ -145,6 +145,83 @@ describe('ensureDbLocation', () => {
   });
 });
 
+describe('ensureCkpoolRuntimeDir', () => {
+  function managedCkpool() {
+    const stateDir = path.join(tmpRoot, 'state');
+    process.env.APOLLO_STATE_DIR = stateDir;
+    const legacyDir = path.join(tmpRoot, 'checkout', 'backend', 'ckpool', 'logs');
+    fs.mkdirSync(path.join(legacyDir, 'users'), { recursive: true });
+    fs.mkdirSync(path.join(legacyDir, 'pool'), { recursive: true });
+    return { logsDir: path.join(stateDir, 'ckpool', 'logs'), legacyDir };
+  }
+
+  it('is a no-op in development', () => {
+    delete process.env.APOLLO_STATE_DIR;
+    process.env.NODE_ENV = 'development';
+    const legacyDir = path.join(tmpRoot, 'checkout');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, 'ckpool.log'), 'LOG');
+
+    paths.ensureCkpoolRuntimeDir({ legacyDir });
+
+    expect(fs.readFileSync(path.join(legacyDir, 'ckpool.log'), 'utf8')).toBe('LOG');
+  });
+
+  it('moves the whole logs tree out of the checkout, keeping user stats', () => {
+    const { logsDir, legacyDir } = managedCkpool();
+    // users/ holds each worker's cumulative best-share history; BLOCKFOUND.log
+    // is the found-block marker the UI reads. Both must survive.
+    fs.writeFileSync(path.join(legacyDir, 'users', 'bc1qexample'), '{"bestever":439761}');
+    fs.writeFileSync(path.join(legacyDir, 'pool', 'pool.status'), '{"runtime":1}');
+    fs.writeFileSync(path.join(legacyDir, 'BLOCKFOUND.log'), 'found');
+
+    paths.ensureCkpoolRuntimeDir({ legacyDir });
+
+    expect(fs.readFileSync(path.join(logsDir, 'users', 'bc1qexample'), 'utf8')).toContain(
+      '439761'
+    );
+    expect(fs.existsSync(path.join(logsDir, 'pool', 'pool.status'))).toBe(true);
+    expect(fs.existsSync(path.join(logsDir, 'BLOCKFOUND.log'))).toBe(true);
+    expect(fs.existsSync(legacyDir)).toBe(false);
+  });
+
+  it('creates an empty logs dir when there is nothing to migrate', () => {
+    const stateDir = path.join(tmpRoot, 'state');
+    process.env.APOLLO_STATE_DIR = stateDir;
+
+    paths.ensureCkpoolRuntimeDir({ legacyDir: path.join(tmpRoot, 'absent') });
+
+    expect(fs.existsSync(path.join(stateDir, 'ckpool', 'logs'))).toBe(true);
+  });
+
+  it('does not re-migrate once the logs already live in the state dir', () => {
+    const { logsDir, legacyDir } = managedCkpool();
+    fs.mkdirSync(logsDir, { recursive: true });
+    fs.writeFileSync(path.join(logsDir, 'ckpool.log'), 'CURRENT');
+    fs.writeFileSync(path.join(legacyDir, 'ckpool.log'), 'STALE');
+
+    paths.ensureCkpoolRuntimeDir({ legacyDir });
+
+    expect(fs.readFileSync(path.join(logsDir, 'ckpool.log'), 'utf8')).toBe('CURRENT');
+  });
+
+  it('falls back to a recursive copy when rename crosses filesystems', () => {
+    const { logsDir, legacyDir } = managedCkpool();
+    fs.writeFileSync(path.join(legacyDir, 'users', 'worker'), 'STATS');
+
+    jest.spyOn(fs, 'renameSync').mockImplementationOnce(() => {
+      const err = new Error('cross-device link');
+      err.code = 'EXDEV';
+      throw err;
+    });
+
+    paths.ensureCkpoolRuntimeDir({ legacyDir });
+
+    expect(fs.readFileSync(path.join(logsDir, 'users', 'worker'), 'utf8')).toBe('STATS');
+    expect(fs.existsSync(legacyDir)).toBe(false);
+  });
+});
+
 describe('ensureMinerRuntimeDir', () => {
   function managedMiner() {
     const stateDir = path.join(tmpRoot, 'state');

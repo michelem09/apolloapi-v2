@@ -2,6 +2,7 @@ const { exec } = require('child_process');
 const { GraphQLError } = require('graphql');
 const fs = require('fs').promises;
 const path = require('path');
+const { getCkpoolLogsDir } = require('../paths');
 
 // Import the dev solo service for development mode
 const devSoloService =
@@ -189,26 +190,14 @@ class SoloService {
     // Helper method to get ckpool stats
   async _getCkpoolStats() {
     try {
-      const ckpoolPoolStatsFile = path.resolve(
-        __dirname,
-        '../../backend/ckpool/logs/pool/pool.status'
-      );
+      const ckpoolPoolStatsFile = path.join(getCkpoolLogsDir(), 'pool/pool.status');
 
-      const ckpoolUsersStatsDir = path.resolve(
-        __dirname,
-        '../../backend/ckpool/logs/users/'
-      );
+      const ckpoolUsersStatsDir = path.join(getCkpoolLogsDir(), 'users/');
 
       // Check for block found in ckpool log
-      const ckpoolLogFile = path.resolve(
-        __dirname,
-        '../../backend/ckpool/logs/ckpool.log'
-      );
+      const ckpoolLogFile = path.join(getCkpoolLogsDir(), 'ckpool.log');
 
-      const blockFoundFlagFile = path.resolve(
-        __dirname,
-        '../../backend/ckpool/logs/BLOCKFOUND.log'
-      );
+      const blockFoundFlagFile = path.join(getCkpoolLogsDir(), 'BLOCKFOUND.log');
 
       let blockFound = false;
       let poolData = {};

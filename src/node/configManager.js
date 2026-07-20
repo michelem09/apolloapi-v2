@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const fs = require('fs').promises;
 const os = require('os');
 const path = require('path');
+const { getCkpoolLogsDir } = require('../paths');
 const {
   ensureRpcCredentials,
   getStateDir,
@@ -247,7 +248,7 @@ function renderCkpoolConfig(settings, credentials) {
           notify: true,
         },
       ],
-      logdir: '/opt/apolloapi/backend/ckpool/logs',
+      logdir: getCkpoolLogsDir(),
       btcsig: `/FutureBit-${userBtcsig}/`,
       zmqblock: 'tcp://127.0.0.1:28332',
       startdiff,
