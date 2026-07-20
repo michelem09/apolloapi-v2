@@ -1,0 +1,210 @@
+name: release
+
+# Builds the signed release artifact for OTA updates. Everything runs on an ARM
+# runner because the backend has native dependencies (sqlite3) that must be
+# compiled for the device's aarch64 ABI — an x86 build would produce a tarball
+# that cannot start.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (no leading v), for dry runs off a tag'
+        required: true
+
+permissions:
+  contents: write   # create the Release and upload assets
+  id-token: write   # OIDC token for cosign keyless signing
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: false   # .gitmodules points upstream on purpose; resolved below
+          fetch-depth: 0
+
+      - name: Resolve the UI submodule from this repo's owner
+        # .gitmodules stays pinned to the upstream repo so a fork URL is never
+        # proposed upstream. Overriding it locally makes the build work unchanged
+        # on a fork and on the official repo.
+        run: |
+          git config submodule.apolloui-v2.url \
+            "https://github.com/${{ github.repository_owner }}/apolloui-v2.git"
+          git submodule update --init --depth 1
+          git -C apolloui-v2 log --oneline -1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc   # must match the device ABI for sqlite3
+
+      - name: Derive version and channel
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          # Artifacts built anywhere other than the official repo are always 'dev'.
+          # A fork's cosign identity differs, so a fork build must never be able to
+          # present itself as something a production device would accept.
+          if [ "${{ github.repository_owner }}" != "jstefanop" ]; then
+            CHANNEL=dev
+          elif printf '%s' "$VERSION" | grep -qE '(-rc|-beta)'; then
+            CHANNEL=beta
+          else
+            CHANNEL=stable
+          fi
+
+          echo "version=$VERSION"   >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL"   >> "$GITHUB_OUTPUT"
+          echo "tarball=apollo-${VERSION}-aarch64.tar.zst" >> "$GITHUB_OUTPUT"
+          echo "Building $VERSION on channel $CHANNEL"
+
+      - name: Backend production dependencies
+        run: yarn install --frozen-lockfile --production
+
+      - name: Build the UI
+        working-directory: apolloui-v2
+        run: |
+          yarn install --frozen-lockfile --ignore-engines
+          yarn build
+          # standalone ships neither of these; without them the UI serves no assets
+          cp -r .next/static .next/standalone/.next/static
+          cp -r public .next/standalone/public
+
+      - name: Stage the release tree
+        id: stage
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+        run: |
+          set -Eeuo pipefail
+          STAGE="$RUNNER_TEMP/stage"
+          mkdir -p "$STAGE/apolloui-v2/.next"
+
+          cp -r src config migrations knexfile.js package.json node_modules "$STAGE/"
+
+          # Only the assembled UI bundle travels, not the build tree or its devDeps.
+          cp -r apolloui-v2/.next/standalone/. "$STAGE/apolloui-v2/"
+          cp -r apolloui-v2/.next/static        "$STAGE/apolloui-v2/.next/static"
+          cp -r apolloui-v2/public              "$STAGE/apolloui-v2/public"
+
+          # backend/ carries the launch scripts, systemd units and the small
+          # miner/ckpool binaries. bitcoind (backend/node/bin, ~214 MB across four
+          # flavours) is deliberately excluded: it ships as its own package, which
+          # is the whole reason the tarball can stay small.
+          mkdir -p "$STAGE/backend"
+          tar -C backend --exclude='node/bin' -cf - . | tar -C "$STAGE/backend" -xf -
+
+          # These arrive with steps 4 and 5; include them once they exist.
+          [ -f bin/apollo-update ] && install -Dm755 bin/apollo-update "$STAGE/bin/apollo-update" || true
+          [ -f bootstrap.sh ]      && install -Dm755 bootstrap.sh      "$STAGE/bootstrap.sh"      || true
+
+          cat > "$STAGE/version.json" <<JSON
+          {
+            "version": "${VERSION}",
+            "git_sha": "${GITHUB_SHA}",
+            "build_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "channel": "${CHANNEL}"
+          }
+          JSON
+
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          du -sh "$STAGE"
+
+      - name: Pack and hash
+        id: pack
+        env:
+          STAGE: ${{ steps.stage.outputs.stage }}
+          TARBALL: ${{ steps.meta.outputs.tarball }}
+        run: |
+          set -Eeuo pipefail
+          tar -C "$STAGE" --zstd -cf "$TARBALL" .
+          SHA=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$TARBALL")
+          echo "sha256=$SHA"  >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE"   >> "$GITHUB_OUTPUT"
+          echo "$TARBALL: $((SIZE/1024/1024)) MB, sha256 $SHA"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign the artifact (keyless)
+        env:
+          TARBALL: ${{ steps.meta.outputs.tarball }}
+        run: |
+          # Keyless: the signature is bound to this repo+workflow identity via OIDC,
+          # so there is no key to store or rotate. The verifier on the device must
+          # pin the expected identity per channel.
+          cosign sign-blob --yes \
+            --output-signature "${TARBALL}.sig" \
+            --output-certificate "${TARBALL}.pem" \
+            "$TARBALL"
+
+      - name: Generate the manifest
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+          TARBALL: ${{ steps.meta.outputs.tarball }}
+          SHA: ${{ steps.pack.outputs.sha256 }}
+          SIZE: ${{ steps.pack.outputs.size }}
+        run: |
+          BASE="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+          cat > "apollo-${VERSION}-manifest.json" <<JSON
+          {
+            "version": "${VERSION}",
+            "channel": "${CHANNEL}",
+            "sha256": "${SHA}",
+            "size": ${SIZE},
+            "min_from_version": "2.1.0",
+            "url": "${BASE}/${TARBALL}",
+            "signature_url": "${BASE}/${TARBALL}.sig",
+            "certificate_url": "${BASE}/${TARBALL}.pem",
+            "signing_identity": {
+              "issuer": "https://token.actions.githubusercontent.com",
+              "repository": "${{ github.repository }}",
+              "workflow_ref": "${{ github.workflow_ref }}"
+            },
+            "git_sha": "${GITHUB_SHA}",
+            "build_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          JSON
+          cat "apollo-${VERSION}-manifest.json"
+
+      - name: Publish the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+          TARBALL: ${{ steps.meta.outputs.tarball }}
+        run: |
+          set -Eeuo pipefail
+          TAG="${{ github.ref_name }}"
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && TAG="v${VERSION}"
+
+          NOTES=$(mktemp)
+          {
+            printf 'Channel: `%s` · sha256 `%s`\n\n' "$CHANNEL" "${{ steps.pack.outputs.sha256 }}"
+            printf 'Signed with cosign keyless, bound to `%s`.\n' "${{ github.repository }}"
+            if [ "$CHANNEL" = "dev" ]; then
+              printf '\n> **Development build.** Built outside the official repository, so its\n'
+              printf '> signing identity differs and production devices reject it by design.\n'
+              printf '> `bitcoind` is not bundled — it ships as a separate package.\n'
+            fi
+          } > "$NOTES"
+
+          PRERELEASE=""
+          [ "$CHANNEL" != "stable" ] && PRERELEASE="--prerelease"
+
+          gh release create "$TAG" $PRERELEASE \
+            --title "Apollo ${VERSION}" \
+            --notes-file "$NOTES" \
+            --target "${GITHUB_SHA}" \
+            "$TARBALL" "${TARBALL}.sig" "${TARBALL}.pem" \
+            "apollo-${VERSION}-manifest.json"
