@@ -8,8 +8,17 @@ After=apollo-api.service
 Type=simple
 User=futurebit
 Environment=PATH=/usr/local/nvm/versions/node/v21.6.2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/usr/local/nvm/versions/node/v21.6.2/bin:/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-WorkingDirectory=/opt/apolloapi/apolloui-v2
-ExecStart=/opt/apolloapi/apolloui-v2/node_modules/next/dist/bin/next start
+# Run the self-contained build (next.config.js: output: 'standalone') instead of
+# `next start`, which needs the full node_modules tree beside it. The standalone
+# bundle is ~73 MB against ~700 MB of node_modules, and needs no build step.
+#
+# HOSTNAME is set explicitly on purpose: server.js binds to `process.env.HOSTNAME
+# || '0.0.0.0'`, and on Linux that variable is often already the machine name — in
+# which case the UI would bind to the loopback and vanish from the LAN.
+WorkingDirectory=/opt/apolloapi/apolloui-v2/.next/standalone
+Environment=HOSTNAME=0.0.0.0
+Environment=PORT=3000
+ExecStart=/usr/local/nvm/versions/node/v21.6.2/bin/node server.js
 Restart=always
 SyslogIdentifier=ApolloUIv2
 

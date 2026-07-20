@@ -180,6 +180,12 @@ echo -e "${GREEN} ---> Project UI dependencies installed using yarn${NC}"
 
 # Build the project
 yarn build
+
+# `next build` with output: 'standalone' emits a self-contained server but does
+# NOT copy these two into it; without them the UI serves HTML and no assets.
+# The release tarball will do the same assembly — until then the device does it.
+cp -r .next/static .next/standalone/.next/static
+cp -r public .next/standalone/public
 echo -e "${GREEN} ---> Project built using yarn${NC}"
 
 ### DOCS ###
