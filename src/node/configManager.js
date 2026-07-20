@@ -219,7 +219,7 @@ function renderUserConfig(settings) {
   return output.join('\n');
 }
 
-function renderCkpoolConfig(settings, credentials) {
+function renderCkpoolConfig(settings, credentials, { stateDir } = {}) {
   const configuredBtcsig = setting(settings, 'btcsig', 'btcsig', null);
   const userBtcsig =
     typeof configuredBtcsig === 'string' &&
@@ -248,7 +248,7 @@ function renderCkpoolConfig(settings, credentials) {
           notify: true,
         },
       ],
-      logdir: getCkpoolLogsDir(),
+      logdir: getCkpoolLogsDir(stateDir),
       btcsig: `/FutureBit-${userBtcsig}/`,
       zmqblock: 'tcp://127.0.0.1:28332',
       startdiff,
@@ -337,7 +337,7 @@ async function applyNodeConfigurationInternal({
     [paths.bitcoinAuth, renderAuthConfig(rpcCredentials)],
     [paths.bitcoinApi, renderApiConfig(settings, { lanCidrs: resolvedCidrs })],
     [paths.bitcoinUser, renderUserConfig(settings)],
-    [paths.ckpool, renderCkpoolConfig(settings, rpcCredentials)],
+    [paths.ckpool, renderCkpoolConfig(settings, rpcCredentials, { stateDir })],
   ];
 
   const changed = [];
