@@ -44,6 +44,14 @@ apt-get -y upgrade
 
 git config --global --add safe.directory "$APOLLO_DIR"
 git config --global --add safe.directory "$UI_DIR"
+
+# Where to pull from. source.conf is authoritative: a device installed from one
+# source can be pointed at another, but its checkout keeps the remote it was
+# cloned with until we reconcile it here.
+. "${APOLLO_DIR}/backend/lib/source-config.sh"
+echo -e "${YELLOW} ---> Code source: ${APOLLO_GIT_BASE}${NC}"
+git -C "$APOLLO_DIR" remote set-url origin "$APOLLO_API_URL"
+git -C "$UI_DIR" remote set-url origin "$APOLLO_UI_URL"
 chown -R futurebit:futurebit "$APOLLO_DIR"
 
 set +u
