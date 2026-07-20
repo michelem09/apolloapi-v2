@@ -88,7 +88,17 @@ jobs:
           # One-line summary for the "update available" row in the UI. Comes from
           # the annotated tag so it is written deliberately when cutting a
           # release, rather than improvised from a commit subject.
-          SUMMARY=$(git tag -l --format='%(contents:subject)' "v${VERSION}" 2>/dev/null || true)
+          #
+          # actions/checkout rewrites refs/tags/<tag> to point straight at the
+          # commit (`fetch +<sha>:refs/tags/<tag>`), which quietly degrades an
+          # annotated tag to a lightweight one — %(contents:subject) then returns
+          # the commit subject, which reads plausibly and is the wrong text. Fetch
+          # the tag object back and only trust it if it really is one.
+          SUMMARY=""
+          git fetch --force origin "refs/tags/v${VERSION}:refs/tags/v${VERSION}" 2>/dev/null || true
+          if [ "$(git cat-file -t "v${VERSION}" 2>/dev/null)" = "tag" ]; then
+            SUMMARY=$(git tag -l --format='%(contents:subject)' "v${VERSION}")
+          fi
           [ -n "$SUMMARY" ] || SUMMARY="Apollo ${VERSION}"
 
           {
