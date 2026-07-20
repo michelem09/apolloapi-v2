@@ -19,6 +19,24 @@ fi
 # Set DEBIAN_FRONTEND to noninteractive to avoid prompts during installation
 export DEBIAN_FRONTEND=noninteractive
 
+#### CODE SOURCE ####
+#########################
+# Where this device pulls its code from. Defaults to the official repos; a dev
+# device can point elsewhere (a fork, or a private mirror) via
+# /var/lib/apollo/source.conf, or by exporting the vars for a one-off run.
+# Precedence: environment > source.conf > official default.
+SOURCE_CONF="${APOLLO_SOURCE_CONF:-/var/lib/apollo/source.conf}"
+_ENV_GIT_BASE="${APOLLO_GIT_BASE-}"
+_ENV_API_REPO="${APOLLO_API_REPO-}"
+_ENV_UI_REPO="${APOLLO_UI_REPO-}"
+[ -r "$SOURCE_CONF" ] && . "$SOURCE_CONF"
+APOLLO_GIT_BASE="${_ENV_GIT_BASE:-${APOLLO_GIT_BASE:-https://github.com/jstefanop}}"
+APOLLO_API_REPO="${_ENV_API_REPO:-${APOLLO_API_REPO:-apolloapi-v2}}"
+APOLLO_UI_REPO="${_ENV_UI_REPO:-${APOLLO_UI_REPO:-apolloui-v2}}"
+APOLLO_API_URL="${APOLLO_GIT_BASE}/${APOLLO_API_REPO}.git"
+APOLLO_UI_URL="${APOLLO_GIT_BASE}/${APOLLO_UI_REPO}.git"
+echo -e "${YELLOW} ---> Code source: ${APOLLO_GIT_BASE}${NC}"
+
 #### SYSTEM PACKAGES ####
 #########################
 echo -e "${YELLOW} ---> Installing and upgrading required system packages${NC}"
@@ -59,14 +77,14 @@ if [ "$1" = "dev" ]; then
 		BRANCH="dev"
 		echo -e "${YELLOW} ---> Using DEV mode with default branch: $BRANCH${NC}"
 	fi
-	git clone --single-branch --branch $BRANCH https://github.com/jstefanop/apolloapi-v2.git $APOLLO_DIR
+	git clone --single-branch --branch $BRANCH "$APOLLO_API_URL" $APOLLO_DIR
 	rm -rf $APOLLO_DIR/apolloui
-	git clone --single-branch --branch $BRANCH https://github.com/jstefanop/apolloui-v2.git $APOLLO_UI_DIR
+	git clone --single-branch --branch $BRANCH "$APOLLO_UI_URL" $APOLLO_UI_DIR
 else
 	echo -e "${YELLOW} ---> Using PRODUCTION branch${NC}"
-	git clone --single-branch --branch main https://github.com/jstefanop/apolloapi-v2.git $APOLLO_DIR
+	git clone --single-branch --branch main "$APOLLO_API_URL" $APOLLO_DIR
 	rm -rf $APOLLO_DIR/apolloui
-	git clone --single-branch --branch main https://github.com/jstefanop/apolloui-v2.git $APOLLO_UI_DIR
+	git clone --single-branch --branch main "$APOLLO_UI_URL" $APOLLO_UI_DIR
 fi
 
 # Install firewall
