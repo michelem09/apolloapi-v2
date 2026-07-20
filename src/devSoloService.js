@@ -1,8 +1,9 @@
 const fs = require('fs');
 const path = require('path');
+const { getCkpoolLogsDir } = require('./paths');
 
 let devSoloInterval = null;
-const ckpoolDir = path.resolve(__dirname, '../backend/ckpool/logs');
+const ckpoolDir = getCkpoolLogsDir();
 let isRunning = false;
 
 // Generate random pool statistics

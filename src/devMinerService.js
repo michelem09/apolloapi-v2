@@ -1,10 +1,10 @@
 const fs = require('fs');
 const path = require('path');
-const { getMinerRuntimeDir } = require('./paths');
+const { getMinerRuntimeDir, getCkpoolLogsDir } = require('./paths');
 
 let devMinerInterval = null;
 const statsDir = getMinerRuntimeDir();
-const ckpoolDir = path.resolve(__dirname, '../backend/ckpool/logs');
+const ckpoolDir = getCkpoolLogsDir();
 let statsFilePath = null;
 
 // Helper function to delete files starting with "apollo-miner" in the directory

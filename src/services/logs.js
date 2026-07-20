@@ -3,7 +3,7 @@ const path = require('path');
 const { exec } = require('child_process');
 const util = require('util');
 const { GraphQLError } = require('graphql');
-const { getMinerRuntimeDir } = require('../paths');
+const { getMinerRuntimeDir, getCkpoolLogsDir } = require('../paths');
 
 // Convert exec to use promises
 const execPromise = util.promisify(exec);
@@ -23,13 +23,13 @@ class LogsService {
         case 'CKPOOL':
           // Check multiple possible locations for ckpool.log
           const possiblePaths = [
-            path.resolve(
-              __dirname,
-              '../../backend/ckpool/logs/ckpool.log'
-            ),
+            path.join(getCkpoolLogsDir(), 'ckpool.log'),
+            // Legacy in-checkout locations, kept as a fallback for devices that
+            // have not been through the relocation yet. (The absolute
+            // /opt/apolloapi variants listed here before resolved to exactly
+            // these on a device, so they were redundant.)
+            path.resolve(__dirname, '../../backend/ckpool/logs/ckpool.log'),
             path.resolve(__dirname, '../../backend/ckpool/ckpool.log'),
-            '/opt/apolloapi/backend/ckpool/logs/ckpool.log',
-            '/opt/apolloapi/backend/ckpool/ckpool.log',
           ];
 
           for (const p of possiblePaths) {

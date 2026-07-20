@@ -17,7 +17,11 @@ ExecStart=/opt/apolloapi/backend/ckpool/ckpool_start.sh
 ExecStop=/opt/apolloapi/backend/ckpool/ckpool_stop.sh
 KillSignal=SIGTERM
 TimeoutStopSec=300
-Restart=always
+# on-failure, not always: when solo mining is disabled the ExecCondition below
+# fails on purpose and the unit is skipped, which is not a failure. With
+# Restart=always systemd retried every 30s forever, spawning a shell and an
+# sqlite query each time (~11.5k log lines/day). A real crash still restarts.
+Restart=on-failure
 RestartSec=30s
 
 [Install]
