@@ -1,0 +1,21 @@
+# Apollo code source — copy to /var/lib/apollo/source.conf on a DEV device.
+#
+# Controls which repos the install/update scripts pull the code from.
+# If this file is absent the device uses the official repos, so production
+# devices need no configuration at all.
+#
+# Precedence: environment > this file > official default.
+
+# Owner/base URL of the repos.
+#   official (default): https://github.com/jstefanop
+#   dev fork:           https://github.com/michelem09
+APOLLO_GIT_BASE="https://github.com/michelem09"
+
+# Repo names, in case the dev repos are named differently.
+#APOLLO_API_REPO="apolloapi-v2"
+#APOLLO_UI_REPO="apolloui-v2"
+
+# Update channel. Reserved for the OTA work: it selects the release manifest
+# and the signing identity accepted by the updater. A device on the dev channel
+# must never accept official artifacts, and vice versa.
+#APOLLO_CHANNEL="dev"
