@@ -202,7 +202,12 @@ jobs:
           echo "size=$SIZE"   >> "$GITHUB_OUTPUT"
           echo "$TARBALL: $((SIZE/1024/1024)) MB, sha256 $SHA"
 
+      # Pinned, and deliberately the same version devices install via
+      # backend/utils/install-update-deps.sh. Left floating, the signing side
+      # drifts while the verifying side stays fixed on hardware nobody upgrades.
       - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.5.2
 
       - name: Sign the artifact (keyless)
         env:

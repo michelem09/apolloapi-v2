@@ -80,6 +80,30 @@ describe('update lifecycle contract', () => {
     expect(script).toMatch(/exec >>"\$LOG_FILE" 2>&1/);
   });
 
+  it('provisions its own dependencies instead of refusing to run', () => {
+    const script = readBackendScript('update');
+
+    // Nothing in the repo installed jq, zstd or cosign, so the hard gate made the
+    // OTA channel inert on every fielded device.
+    expect(script).toContain('backend/utils/install-update-deps.sh');
+    const provision = script.indexOf('install-update-deps.sh');
+    const gate = script.indexOf('Missing dependency');
+    expect(gate).toBeGreaterThan(provision);
+  });
+
+  it('reports failure to the UI rather than deleting the progress file', () => {
+    const script = readBackendScript('update');
+
+    // A missing file reads as progress 0 through Mcu.updateProgress, which the
+    // modal cannot tell apart from a fresh start — it hid its own close button
+    // and sat at "Updating... 0%" until the page was reloaded.
+    expect(script).toMatch(/echo "-1" > "\$TMPFILE"/);
+    const failureWrite = script.indexOf('echo "-1" > "$TMPFILE"');
+    const failureMsg = script.indexOf('Update failed; the previous version');
+    expect(failureWrite).toBeGreaterThan(-1);
+    expect(failureMsg).toBeGreaterThan(failureWrite);
+  });
+
   it('validates every manifest field it consumes, before it consumes it', () => {
     const script = readBackendScript('update');
 

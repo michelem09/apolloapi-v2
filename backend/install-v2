@@ -45,7 +45,7 @@ echo -e "${YELLOW} ---> Installing and upgrading required system packages${NC}"
 apt-get update
 apt-get -y upgrade
 
-apt-get -y install tor sqlite3 htop net-tools iputils-ping zip unzip whois traceroute vim openssh-server curl git libvips-dev libssl-dev libxslt-dev libxml2-dev imagemagick libmagickwand-dev libreadline-dev zlib1g-dev libsqlite3-dev libpq-dev libxml2-dev yasm libzmq3-dev build-essential libxslt1-dev python-dev-is-python3 vim git sudo iptables network-manager screen ntp
+apt-get -y install tor sqlite3 htop net-tools iputils-ping zip unzip whois traceroute vim openssh-server curl git libvips-dev libssl-dev libxslt-dev libxml2-dev imagemagick libmagickwand-dev libreadline-dev zlib1g-dev libsqlite3-dev libpq-dev libxml2-dev yasm libzmq3-dev build-essential libxslt1-dev python-dev-is-python3 vim git sudo iptables network-manager screen ntp jq zstd
 
 #### SYSTEM SETUP ####
 #########################
@@ -86,6 +86,12 @@ else
 	rm -rf $APOLLO_DIR/apolloui
 	git clone --single-branch --branch main "$APOLLO_UI_URL" $APOLLO_UI_DIR
 fi
+
+# Install what the OTA updater needs to verify a signed release. Done here, after
+# the clone, so a factory image can take its first update without anyone SSHing in.
+echo -e "${YELLOW} ---> Installing update dependencies${NC}"
+bash $APOLLO_DIR/backend/utils/install-update-deps.sh || \
+	echo -e "${RED} ---> WARNING: update dependencies not installed${NC}"
 
 # Install firewall
 echo -e "${YELLOW} ---> Installing firewall${NC}"

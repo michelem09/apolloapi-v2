@@ -184,7 +184,11 @@ cleanup() {
     start_services
   fi
   restore_solo_intent || true
-  rm -f "$TMPFILE"
+  # -1 means "failed", and the UI needs to be told. Deleting the file instead made
+  # Mcu.updateProgress report a plain 0, indistinguishable from "just started", so
+  # the modal sat at "Updating... 0%" with its close button hidden until the user
+  # reloaded the page. The next run truncates this file before it starts.
+  echo "-1" > "$TMPFILE"
   err "Update failed; the previous version is still installed"
   exit "$status"
 }
@@ -334,6 +338,14 @@ health_ok() {
 
 rm -f "$TMPFILE"; echo "5" > "$TMPFILE"
 
+# Self-provision rather than refuse. Devices already in the field have none of
+# jq, zstd or cosign — nothing ever installed them — so a hard gate here left the
+# whole fleet unable to take a single OTA update without someone SSHing in.
+if ! have jq || ! have zstd || ! have cosign; then
+  log "Installing update dependencies"
+  DEPS_SCRIPT="$APOLLO_DIR/backend/utils/install-update-deps.sh"
+  [ -x "$DEPS_SCRIPT" ] && "$DEPS_SCRIPT" || err "Could not install update dependencies"
+fi
 for t in curl jq zstd sha256sum sqlite3 cosign; do
   have "$t" || die "Missing dependency: $t (install it before updating)"
 done
