@@ -29,6 +29,10 @@ OFFICIAL_REPO='apolloapi-v2'
 HEALTH_URL="${APOLLO_HEALTH_URL:-http://localhost:5000/health}"
 UI_HEALTH_URL="${APOLLO_UI_HEALTH_URL:-http://localhost:3000/}"
 HEALTH_TIMEOUT="${APOLLO_HEALTH_TIMEOUT:-90}"
+# Overridable so the unit backup/restore path can be exercised against a sandbox
+# instead of only asserted on as text. Same reasoning as APOLLO_ROOT_DIR.
+SYSTEMD_DIR="${APOLLO_SYSTEMD_DIR:-/etc/systemd/system}"
+RC_LOCAL="${APOLLO_RC_LOCAL:-/etc/rc.local}"
 VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$'
 
 STAGING=''; TARBALL=''
@@ -79,10 +83,25 @@ if [ -z "${APOLLO_UPDATE_DETACHED:-}" ] && [ -d /run/systemd/system ] && have sy
   echo "Update started. Follow it with: tail -f $LOG_FILE"
   # --setenv and not export: systemd gives a transient service a fresh
   # environment, so nothing from here is inherited.
+  #
+  # EVERY override is forwarded, not just these two. Forwarding a subset meant
+  # the detached run — the one that actually does the work — silently reverted to
+  # the defaults: `APOLLO_ROOT_DIR=/tmp/sandbox backend/update`, the whole point
+  # of which is to touch nothing real, swapped /opt/apolloapi for real, while its
+  # log obediently went to the sandbox. APOLLO_CHANNEL_URL pointing at a dev
+  # channel would likewise have installed the official stable release.
+  setenv_args=(
+    --setenv=APOLLO_UPDATE_DETACHED=1
+    --setenv="APOLLO_UPDATE_LOG=$LOG_FILE"
+  )
+  for override in APOLLO_ROOT_DIR APOLLO_STATE_DIR APOLLO_SOURCE_CONF \
+                  APOLLO_TRUST_CONF APOLLO_CHANNEL_URL APOLLO_HEALTH_URL \
+                  APOLLO_UI_HEALTH_URL APOLLO_HEALTH_TIMEOUT APOLLO_SYSTEMD_DIR \
+                  APOLLO_RC_LOCAL; do
+    [ -n "${!override:-}" ] && setenv_args+=(--setenv="$override=${!override}")
+  done
   exec systemd-run --quiet --collect --unit=apollo-update \
-    --setenv=APOLLO_UPDATE_DETACHED=1 \
-    --setenv="APOLLO_UPDATE_LOG=$LOG_FILE" \
-    -- "$0" "$@"
+    "${setenv_args[@]}" -- "$0" "$@"
 fi
 if [ -n "${APOLLO_UPDATE_DETACHED:-}" ]; then
   mkdir -p "$STATE_DIR"
@@ -411,10 +430,10 @@ backup_units() {
   mkdir -p "$UNIT_BACKUP"
   local unit
   for unit in $UNITS; do
-    [ -f "/etc/systemd/system/$unit.service" ] \
-      && cp -p "/etc/systemd/system/$unit.service" "$UNIT_BACKUP/$unit.service"
+    [ -f "$SYSTEMD_DIR/$unit.service" ] \
+      && cp -p "$SYSTEMD_DIR/$unit.service" "$UNIT_BACKUP/$unit.service"
   done
-  [ -f /etc/rc.local ] && cp -p /etc/rc.local "$UNIT_BACKUP/rc.local"
+  [ -f "$RC_LOCAL" ] && cp -p "$RC_LOCAL" "$UNIT_BACKUP/rc.local"
   UNITS_SAVED=1
   return 0
 }
@@ -422,14 +441,25 @@ backup_units() {
 restore_units() {
   [ "$UNITS_SAVED" -eq 1 ] && [ -d "${UNIT_BACKUP:-}" ] || return 0
   err "Restoring the previous systemd units"
-  local unit
+  local unit rc=0
   for unit in $UNITS; do
-    [ -f "$UNIT_BACKUP/$unit.service" ] \
-      && install -m 644 "$UNIT_BACKUP/$unit.service" "/etc/systemd/system/$unit.service"
+    if [ -f "$UNIT_BACKUP/$unit.service" ]; then
+      install -m 644 "$UNIT_BACKUP/$unit.service" "$SYSTEMD_DIR/$unit.service" || rc=1
+    elif [ -f "$SYSTEMD_DIR/$unit.service" ]; then
+      # Absent from the backup means the unit did not exist before this update —
+      # the release introduced it, and the code it runs has just been rolled
+      # back. Left installed and enabled, it points at an ExecStart the restored
+      # tree does not contain and fails on every boot. This asymmetry was fixed
+      # for the root files and missed here.
+      systemctl disable "$unit.service" >/dev/null 2>&1 || true
+      rm -f "$SYSTEMD_DIR/$unit.service" || rc=1
+    fi
   done
-  [ -f "$UNIT_BACKUP/rc.local" ] && install -m 755 "$UNIT_BACKUP/rc.local" /etc/rc.local
+  if [ -f "$UNIT_BACKUP/rc.local" ]; then
+    install -m 755 "$UNIT_BACKUP/rc.local" "$RC_LOCAL" || rc=1
+  fi
   systemctl daemon-reload || true
-  return 0
+  return "$rc"
 }
 
 # Nothing pruned these, so every update left a full copy of the tree it replaced
@@ -739,9 +769,9 @@ log "Applying units and configuration"
 backup_units
 for unit in $UNITS; do
   [ -f "$APOLLO_DIR/backend/systemd/$unit.service" ] \
-    && install -m 644 "$APOLLO_DIR/backend/systemd/$unit.service" "/etc/systemd/system/$unit.service"
+    && install -m 644 "$APOLLO_DIR/backend/systemd/$unit.service" "$SYSTEMD_DIR/$unit.service"
 done
-[ -f "$APOLLO_DIR/backend/rc.local" ] && install -m 755 "$APOLLO_DIR/backend/rc.local" /etc/rc.local
+[ -f "$APOLLO_DIR/backend/rc.local" ] && install -m 755 "$APOLLO_DIR/backend/rc.local" "$RC_LOCAL"
 systemctl daemon-reload
 systemctl enable apollo-bootstrap.service apollo-api.service apollo-ui-v2.service \
   apollo-miner.service node.service rc-local.service >/dev/null 2>&1 || true

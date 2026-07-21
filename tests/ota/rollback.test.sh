@@ -28,7 +28,7 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=44
+EXPECTED_ASSERTIONS=47
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -149,24 +149,26 @@ echo "rollback contract"
 # --- units are reverted -------------------------------------------------------
 (
   make_device
-  mkdir -p "$ROOT/etc/systemd/system"
-  # restore_units writes to the real /etc, so point the whole thing at the sandbox
-  # by overriding the two functions' target through a stubbed install.
+  # Sandbox the /etc paths. Without this, restore_units would inspect — and on a
+  # Linux host try to remove — real system units.
+  SYSTEMD_DIR="$ROOT/etc/systemd/system"
+  RC_LOCAL="$ROOT/etc/rc.local"
+  mkdir -p "$SYSTEMD_DIR"
   cat > "$STUBS/install" <<EOF
 #!/bin/bash
 args=(); for a in "\$@"; do [ "\$a" = "-m" ] && { skip=1; continue; }; [ -n "\${skip:-}" ] && { unset skip; continue; }; args+=("\$a"); done
 cp "\${args[0]}" "$ROOT/etc/systemd/system/\$(basename "\${args[1]}")"
 EOF
   chmod +x "$STUBS/install"
-  echo 'OLD-UNIT' > "$ROOT/etc/systemd/system/apollo-api.service"
+  echo 'OLD-UNIT' > "$SYSTEMD_DIR/apollo-api.service"
   UNIT_BACKUP=''; UNITS_SAVED=0
   # backup_units reads from the real /etc; drive it against the sandbox copy.
   UNIT_BACKUP="$APOLLO_STATE_DIR/backups/units-test"; mkdir -p "$UNIT_BACKUP"
-  cp "$ROOT/etc/systemd/system/apollo-api.service" "$UNIT_BACKUP/apollo-api.service"
+  cp "$SYSTEMD_DIR/apollo-api.service" "$UNIT_BACKUP/apollo-api.service"
   UNITS_SAVED=1
-  echo 'NEW-UNIT' > "$ROOT/etc/systemd/system/apollo-api.service"
+  echo 'NEW-UNIT' > "$SYSTEMD_DIR/apollo-api.service"
   restore_units >/dev/null 2>&1
-  check "unit file reverted" "$(cat "$ROOT/etc/systemd/system/apollo-api.service")" "OLD-UNIT"
+  check "unit file reverted" "$(cat "$SYSTEMD_DIR/apollo-api.service")" "OLD-UNIT"
   if grep -q 'daemon-reload' "$SYSTEMCTL_LOG"; then ok "daemon-reload issued after revert"
   else bad "daemon-reload issued after revert" "not in systemctl log"; fi
 )
@@ -182,6 +184,38 @@ EOF
     if grep -q "start.*$unit" "$SYSTEMCTL_LOG"; then ok "restarts $unit"
     else bad "restarts $unit" "not started"; fi
   done
+)
+
+# --- a unit the release ADDED is removed on rollback --------------------------
+# backup_units only records units that already exist, so a unit introduced by the
+# release had nothing to restore and stayed installed and enabled — pointing at
+# an ExecStart the rolled-back tree does not contain, failing on every boot.
+(
+  make_device
+  # The real /etc paths are overridable, so the REAL restore_units runs here
+  # against the sandbox. Reimplementing its logic in the test would only prove
+  # the reimplementation right — which is what the first version of this did.
+  SYSTEMD_DIR="$ROOT/etc/systemd/system"
+  RC_LOCAL="$ROOT/etc/rc.local"
+  mkdir -p "$SYSTEMD_DIR"
+
+  UNIT_BACKUP="$APOLLO_STATE_DIR/backups/units-added"; mkdir -p "$UNIT_BACKUP"
+  # apollo-api existed before; apollo-bootstrap is new in this release.
+  echo 'OLD-UNIT' > "$UNIT_BACKUP/apollo-api.service"
+  echo 'NEW-UNIT' > "$SYSTEMD_DIR/apollo-api.service"
+  echo 'NEW-UNIT' > "$SYSTEMD_DIR/apollo-bootstrap.service"
+  UNITS_SAVED=1
+
+  restore_units >/dev/null 2>&1
+
+  check "a pre-existing unit is restored" \
+    "$(cat "$SYSTEMD_DIR/apollo-api.service" 2>/dev/null)" "OLD-UNIT"
+  if grep -q 'disable apollo-bootstrap.service' "$SYSTEMCTL_LOG"; then
+    ok "a unit added by the release is disabled"
+  else bad "a unit added by the release is disabled" "no disable recorded"; fi
+  if [ -f "$SYSTEMD_DIR/apollo-bootstrap.service" ]; then
+    bad "a unit added by the release is removed" "it is still installed"
+  else ok "a unit added by the release is removed"; fi
 )
 
 # --- a rollback after a PARTIAL backup must not destroy the live copies -------
