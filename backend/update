@@ -9,9 +9,10 @@
 # update mechanism itself never changes, so a bad release is corrected by the
 # next one through the same still-working path. See OTA_UPDATE_REDESIGN.md §5.1.
 #
-# Extraction is additive on purpose: files the tarball does not carry — bitcoind
-# under backend/node/bin, the materialised miner/ckpool binaries — stay from the
-# previous install, so the artifact stays ~40 MB instead of ~150 MB.
+# The directories the release owns are replaced wholesale, so a file deleted
+# upstream really disappears. bitcoind under backend/node/bin is the single
+# documented exception, carried across the swap to keep the artifact ~40 MB
+# instead of ~150 MB.
 set -Eeuo pipefail
 
 YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
