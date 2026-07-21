@@ -20,6 +20,16 @@ RESULTS="$(mktemp -d)"
 trap 'rm -rf "$RESULTS"' EXIT
 export RESULTS
 
+# Every assertion in this file is counted, and the total is checked at the end.
+# Without it a scenario that dies early records neither a pass nor a fail and
+# simply vanishes, leaving the suite green — which is what happened: sourcing
+# backend/update turns on `set -Eeuo pipefail` (the `set` line is outside the
+# APOLLO_UPDATE_LIB guard), so any command returning non-zero inside a scenario
+# killed that subshell silently. Re-introducing a real rollback regression
+# dropped the suite from 27 assertions to 21 and it still exited 0.
+# Update this number when adding or removing an assertion — deliberately.
+EXPECTED_ASSERTIONS=33
+
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected '$3', got '$2'"; fi; }
@@ -55,6 +65,12 @@ EOF
   export PATH="$STUBS:$PATH"
   # shellcheck disable=SC1091
   APOLLO_UPDATE_LIB=1 source "$REPO/backend/update"
+  # backend/update sets `set -Eeuo pipefail` at the top, outside the library
+  # guard, and shell options are global — so sourcing it silently armed errexit
+  # in this scenario. Restore what this harness actually wants: a failing command
+  # must be reported by an assertion, not abort the scenario before it runs one.
+  set +eE
+  set -uo pipefail
 }
 
 flavours() { ls "$APOLLO_ROOT_DIR/backend/node/bin" 2>/dev/null | wc -l | tr -d ' '; }
@@ -166,6 +182,25 @@ EOF
     if grep -q "start.*$unit" "$SYSTEMCTL_LOG"; then ok "restarts $unit"
     else bad "restarts $unit" "not started"; fi
   done
+)
+
+# --- manifest fields are validated as whole values ----------------------------
+# The manifest is attacker-controlled until cosign has verified the artifact, and
+# `grep` tests each LINE: a size of $'x[$(cmd)]\n40000000' passed a `grep -qE
+# '^[0-9]+$'` guard on its second line, then reached an arithmetic expansion,
+# where bash ran the first line as root — before the checksum and the signature.
+(
+  make_device
+  yes() { if "$@"; then echo Y; else echo N; fi; }
+  check "a multi-line size is rejected" \
+    "$(yes valid_number "$(printf 'SWAPPED[$(id)]\n40000000')")" "N"
+  check "a plain number is accepted"        "$(yes valid_number 40000000)" "Y"
+  check "an empty size is rejected"         "$(yes valid_number '')" "N"
+  check "a non-numeric size is rejected"    "$(yes valid_number abc)" "N"
+  check "a multi-line url is rejected" \
+    "$(yes valid_url "$(printf 'https://evil\nhttps://ok')")" "N"
+  check "a plain https url is accepted" \
+    "$(yes valid_url 'https://github.com/o/r/releases/download/x/y.json')" "Y"
 )
 
 # --- the stop verification must succeed when everything IS stopped ------------
@@ -294,6 +329,12 @@ PASS=$(count "$RESULTS/pass")
 FAIL=$(count "$RESULTS/fail")
 if [ "$PASS" -eq 0 ]; then
   printf '\033[0;31mno assertions ran\033[0m — the harness is broken\n'; exit 1
+fi
+TOTAL=$((PASS + FAIL))
+if [ "$TOTAL" -ne "$EXPECTED_ASSERTIONS" ]; then
+  printf '\033[0;31m%d assertions ran, expected %d\033[0m — a scenario died before asserting\n' \
+    "$TOTAL" "$EXPECTED_ASSERTIONS"
+  exit 1
 fi
 if [ "$FAIL" -eq 0 ]; then
   printf '\033[0;32m%d passed\033[0m\n' "$PASS"; exit 0

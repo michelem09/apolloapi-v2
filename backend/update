@@ -162,10 +162,25 @@ normalize_prerelease() {
   printf '%s%s' "$out" "$s"
 }
 
-valid_version() { printf '%s' "$1" | grep -qE "$VERSION_RE"; }
+# grep tests each LINE, so a multi-line value passes as long as ONE of its lines
+# matches — which defeated the numeric check on the manifest's size field: a value
+# of $'x[$(cmd)]\n40000000' cleared the guard on its second line and then reached
+# an arithmetic expansion, where bash executed the first one as root, before the
+# checksum and signature were ever checked. Every manifest field is single-line by
+# definition, so an embedded newline is rejected outright, ahead of any pattern.
+single_line() { [[ "$1" != *$'\n'* ]]; }
+
+# Whole-value numeric test. `case` is used rather than a pattern match because it
+# cannot be fooled the way a line-oriented tool can.
+valid_number() {
+  single_line "$1" || return 1
+  case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac
+}
+
+valid_version() { single_line "$1" && printf '%s' "$1" | grep -qE "$VERSION_RE"; }
 # A field starting with '-' would be read by curl as an option (e.g. -K reads a
 # config file), so every URL is schema-checked and passed after --url.
-valid_url() { printf '%s' "$1" | grep -qE '^https://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$'; }
+valid_url() { single_line "$1" && printf '%s' "$1" | grep -qE '^https://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$'; }
 
 fetch() { curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 --url "$1"; }
 
@@ -462,12 +477,12 @@ valid_version "$VERSION" || die "Manifest version '$VERSION' is not a valid vers
 for u in "$URL" "$SIG_URL" "$CERT_URL"; do
   valid_url "$u" || die "Manifest contains a URL that is not a plain https URL"
 done
-printf '%s' "$SHA" | grep -qE '^[0-9a-f]{64}$' || die "Manifest sha256 is malformed"
+single_line "$SHA" && printf '%s' "$SHA" | grep -qE '^[0-9a-f]{64}$' || die "Manifest sha256 is malformed"
 # SIZE is used in an arithmetic expansion below, and bash re-evaluates a variable's
 # value there as an expression — array subscripts inside it undergo full expansion,
 # so an unvalidated size of the form `x[$(cmd)]` runs cmd as root. That happens
 # BEFORE the checksum and cosign checks, which would bypass signing entirely.
-printf '%s' "$SIZE" | grep -qE '^[0-9]+$' || die "Manifest size is malformed"
+valid_number "$SIZE" || die "Manifest size is malformed"
 
 CURRENT="$(current_version || true)"
 if [ -n "$CURRENT" ] && valid_version "$CURRENT"; then

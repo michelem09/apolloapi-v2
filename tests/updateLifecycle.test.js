@@ -152,10 +152,21 @@ describe('update lifecycle contract', () => {
     // it reaches an arithmetic expansion, where bash re-evaluates the value as an
     // expression and expands array subscripts inside it — `x[$(cmd)]` runs cmd as
     // root, and it happens before the checksum and signature checks.
-    const guard = script.indexOf("printf '%s' \"$SIZE\" | grep -qE '^[0-9]+$'");
+    // Whole-value, not line-oriented: `grep` tests each line, so a multi-line
+    // value passed as long as ONE line matched, and the other line reached the
+    // arithmetic expansion and executed. The guards must reject embedded
+    // newlines outright — see single_line / valid_number.
+    const guard = script.indexOf('valid_number "$SIZE"');
     const use = script.indexOf('NEED_KB=$((');
     expect(guard).toBeGreaterThan(-1);
     expect(use).toBeGreaterThan(guard);
+    expect(script).toMatch(/single_line\(\) \{ \[\[ "\$1" != \*\$'\\n'\* \]\]; \}/);
+    // Every value read out of the manifest goes through a single-line check.
+    for (const helper of ['valid_version()', 'valid_url()', 'valid_number()']) {
+      const body = script.slice(script.indexOf(helper), script.indexOf(helper) + 220);
+      expect(body).toContain('single_line');
+    }
+    expect(script).toContain('single_line "$SHA"');
 
     // The channel URL is built from source.conf, which the app user can write.
     const urlGuard = script.indexOf('valid_url "$CHANNEL_URL"');
