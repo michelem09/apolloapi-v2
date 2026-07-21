@@ -18,7 +18,7 @@ set -Eeuo pipefail
 YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 TMPFILE='/tmp/update_progress'
 SOLO_REQUEST_FILE='/run/apollo-update-solo-requested-status'
-APOLLO_DIR='/opt/apolloapi'
+APOLLO_DIR="${APOLLO_ROOT_DIR:-/opt/apolloapi}"
 UI_DIR="${APOLLO_DIR}/apolloui-v2"
 STATE_DIR="${APOLLO_STATE_DIR:-/var/lib/apollo}"
 TRUST_CONF="${APOLLO_TRUST_CONF:-/etc/apollo/update.conf}"
@@ -31,12 +31,21 @@ UI_HEALTH_URL="${APOLLO_UI_HEALTH_URL:-http://localhost:3000/}"
 HEALTH_TIMEOUT="${APOLLO_HEALTH_TIMEOUT:-90}"
 VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$'
 
-STAGING=''; TARBALL=''; SWAPPED=0
+STAGING=''; TARBALL=''
+# MUTATED is armed BEFORE the first destructive step, not after the last one: it
+# answers "might /opt/apolloapi be half-dismantled?", and a flag set afterwards
+# was still 0 during the exact window it exists to cover.
+MUTATED=0; STOPPED=0; UNITS_SAVED=0; COMPLETED=0
 
 log()  { echo -e "${YELLOW} ---> $*${NC}"; }
 err()  { echo -e "${RED}$*${NC}" >&2; }
 die()  { err "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Sourced with APOLLO_UPDATE_LIB=1 by tests/ota/rollback.test.sh, which drives the
+# backup and restore functions directly under injected failures. The update itself
+# never sets it, and sudo's env_reset means it cannot arrive from outside.
+if [ -z "${APOLLO_UPDATE_LIB:-}" ]; then
 
 [ "$EUID" -eq 0 ] || die "Update script must be run by root or with sudo"
 
@@ -65,6 +74,8 @@ if [ -n "${APOLLO_UPDATE_SCOPED:-}" ]; then
   exec >>"$LOG_FILE" 2>&1
   echo "=== update started $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 fi
+
+fi  # end of the non-library preamble
 
 # --- config, parsed and never executed --------------------------------------
 # source.conf is writable by the app user, so sourcing it would be code
@@ -148,20 +159,42 @@ restore_solo_intent() {
 
 # Any abort must leave the device on working code and no debris behind — the
 # previous design leaked a half-extracted tree and a partial tarball.
+#
+# Success is tracked with an explicit flag rather than inferred from $?. When the
+# shell dies on a signal the EXIT trap can run with $? == 0, which took the
+# success branch and skipped the rollback entirely — on the one path where the
+# rollback is the whole point.
 cleanup() {
   local status=$?
-  trap - ERR EXIT
+  trap - ERR EXIT TERM INT HUP
   [ -n "$STAGING" ] && rm -rf "$STAGING"
-  if [ "$status" -ne 0 ]; then
-    [ -n "$TARBALL" ] && rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"
-    [ "$SWAPPED" -eq 1 ] && restore_code
-    restore_solo_intent || true
-    rm -f "$TMPFILE"
-    err "Update failed; the previous version is still installed"
+
+  if [ "$COMPLETED" -eq 1 ]; then exit 0; fi
+  [ "$status" -eq 0 ] && status=1
+
+  [ -n "$TARBALL" ] && rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"
+  if [ "$MUTATED" -eq 1 ]; then
+    restore_code || err "ROLLBACK FAILED — this device needs manual recovery over SSH"
   fi
+  # Restarting is unconditional once anything has been stopped: an explicit `die`
+  # between the stop and the end used to leave the API, UI, node and ckpool all
+  # down, with no Restart= recovery because the stop was deliberate.
+  if [ "$STOPPED" -eq 1 ]; then
+    err "Restarting services"
+    start_services
+  fi
+  restore_solo_intent || true
+  rm -f "$TMPFILE"
+  err "Update failed; the previous version is still installed"
   exit "$status"
 }
-trap cleanup ERR EXIT
+if [ -z "${APOLLO_UPDATE_LIB:-}" ]; then
+  trap cleanup ERR EXIT
+  # Without these the shell dies on the signal and the EXIT trap misreads it as
+  # success. The self-SIGTERM this used to cause is fixed above, but a manual
+  # `kill`, an SSH hangup or a shutdown mid-update are all still real.
+  trap 'exit 143' TERM INT HUP
+fi
 
 # --- code swap ---------------------------------------------------------------
 # Directories the release fully owns. Replaced wholesale — never merged — so a
@@ -176,14 +209,40 @@ OWNED='src config migrations node_modules backend'
 # a merge would leave behind. Step 6 (bitcoind as its own package) removes even this.
 PRESERVED_BIN="$BACKUP_DIR/.preserved-node-bin"
 
+# Root-level files the release owns. version.json matters most: it is what the
+# device believes it is running, so a rollback that leaves the new one behind
+# makes every later update exit "Already on <version>" against old code — an OTA
+# dead end that only SSH can undo.
+ROOT_FILES='knexfile.js package.json version.json'
+
+# systemd units the release installs. Named once so the backup and the install
+# cannot drift apart and leave a unit un-revertable.
+UNITS='apollo-bootstrap apollo-api apollo-ui-v2 apollo-miner node ckpool rc-local swap'
+
 preserve_binaries() {
   rm -rf "$PRESERVED_BIN"
   [ -d "$APOLLO_DIR/backend/node/bin" ] && mv "$APOLLO_DIR/backend/node/bin" "$PRESERVED_BIN"
   return 0
 }
 
+# Rollback-safe counterpart. It must never delete $PRESERVED_BIN: between
+# preserve_binaries and place_binaries that directory holds the device's ONLY
+# copy of bitcoind, because the artifact ships none. Calling preserve_binaries
+# here — whose first act is `rm -rf "$PRESERVED_BIN"` — destroyed it, and the
+# rollback then "succeeded" with zero bitcoind on the device and no release able
+# to put it back.
+rescue_binaries() {
+  [ -d "$PRESERVED_BIN" ] && return 0
+  [ -d "$APOLLO_DIR/backend/node/bin" ] && mv "$APOLLO_DIR/backend/node/bin" "$PRESERVED_BIN"
+  return 0
+}
+
 place_binaries() {
-  [ -d "$PRESERVED_BIN" ] || return 0
+  if [ ! -d "$PRESERVED_BIN" ]; then
+    [ -d "$APOLLO_DIR/backend/node/bin" ] \
+      || err "WARNING: no bitcoind found on this device — the node cannot start"
+    return 0
+  fi
   mkdir -p "$APOLLO_DIR/backend/node"
   rm -rf "$APOLLO_DIR/backend/node/bin"
   mv "$PRESERVED_BIN" "$APOLLO_DIR/backend/node/bin"
@@ -192,24 +251,67 @@ place_binaries() {
 backup_code() {
   BACKUP_CODE="$BACKUP_DIR/code-pre-$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$BACKUP_CODE"
-  local d
+  # Written before anything moves. Written afterwards, a failure partway through
+  # the move loop left the tree dismantled and no pointer to what held it.
+  printf '%s\n' "$BACKUP_CODE" > "$BACKUP_DIR/.last-code-backup"
+  local d f
   for d in $OWNED; do [ -e "$APOLLO_DIR/$d" ] && mv "$APOLLO_DIR/$d" "$BACKUP_CODE/$d"; done
   [ -e "$UI_DIR/.next" ] && { mkdir -p "$BACKUP_CODE/apolloui-v2"; mv "$UI_DIR/.next" "$BACKUP_CODE/apolloui-v2/.next"; }
-  printf '%s\n' "$BACKUP_CODE" > "$BACKUP_DIR/.last-code-backup"
+  for f in $ROOT_FILES; do [ -e "$APOLLO_DIR/$f" ] && cp -p "$APOLLO_DIR/$f" "$BACKUP_CODE/$f"; done
+  return 0
+}
+
+backup_units() {
+  UNIT_BACKUP="$BACKUP_DIR/units-pre-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$UNIT_BACKUP"
+  local unit
+  for unit in $UNITS; do
+    [ -f "/etc/systemd/system/$unit.service" ] \
+      && cp -p "/etc/systemd/system/$unit.service" "$UNIT_BACKUP/$unit.service"
+  done
+  [ -f /etc/rc.local ] && cp -p /etc/rc.local "$UNIT_BACKUP/rc.local"
+  UNITS_SAVED=1
+  return 0
+}
+
+restore_units() {
+  [ "$UNITS_SAVED" -eq 1 ] && [ -d "${UNIT_BACKUP:-}" ] || return 0
+  err "Restoring the previous systemd units"
+  local unit
+  for unit in $UNITS; do
+    [ -f "$UNIT_BACKUP/$unit.service" ] \
+      && install -m 644 "$UNIT_BACKUP/$unit.service" "/etc/systemd/system/$unit.service"
+  done
+  [ -f "$UNIT_BACKUP/rc.local" ] && install -m 755 "$UNIT_BACKUP/rc.local" /etc/rc.local
+  systemctl daemon-reload || true
+  return 0
+}
+
+# Same set the success path starts, and in the same order. ckpool is deliberately
+# absent: its intent lives in the database and serviceMonitor acts on it.
+start_services() {
+  systemctl start apollo-bootstrap.service apollo-api.service apollo-ui-v2.service || true
+  systemctl start node.service apollo-miner.service || true
+  return 0
 }
 
 restore_code() {
   local b; b="${BACKUP_CODE:-$(cat "$BACKUP_DIR/.last-code-backup" 2>/dev/null || true)}"
-  [ -n "$b" ] && [ -d "$b" ] || return 0
+  [ -n "$b" ] && [ -d "$b" ] || { err "No code backup to restore from"; return 1; }
   err "Restoring the previous code from $b"
-  # Rescue bitcoind from whichever backend/ is currently in place first, so the
-  # restore cannot delete it along with the half-installed release.
-  preserve_binaries
-  local d
+  rescue_binaries
+  local d f
   for d in $OWNED; do rm -rf "$APOLLO_DIR/$d"; [ -e "$b/$d" ] && mv "$b/$d" "$APOLLO_DIR/$d"; done
   rm -rf "$UI_DIR/.next"; [ -e "$b/apolloui-v2/.next" ] && mv "$b/apolloui-v2/.next" "$UI_DIR/.next"
   place_binaries
-  systemctl daemon-reload || true
+  # Absent in the backup means absent before the update — the file must go, not
+  # survive as the new release's copy.
+  for f in $ROOT_FILES; do
+    if [ -e "$b/$f" ]; then cp -p "$b/$f" "$APOLLO_DIR/$f"; else rm -f "$APOLLO_DIR/$f"; fi
+  done
+  chown -R futurebit:futurebit "$APOLLO_DIR" || true
+  restore_units
+  return 0
 }
 
 health_ok() {
@@ -225,6 +327,9 @@ health_ok() {
 }
 
 # --- run ---------------------------------------------------------------------
+# Everything above is definitions; the tests source the file to here and stop.
+[ -n "${APOLLO_UPDATE_LIB:-}" ] && return 0
+
 rm -f "$TMPFILE"; echo "5" > "$TMPFILE"
 
 for t in curl jq zstd sha256sum sqlite3 cosign; do
@@ -308,6 +413,8 @@ fi
 
 echo "60" > "$TMPFILE"
 log "Stopping services"
+# Armed before the stop, so a failure during it still restarts what went down.
+STOPPED=1
 # The node runs binaries and configuration out of this checkout.
 systemctl stop ckpool.service node.service apollo-ui-v2.service apollo-api.service
 if systemctl is-active --quiet node.service || pgrep -u futurebit -x bitcoind >/dev/null 2>&1; then
@@ -316,14 +423,14 @@ fi
 
 echo "70" > "$TMPFILE"
 log "Installing $VERSION"
+MUTATED=1
 preserve_binaries
 backup_code
-SWAPPED=1
 for d in $OWNED; do [ -e "$STAGING/$d" ] && mv "$STAGING/$d" "$APOLLO_DIR/$d"; done
 mkdir -p "$UI_DIR/.next"
 mv "$STAGING/apolloui-v2/.next/standalone" "$UI_DIR/.next/standalone"
 place_binaries
-for f in knexfile.js package.json version.json; do
+for f in $ROOT_FILES; do
   [ -e "$STAGING/$f" ] && cp "$STAGING/$f" "$APOLLO_DIR/$f"
 done
 # Device state lives outside the release and is never touched: .env,
@@ -332,7 +439,11 @@ chown -R futurebit:futurebit "$APOLLO_DIR"
 
 echo "85" > "$TMPFILE"
 log "Applying units and configuration"
-for unit in apollo-bootstrap apollo-api apollo-ui-v2 apollo-miner node ckpool rc-local swap; do
+# Snapshot the live units first: they are overwritten and enabled below, and a
+# rollback that restores only the code leaves the device booting old code under
+# the new release's units.
+backup_units
+for unit in $UNITS; do
   [ -f "$APOLLO_DIR/backend/systemd/$unit.service" ] \
     && install -m 644 "$APOLLO_DIR/backend/systemd/$unit.service" "/etc/systemd/system/$unit.service"
 done
@@ -350,5 +461,6 @@ systemctl start node.service apollo-miner.service || err "A mining service did n
 health_ok || die "Health check failed after installing $VERSION"
 
 echo "100" > "$TMPFILE"
+COMPLETED=1
 log "Updated to $VERSION"
 rm -f "$TMPFILE"
