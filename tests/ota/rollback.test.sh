@@ -168,6 +168,42 @@ EOF
   done
 )
 
+# --- backups are pruned -------------------------------------------------------
+# Nothing pruned them, so ~199 MB accumulated per update until the disk preflight
+# refused every further run and the device could no longer take security fixes.
+(
+  make_device
+  for i in 1 2 3 4; do
+    mkdir -p "$APOLLO_STATE_DIR/backups/code-pre-2026010${i}T000000Z"
+    mkdir -p "$APOLLO_STATE_DIR/backups/units-pre-2026010${i}T000000Z"
+    sleep 0.01
+  done
+  prune_backups
+  check "keeps exactly one code backup" \
+    "$(ls -1d "$APOLLO_STATE_DIR"/backups/code-pre-* 2>/dev/null | wc -l | tr -d ' ')" "1"
+  check "keeps three unit backups" \
+    "$(ls -1d "$APOLLO_STATE_DIR"/backups/units-pre-* 2>/dev/null | wc -l | tr -d ' ')" "3"
+  # The survivor must be the newest, or the rollback target is the one deleted.
+  check "the kept code backup is the newest" \
+    "$(basename "$(ls -1d "$APOLLO_STATE_DIR"/backups/code-pre-* 2>/dev/null | head -1)")" \
+    "code-pre-20260104T000000Z"
+)
+
+# --- version ordering ---------------------------------------------------------
+# Lexical comparison ranked rc10 below rc9, so beta devices stuck at rc9 and, in
+# the other direction, accepted rc2 over rc10 as an upgrade.
+(
+  make_device
+  vt() { if version_gt "$1" "$2"; then echo TRUE; else echo FALSE; fi; }
+  check "rc10 outranks rc9"            "$(vt 2.2.0-rc10 2.2.0-rc9)"     "TRUE"
+  check "rc2 does not outrank rc10"    "$(vt 2.2.0-rc2 2.2.0-rc10)"     "FALSE"
+  check "beta.10 outranks beta.2"      "$(vt 2.2.0-beta.10 2.2.0-beta.2)" "TRUE"
+  check "a release outranks its rc"    "$(vt 2.2.0 2.2.0-rc1)"          "TRUE"
+  check "an rc does not outrank its release" "$(vt 2.2.0-rc1 2.2.0)"    "FALSE"
+  check "equal versions do not outrank" "$(vt 2.2.0 2.2.0)"             "FALSE"
+  check "2.10.0 outranks 2.9.0"        "$(vt 2.10.0 2.9.0)"             "TRUE"
+)
+
 # --- a signal must not be read as success -------------------------------------
 # The EXIT trap can run with $? == 0 when the shell dies on a signal, which took
 # the success branch and skipped the rollback. Run the real script under SIGTERM.

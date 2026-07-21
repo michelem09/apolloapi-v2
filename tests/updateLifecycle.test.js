@@ -80,6 +80,21 @@ describe('update lifecycle contract', () => {
     expect(script).toMatch(/exec >>"\$LOG_FILE" 2>&1/);
   });
 
+  it('refuses an incomplete artifact before touching the device copy', () => {
+    const script = readBackendScript('update');
+
+    // The install loop skips anything missing, so without this an artifact built
+    // without backend/ completed "successfully" with backend/ simply gone — the
+    // health probe passes, because the API and UI start fine from src/.
+    expect(script).toMatch(/Artifact is missing \$d/);
+    expect(script).toMatch(/Artifact is missing \$f/);
+
+    const assertion = script.indexOf('Artifact is missing $d');
+    const backup = script.indexOf('backup_code\n');
+    expect(assertion).toBeGreaterThan(-1);
+    expect(backup).toBeGreaterThan(assertion);
+  });
+
   it('provisions its own dependencies instead of refusing to run', () => {
     const script = readBackendScript('update');
 

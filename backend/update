@@ -118,7 +118,33 @@ version_gt() {  # $1 > $2 ?
   [ -z "$ap" ] && [ -n "$bp" ] && return 0
   [ -n "$ap" ] && [ -z "$bp" ] && return 1
   [ "$ap" = "$bp" ] && return 1
-  [ "$(printf '%s\n%s\n' "$ap" "$bp" | sort | tail -n 1)" = "$ap" ]
+
+  local na nb
+  na="$(normalize_prerelease "$ap")"
+  nb="$(normalize_prerelease "$bp")"
+  [ "$na" = "$nb" ] && return 1
+  # LC_ALL=C, because collation is locale-dependent: without it two devices in
+  # different locales could reach opposite conclusions about the same pair.
+  local LC_ALL=C
+  [[ "$na" > "$nb" ]]
+}
+
+# Zero-pads every run of digits so a plain lexical compare orders them naturally:
+# rc9 -> rc0000000009, rc10 -> rc0000000010.
+#
+# This is a DELIBERATE deviation from semver §11, which compares alphanumeric
+# identifiers lexically and therefore ranks rc10 BELOW rc9 — formally correct and
+# certainly not what anyone means. Strict semver only gets this right when the
+# number is its own dot-separated field (rc.10), which is not how these tags are
+# written. Comparing lexically without the padding left every beta device stuck
+# at rc9 and, in the other direction, accepting rc2 over rc10 as an "upgrade".
+normalize_prerelease() {
+  local s="$1" out=''
+  while [[ "$s" =~ ^([^0-9]*)([0-9]+)(.*)$ ]]; do
+    out="$out${BASH_REMATCH[1]}$(printf '%010d' "$((10#${BASH_REMATCH[2]}))")"
+    s="${BASH_REMATCH[3]}"
+  done
+  printf '%s%s' "$out" "$s"
 }
 
 valid_version() { printf '%s' "$1" | grep -qE "$VERSION_RE"; }
@@ -291,6 +317,27 @@ restore_units() {
   return 0
 }
 
+# Nothing pruned these, so every update left a full copy of the tree it replaced
+# (~160 MB) plus its 40 MB tarball on a small eMMC. After a handful of updates the
+# disk preflight starts refusing every run, and the device silently stops being
+# able to take security fixes — the exact failure this mechanism exists to prevent.
+# Called only after a successful install, so the rollback target is never the one
+# being deleted.
+prune_backups() {
+  local d n=0
+  # One previous tree is kept: it is what a later manual recovery would use.
+  for d in $(ls -1dt "$BACKUP_DIR"/code-pre-* 2>/dev/null); do
+    n=$((n+1)); [ "$n" -le 1 ] && continue
+    rm -rf "$d"
+  done
+  n=0
+  for d in $(ls -1dt "$BACKUP_DIR"/units-pre-* 2>/dev/null); do
+    n=$((n+1)); [ "$n" -le 3 ] && continue
+    rm -rf "$d"
+  done
+  return 0
+}
+
 # Same set the success path starts, and in the same order: bootstrap first,
 # because node and apollo-miner Require it. ckpool is deliberately absent — its
 # intent lives in the database and serviceMonitor acts on it.
@@ -385,8 +432,19 @@ fi
 # Peak usage is the tarball plus the unpacked tree plus the backup of what it
 # replaces; ask for a generous multiple of the artifact size.
 NEED_KB=$(( (SIZE / 1024) * 4 + 262144 ))
-FREE_KB=$(df -Pk "$APOLLO_DIR" | awk 'NR==2 {print $4}')
-[ "$FREE_KB" -ge "$NEED_KB" ] || die "Not enough disk space: need ~$((NEED_KB/1024)) MB, have $((FREE_KB/1024)) MB"
+# Both filesystems: the tree is unpacked under APOLLO_DIR but the backup and the
+# download land under STATE_DIR, which is not necessarily the same mount. Created
+# first, because df on a path that does not exist reports nothing.
+mkdir -p "$STATE_DIR"
+for target in "$APOLLO_DIR" "$STATE_DIR"; do
+  FREE_KB=$(df -Pk "$target" | awk 'NR==2 {print $4}')
+  [ "$FREE_KB" -ge "$NEED_KB" ] \
+    || die "Not enough disk space on $target: need ~$((NEED_KB/1024)) MB, have $((FREE_KB/1024)) MB"
+done
+
+# Staging dirs from a run that was killed before its trap could fire; each holds
+# a full unpacked release and nothing else ever removes them.
+rm -rf "$APOLLO_DIR"/.staging.* 2>/dev/null || true
 
 log "Downloading $VERSION"
 echo "15" > "$TMPFILE"
@@ -418,6 +476,19 @@ tar -C "$STAGING" --zstd --no-same-owner -xf "$TARBALL"
 STAGED_VERSION="$(jq -r '.version // empty' "$STAGING/version.json" 2>/dev/null || true)"
 [ "$STAGED_VERSION" = "$VERSION" ] || die "Artifact is version '$STAGED_VERSION', manifest said '$VERSION'"
 [ -f "$STAGING/apolloui-v2/.next/standalone/server.js" ] || die "Artifact has no standalone UI server"
+
+# Everything the swap will move must be here BEFORE the device's copy is taken
+# away. The install loop skipped anything missing, so an artifact built without
+# backend/ (a staging regression, a truncated pipe in the release workflow)
+# completed "successfully" with backend/ simply gone: node, miner and ckpool dead
+# pointing at scripts that no longer existed, and all eight unit installs quietly
+# skipped — while the health probe passed, because the API and UI start fine.
+for d in $OWNED; do
+  [ -e "$STAGING/$d" ] || die "Artifact is missing $d — refusing to install"
+done
+for f in $ROOT_FILES; do
+  [ -e "$STAGING/$f" ] || die "Artifact is missing $f — refusing to install"
+done
 
 # Preserve solo intent before anything stops. /run is cleared on reboot.
 if [ ! -e "$SOLO_REQUEST_FILE" ] && db="$(resolve_database_url)"; then
@@ -509,5 +580,11 @@ health_ok || die "Health check failed after installing $VERSION"
 
 echo "100" > "$TMPFILE"
 COMPLETED=1
+
+# The verified download is only useful for retrying a failed install, so it goes
+# once the install has succeeded.
+rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"
+prune_backups
+
 log "Updated to $VERSION"
 rm -f "$TMPFILE"
