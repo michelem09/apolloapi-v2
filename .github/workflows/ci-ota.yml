@@ -4,8 +4,10 @@ name: ci-ota
 # tag, since a broken apollo-update is a broken update path for the whole fleet.
 
 on:
+  # push only on integration branches; feature branches are covered by the PR,
+  # so a PR does not run the whole suite twice.
   push:
-    branches: ['**']
+    branches: [v2.2, main]
     paths: &ota_paths
       - 'bin/apollo-update'
       - 'bootstrap.sh'

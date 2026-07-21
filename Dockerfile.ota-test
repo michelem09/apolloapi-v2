@@ -6,7 +6,9 @@
 # What is still stubbed: systemctl (no init in a container) and the health probe
 # (no running API). Those are covered on apollo2. What is REAL here and nowhere
 # else off-device: the cosign keyless signature check against the fork identity.
-FROM node:21-bookworm-slim
+#
+# A plain Debian base: this container drives a bash tool and never runs Node.
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ca-certificates zstd jq sqlite3 \
