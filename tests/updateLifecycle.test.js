@@ -30,10 +30,11 @@ describe('update lifecycle contract', () => {
     // so anything left running never picks up the new release. apollo-miner kept
     // executing the old binary, and apollo-bootstrap — oneshot with
     // RemainAfterExit — never re-ran its migrations.
-    // The whole stop region, not one command: bootstrap is stopped separately
-    // and last, because everything else declares Requires= on it and stopping it
-    // in the same transaction races their ExecStop.
-    const stop = script.match(/log "Stopping services"[\s\S]*?verify_all_stopped/);
+    // The stop lives in one function, used by both the main path and the
+    // rollback, so the two cannot drift. bootstrap is stopped separately and
+    // last, because everything else declares Requires= on it and stopping it in
+    // the same transaction races their ExecStop.
+    const stop = script.match(/stop_services\(\) \{[\s\S]*?\n\}/);
     expect(stop).not.toBeNull();
     for (const unit of [
       'ckpool.service',

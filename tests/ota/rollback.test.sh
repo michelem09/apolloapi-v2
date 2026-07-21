@@ -28,7 +28,7 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=33
+EXPECTED_ASSERTIONS=37
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -84,7 +84,7 @@ echo "rollback contract"
 (
   make_device
   preserve_binaries          # bitcoind now lives ONLY at $PRESERVED_BIN
-  backup_code
+  backup_code 2>/dev/null
   check "bitcoind is out of the tree mid-update" "$(flavours)" "0"
   restore_code >/dev/null 2>&1
   check "rollback puts all six flavours back" "$(flavours)" "6"
@@ -96,7 +96,7 @@ echo "rollback contract"
 (
   make_device
   preserve_binaries
-  backup_code
+  backup_code 2>/dev/null
   restore_code >/dev/null 2>&1          # run 1 rolls back
   preserve_binaries                     # run 2 starts
   restore_code >/dev/null 2>&1          # run 2 also rolls back
@@ -109,7 +109,7 @@ echo "rollback contract"
 (
   make_device
   BACKUP_CODE=''
-  backup_code
+  backup_code 2>/dev/null
   ptr="$(cat "$APOLLO_STATE_DIR/backups/.last-code-backup" 2>/dev/null)"
   if [ -n "$ptr" ] && [ -d "$ptr" ]; then ok "backup pointer written and valid"
   else bad "backup pointer written and valid" "got '$ptr'"; fi
@@ -125,7 +125,7 @@ echo "rollback contract"
 (
   make_device
   echo '{"version":"2.2.0"}' > "$APOLLO_ROOT_DIR/version.json"
-  preserve_binaries; backup_code
+  preserve_binaries; backup_code 2>/dev/null
   echo '{"version":"2.3.0"}' > "$APOLLO_ROOT_DIR/version.json"   # the new release
   restore_code >/dev/null 2>&1
   check "version.json reverted to the old release" \
@@ -138,7 +138,7 @@ echo "rollback contract"
 (
   make_device
   rm -f "$APOLLO_ROOT_DIR/version.json"
-  preserve_binaries; backup_code
+  preserve_binaries; backup_code 2>/dev/null
   echo '{"version":"2.3.0"}' > "$APOLLO_ROOT_DIR/version.json"
   restore_code >/dev/null 2>&1
   if [ -e "$APOLLO_ROOT_DIR/version.json" ]; then
@@ -182,6 +182,37 @@ EOF
     if grep -q "start.*$unit" "$SYSTEMCTL_LOG"; then ok "restarts $unit"
     else bad "restarts $unit" "not started"; fi
   done
+)
+
+# --- the database rolls back with the code ------------------------------------
+# A release can carry knex migrations, and apollo-bootstrap applies them before
+# the health check decides whether to keep the release. Restoring only
+# migrations/ leaves the DB migrated forward past files that no longer exist;
+# knex then refuses to run, bootstrap fails, and apollo-api, node and
+# apollo-miner all Require it — unbootable, SSH-only recovery.
+(
+  make_device
+  db="$APOLLO_STATE_DIR/db/futurebit.sqlite"
+  mkdir -p "$(dirname "$db")"
+  sqlite3 "$db" "CREATE TABLE knex_migrations (name TEXT); INSERT INTO knex_migrations VALUES ('001_old.js');"
+  printf 'DATABASE_URL=%s\n' "$db" > "$APOLLO_ROOT_DIR/.env"
+
+  preserve_binaries; backup_code
+  if [ -f "$BACKUP_CODE/futurebit.sqlite" ]; then ok "the database is backed up with the code"
+  else bad "the database is backed up with the code" "no snapshot in $BACKUP_CODE"; fi
+
+  # The release migrates forward, and leaves WAL sidecars behind.
+  sqlite3 "$db" "INSERT INTO knex_migrations VALUES ('002_new.js');"
+  : > "$db-wal"; : > "$db-shm"
+
+  restore_code >/dev/null 2>&1
+  check "the database is rolled back too" \
+    "$(sqlite3 "$db" "SELECT count(*) FROM knex_migrations;" 2>/dev/null)" "1"
+  check "the forward migration is gone" \
+    "$(sqlite3 "$db" "SELECT count(*) FROM knex_migrations WHERE name='002_new.js';" 2>/dev/null)" "0"
+  if [ -e "$db-wal" ] || [ -e "$db-shm" ]; then
+    bad "WAL sidecars of the forward database are removed" "they survived the restore"
+  else ok "WAL sidecars of the forward database are removed"; fi
 )
 
 # --- manifest fields are validated as whole values ----------------------------

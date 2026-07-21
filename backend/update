@@ -230,7 +230,13 @@ cleanup() {
 
   [ -n "$TARBALL" ] && rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"
   if [ "$MUTATED" -eq 1 ]; then
+    # Stop first. On the `health_ok || die` path everything has already been
+    # started again against the half-installed release, and apollo-api holds the
+    # database open — restoring it underneath a live writer would corrupt exactly
+    # the file the rollback exists to save.
+    stop_services
     restore_code || err "ROLLBACK FAILED — this device needs manual recovery over SSH"
+    STOPPED=1
   fi
   # Restarting is unconditional once anything has been stopped: an explicit `die`
   # between the stop and the end used to leave the API, UI, node and ckpool all
@@ -318,6 +324,53 @@ backup_code() {
   for d in $OWNED; do [ -e "$APOLLO_DIR/$d" ] && mv "$APOLLO_DIR/$d" "$BACKUP_CODE/$d"; done
   [ -e "$UI_DIR/.next" ] && { mkdir -p "$BACKUP_CODE/apolloui-v2"; mv "$UI_DIR/.next" "$BACKUP_CODE/apolloui-v2/.next"; }
   for f in $ROOT_FILES; do [ -e "$APOLLO_DIR/$f" ] && cp -p "$APOLLO_DIR/$f" "$BACKUP_CODE/$f"; done
+  backup_database
+  return 0
+}
+
+# The database has to travel with the code, because a release can carry knex
+# migrations and apollo-bootstrap applies them before the health check decides
+# whether to keep the release at all.
+#
+# Restoring only migrations/ leaves the DB migrated FORWARD past files that no
+# longer exist, and knex refuses to run at all in that state ("the migration
+# directory is corrupt, the following files are missing"). bootstrap.js then
+# exits non-zero, its oneshot unit fails, and apollo-api, node and apollo-miner
+# all declare Requires= on it — so none of them start, at rollback time and on
+# every boot afterwards. The health check, which exists to protect the device,
+# would be the thing that bricks it. Recovery would need SSH.
+#
+# A rollback therefore also rolls the database back, losing anything written
+# during the update window (minutes): settings changes, time-series samples,
+# automation events. That is the intended trade against an unbootable device.
+backup_database() {
+  local db
+  if ! db="$(resolve_database_url)"; then
+    err "No database found; a rollback will not be able to revert migrations"
+    return 0
+  fi
+  # `.backup`, not cp: the database runs in WAL mode, so a plain copy can miss
+  # committed transactions still sitting in the -wal file. The timeout covers a
+  # writer holding the lock as the services wind down.
+  if ! sqlite3 "$db" ".timeout 10000" ".backup '$BACKUP_CODE/futurebit.sqlite'" 2>/dev/null; then
+    err "Could not back up the database; refusing to continue"
+    return 1
+  fi
+  return 0
+}
+
+restore_database() {
+  local b db
+  b="${BACKUP_CODE:-$(cat "$BACKUP_DIR/.last-code-backup" 2>/dev/null || true)}"
+  [ -n "$b" ] && [ -f "$b/futurebit.sqlite" ] || return 0
+  if ! db="$(resolve_database_url)"; then return 0; fi
+  err "Restoring the database from $b"
+  # The -wal and -shm belong to the forward-migrated database; leaving them beside
+  # a restored file would reintroduce exactly what is being rolled back. Callers
+  # must have stopped everything first.
+  rm -f "$db-wal" "$db-shm"
+  cp -p "$b/futurebit.sqlite" "$db"
+  chown futurebit:futurebit "$db" 2>/dev/null || true
   return 0
 }
 
@@ -399,6 +452,18 @@ verify_all_stopped() {
   return 0
 }
 
+# Order matters: node and apollo-miner have Requires=apollo-bootstrap, so
+# bootstrap goes last on the way down and first on the way up. It is stopped on
+# its own because everything above declares Requires= on it, and doing it in one
+# transaction makes systemd tear those units down while their own ExecStop is
+# still running — which left node.service "failed" on hardware.
+stop_services() {
+  systemctl stop ckpool.service node.service apollo-miner.service \
+    apollo-ui-v2.service apollo-api.service || true
+  systemctl stop apollo-bootstrap.service || true
+  return 0
+}
+
 # Same set the success path starts, and in the same order: bootstrap first,
 # because node and apollo-miner Require it. ckpool is deliberately absent — its
 # intent lives in the database and serviceMonitor acts on it.
@@ -413,6 +478,7 @@ restore_code() {
   local b; b="${BACKUP_CODE:-$(cat "$BACKUP_DIR/.last-code-backup" 2>/dev/null || true)}"
   [ -n "$b" ] && [ -d "$b" ] || { err "No code backup to restore from"; return 1; }
   err "Restoring the previous code from $b"
+  restore_database
   rescue_binaries
   local d f
   for d in $OWNED; do rm -rf "$APOLLO_DIR/$d"; [ -e "$b/$d" ] && mv "$b/$d" "$APOLLO_DIR/$d"; done
@@ -570,14 +636,7 @@ STOPPED=1
 #
 # Order matters: node and apollo-miner have Requires=apollo-bootstrap, so
 # bootstrap goes last on the way down and first on the way up.
-systemctl stop ckpool.service node.service apollo-miner.service \
-  apollo-ui-v2.service apollo-api.service || true
-# bootstrap last, and on its own: everything above declares Requires= on it, so
-# stopping it in the same transaction makes systemd tear those units down while
-# their own ExecStop is still running. Observed on hardware — node.service runs
-# bitcoind under `screen`, the wrapper got pulled out from under a shutdown that
-# had already completed cleanly, exited 1, and the unit ended up "failed".
-systemctl stop apollo-bootstrap.service || true
+stop_services
 
 # The aggregate exit code of `systemctl stop` is deliberately ignored, because it
 # reports unit *state* and not whether the shutdown did its job: the same clean
