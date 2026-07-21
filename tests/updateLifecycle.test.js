@@ -30,7 +30,10 @@ describe('update lifecycle contract', () => {
     // so anything left running never picks up the new release. apollo-miner kept
     // executing the old binary, and apollo-bootstrap — oneshot with
     // RemainAfterExit — never re-ran its migrations.
-    const stop = script.match(/systemctl stop [\s\S]*?(?=\n[^\s\\])/);
+    // The whole stop region, not one command: bootstrap is stopped separately
+    // and last, because everything else declares Requires= on it and stopping it
+    // in the same transaction races their ExecStop.
+    const stop = script.match(/log "Stopping services"[\s\S]*?for u in /);
     expect(stop).not.toBeNull();
     for (const unit of [
       'ckpool.service',
@@ -49,10 +52,28 @@ describe('update lifecycle contract', () => {
       stop[0].indexOf('apollo-api.service')
     );
 
-    expect(script).not.toMatch(/systemctl stop[^\n]*\|\| true/);
+    // The exit code of `systemctl stop` is ignored on purpose — it reports unit
+    // state, not whether the shutdown worked, and a clean bitcoind shutdown can
+    // still leave node.service "failed" because of its screen wrapper. What
+    // replaces it is stronger: every unit is verified inactive afterwards.
+    expect(script).toMatch(
+      /for u in [^\n]*; do\n\s*systemctl is-active --quiet "\$u\.service" && die/
+    );
+    const verifyLoop = script.match(/for u in ([^;]+); do\n\s*systemctl is-active --quiet/);
+    expect(verifyLoop).not.toBeNull();
+    for (const unit of [
+      'ckpool',
+      'node',
+      'apollo-miner',
+      'apollo-ui-v2',
+      'apollo-api',
+      'apollo-bootstrap',
+    ]) {
+      expect(verifyLoop[1]).toContain(unit);
+    }
 
-    // Both residual checks: ckpool's stop path cannot report failure, because
-    // ckpool_stop.sh ends in `|| true` and the daemon backgrounds itself.
+    // Both residual process checks: a unit can report inactive while its daemon
+    // survives. ckpool_stop.sh ends in `|| true` and ckpool backgrounds itself.
     expect(script).toContain('pgrep -u futurebit -x bitcoind');
     expect(script).toContain('pgrep -u futurebit -x ckpool');
 

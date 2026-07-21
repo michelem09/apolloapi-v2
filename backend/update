@@ -510,8 +510,22 @@ STOPPED=1
 # Order matters: node and apollo-miner have Requires=apollo-bootstrap, so
 # bootstrap goes last on the way down and first on the way up.
 systemctl stop ckpool.service node.service apollo-miner.service \
-  apollo-ui-v2.service apollo-api.service apollo-bootstrap.service
-if systemctl is-active --quiet node.service || pgrep -u futurebit -x bitcoind >/dev/null 2>&1; then
+  apollo-ui-v2.service apollo-api.service || true
+# bootstrap last, and on its own: everything above declares Requires= on it, so
+# stopping it in the same transaction makes systemd tear those units down while
+# their own ExecStop is still running. Observed on hardware — node.service runs
+# bitcoind under `screen`, the wrapper got pulled out from under a shutdown that
+# had already completed cleanly, exited 1, and the unit ended up "failed".
+systemctl stop apollo-bootstrap.service || true
+
+# The aggregate exit code of `systemctl stop` is deliberately ignored, because it
+# reports unit *state* and not whether the shutdown did its job: the same clean
+# bitcoind shutdown can leave node.service "failed" purely through that screen
+# wrapper. What actually matters is verified here instead — nothing still running.
+for u in ckpool node apollo-miner apollo-ui-v2 apollo-api apollo-bootstrap; do
+  systemctl is-active --quiet "$u.service" && die "$u.service did not stop; aborting update"
+done
+if pgrep -u futurebit -x bitcoind >/dev/null 2>&1; then
   die "Bitcoin node did not stop cleanly; aborting update"
 fi
 # ckpool needs its own check and not belt-and-braces: ckpool_stop.sh ends in
