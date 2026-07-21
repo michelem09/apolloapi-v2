@@ -1,132 +1,292 @@
 #!/bin/bash
+# Apollo updater — installs a signed, pre-built release over the checkout.
+#
+# Replaces "git pull + yarn install + next build on the device", which took
+# 10–20 minutes and peaked enough RAM to take the box down. The release is built
+# and signed by CI; the device only verifies and unpacks it.
+#
+# Deliberately NOT the release-layout OTA (releases/<v> + current symlink): the
+# update mechanism itself never changes, so a bad release is corrected by the
+# next one through the same still-working path. See OTA_UPDATE_REDESIGN.md §5.1.
+#
+# Extraction is additive on purpose: files the tarball does not carry — bitcoind
+# under backend/node/bin, the materialised miner/ckpool binaries — stay from the
+# previous install, so the artifact stays ~40 MB instead of ~150 MB.
 set -Eeuo pipefail
 
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 TMPFILE='/tmp/update_progress'
 SOLO_REQUEST_FILE='/run/apollo-update-solo-requested-status'
 APOLLO_DIR='/opt/apolloapi'
 UI_DIR="${APOLLO_DIR}/apolloui-v2"
 STATE_DIR="${APOLLO_STATE_DIR:-/var/lib/apollo}"
+TRUST_CONF="${APOLLO_TRUST_CONF:-/etc/apollo/update.conf}"
+DL_DIR="${STATE_DIR}/cache/dl"
+BACKUP_DIR="${STATE_DIR}/backups"
+OFFICIAL_OWNER='jstefanop'
+OFFICIAL_REPO='apolloapi-v2'
+HEALTH_URL="${APOLLO_HEALTH_URL:-http://localhost:5000/health}"
+UI_HEALTH_URL="${APOLLO_UI_HEALTH_URL:-http://localhost:3000/}"
+HEALTH_TIMEOUT="${APOLLO_HEALTH_TIMEOUT:-90}"
+VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$'
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Update script must be run by root or with sudo${NC}"
-    exit 1
-fi
+STAGING=''; TARBALL=''; SWAPPED=0
 
-# The API relocates the DB out of the checkout into the state dir (src/paths.js),
-# and that can happen while this script runs, so resolve the path at each use
-# instead of once at startup. .env is the source of truth, with the managed and
-# legacy locations as fallbacks.
+log()  { echo -e "${YELLOW} ---> $*${NC}"; }
+err()  { echo -e "${RED}$*${NC}" >&2; }
+die()  { err "$*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+[ "$EUID" -eq 0 ] || die "Update script must be run by root or with sudo"
+
+# --- config, parsed and never executed --------------------------------------
+# source.conf is writable by the app user, so sourcing it would be code
+# execution as root. Read the keys instead.
+conf_get() {  # file key
+  [ -r "$1" ] || return 0
+  sed -n "s/^[[:space:]]*$2=//p" "$1" | tail -n 1 \
+    | sed -e 's/[[:space:]]*#.*$//' -e 's/\r$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//"
+}
+
+SOURCE_CONF="${APOLLO_SOURCE_CONF:-$STATE_DIR/source.conf}"
+GIT_BASE="$(conf_get "$SOURCE_CONF" APOLLO_GIT_BASE)"; GIT_BASE="${GIT_BASE:-https://github.com/$OFFICIAL_OWNER}"
+API_REPO="$(conf_get "$SOURCE_CONF" APOLLO_API_REPO)"; API_REPO="${API_REPO:-$OFFICIAL_REPO}"
+CHANNEL="$(conf_get "$SOURCE_CONF" APOLLO_CHANNEL)";   CHANNEL="${CHANNEL:-stable}"
+CHANNEL_URL="${APOLLO_CHANNEL_URL:-${GIT_BASE}/${API_REPO}/releases/download/channel-${CHANNEL}/${CHANNEL}.json}"
+
+# Which identity to trust is a root-only decision: source.conf only says where to
+# fetch, and a wrong value there must not be able to change what we accept.
+default_identity="^https://github\\.com/${OFFICIAL_OWNER}/${OFFICIAL_REPO}/\\.github/workflows/release\\.yml@refs/tags/v"
+TRUST_IDENTITY="$(conf_get "$TRUST_CONF" APOLLO_TRUST_IDENTITY)"; TRUST_IDENTITY="${TRUST_IDENTITY:-$default_identity}"
+TRUST_ISSUER="$(conf_get "$TRUST_CONF" APOLLO_TRUST_ISSUER)";     TRUST_ISSUER="${TRUST_ISSUER:-https://token.actions.githubusercontent.com}"
+
+# --- helpers -----------------------------------------------------------------
+sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# Semver-aware. `sort -V` is not: it orders 2.2.0-rc1 ABOVE 2.2.0, which would
+# leave every beta device thinking it is already up to date.
+version_gt() {  # $1 > $2 ?
+  local a="$1" b="$2" ac bc ap bp i x y
+  ac="${a%%-*}"; bc="${b%%-*}"
+  [ "$a" = "$ac" ] && ap='' || ap="${a#*-}"
+  [ "$b" = "$bc" ] && bp='' || bp="${b#*-}"
+  local -a A B; IFS=. read -ra A <<<"$ac"; IFS=. read -ra B <<<"$bc"
+  for i in 0 1 2; do
+    x=$((10#${A[i]:-0})); y=$((10#${B[i]:-0}))
+    [ "$x" -gt "$y" ] && return 0
+    [ "$x" -lt "$y" ] && return 1
+  done
+  # Cores equal: a release outranks any prerelease of the same core.
+  [ -z "$ap" ] && [ -n "$bp" ] && return 0
+  [ -n "$ap" ] && [ -z "$bp" ] && return 1
+  [ "$ap" = "$bp" ] && return 1
+  [ "$(printf '%s\n%s\n' "$ap" "$bp" | sort | tail -n 1)" = "$ap" ]
+}
+
+valid_version() { printf '%s' "$1" | grep -qE "$VERSION_RE"; }
+# A field starting with '-' would be read by curl as an option (e.g. -K reads a
+# config file), so every URL is schema-checked and passed after --url.
+valid_url() { printf '%s' "$1" | grep -qE '^https://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$'; }
+
+fetch() { curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 --url "$1"; }
+
+current_version() {
+  if [ -f "$APOLLO_DIR/version.json" ]; then jq -r '.version // empty' "$APOLLO_DIR/version.json"
+  elif [ -f "$APOLLO_DIR/package.json" ]; then jq -r '.version // empty' "$APOLLO_DIR/package.json"
+  fi
+}
+
 resolve_database_url() {
-    local from_env='' candidate
-    if [ -r "${APOLLO_DIR}/.env" ]; then
-        from_env=$(sed -n 's/^DATABASE_URL=//p' "${APOLLO_DIR}/.env" | tail -n 1)
-    fi
-    for candidate in "$from_env" "${STATE_DIR}/db/futurebit.sqlite" "${APOLLO_DIR}/futurebit.sqlite"; do
-        if [ -n "$candidate" ] && [ -f "$candidate" ]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-    return 1
+  local from_env candidate
+  from_env="$(conf_get "$APOLLO_DIR/.env" DATABASE_URL)"
+  for candidate in "$from_env" "$STATE_DIR/db/futurebit.sqlite" "$APOLLO_DIR/futurebit.sqlite"; do
+    [ -n "$candidate" ] && [ -f "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
 }
 
 restore_solo_intent() {
-    [ -f "$SOLO_REQUEST_FILE" ] || return 0
-
-    local database_url
-    if ! database_url=$(resolve_database_url); then
-        # Keep the marker so a later run can still restore the user's intent
-        # instead of silently dropping their solo-mining setting.
-        echo -e "${YELLOW}Could not locate the database; keeping preserved solo intent${NC}" >&2
-        return 0
-    fi
-
-    local requested_status
-    requested_status=$(<"$SOLO_REQUEST_FILE")
-    case "$requested_status" in
-        online|offline)
-            sqlite3 "$database_url" \
-                "UPDATE service_status
-                    SET status = 'pending',
-                        requested_status = '${requested_status}',
-                        requested_at = CURRENT_TIMESTAMP
-                  WHERE service_name = 'solo';"
-            ;;
-        '')
-            sqlite3 "$database_url" \
-                "UPDATE service_status
-                    SET requested_status = NULL,
-                        requested_at = NULL
-                  WHERE service_name = 'solo';"
-            ;;
-    esac
-
-    rm -f "$SOLO_REQUEST_FILE"
+  [ -f "$SOLO_REQUEST_FILE" ] || return 0
+  local db requested
+  if ! db="$(resolve_database_url)"; then
+    err "Could not locate the database; keeping preserved solo intent"; return 0
+  fi
+  requested="$(<"$SOLO_REQUEST_FILE")"
+  case "$requested" in
+    online|offline) sqlite3 "$db" "UPDATE service_status SET status='pending', requested_status='${requested}', requested_at=CURRENT_TIMESTAMP WHERE service_name='solo';" ;;
+    '')             sqlite3 "$db" "UPDATE service_status SET requested_status=NULL, requested_at=NULL WHERE service_name='solo';" ;;
+  esac
+  rm -f "$SOLO_REQUEST_FILE"
 }
 
-on_error() {
-    local status=$?
-    trap - ERR
+# Any abort must leave the device on working code and no debris behind — the
+# previous design leaked a half-extracted tree and a partial tarball.
+cleanup() {
+  local status=$?
+  trap - ERR EXIT
+  [ -n "$STAGING" ] && rm -rf "$STAGING"
+  if [ "$status" -ne 0 ]; then
+    [ -n "$TARBALL" ] && rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"
+    [ "$SWAPPED" -eq 1 ] && restore_code
     restore_solo_intent || true
     rm -f "$TMPFILE"
-    echo -e "${RED}Update failed; the system was not rebooted${NC}" >&2
-    exit "$status"
+    err "Update failed; the previous version is still installed"
+  fi
+  exit "$status"
 }
-trap on_error ERR
+trap cleanup ERR EXIT
 
+# --- code swap ---------------------------------------------------------------
+# Directories the release fully owns. Replaced wholesale so files deleted
+# upstream do not linger; everything else in the checkout is left alone.
+OWNED='src config migrations node_modules'
+
+backup_code() {
+  BACKUP_CODE="$BACKUP_DIR/code-pre-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$BACKUP_CODE"
+  local d
+  for d in $OWNED; do [ -e "$APOLLO_DIR/$d" ] && mv "$APOLLO_DIR/$d" "$BACKUP_CODE/$d"; done
+  [ -e "$UI_DIR/.next" ] && { mkdir -p "$BACKUP_CODE/apolloui-v2"; mv "$UI_DIR/.next" "$BACKUP_CODE/apolloui-v2/.next"; }
+  printf '%s\n' "$BACKUP_CODE" > "$BACKUP_DIR/.last-code-backup"
+}
+
+restore_code() {
+  local b; b="${BACKUP_CODE:-$(cat "$BACKUP_DIR/.last-code-backup" 2>/dev/null || true)}"
+  [ -n "$b" ] && [ -d "$b" ] || return 0
+  err "Restoring the previous code from $b"
+  local d
+  for d in $OWNED; do rm -rf "$APOLLO_DIR/$d"; [ -e "$b/$d" ] && mv "$b/$d" "$APOLLO_DIR/$d"; done
+  rm -rf "$UI_DIR/.next"; [ -e "$b/apolloui-v2/.next" ] && mv "$b/apolloui-v2/.next" "$UI_DIR/.next"
+  systemctl daemon-reload || true
+}
+
+health_ok() {
+  local deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    # -L: the UI answers / with a 308 to /overview, which -fsS alone would accept
+    # even from a server that cannot serve a page.
+    if curl -fsS --max-time 5 --url "$HEALTH_URL" >/dev/null 2>&1 \
+       && curl -fsSL --max-time 5 --url "$UI_HEALTH_URL" >/dev/null 2>&1; then return 0; fi
+    sleep 3
+  done
+  return 1
+}
+
+# --- run ---------------------------------------------------------------------
+rm -f "$TMPFILE"; echo "5" > "$TMPFILE"
+
+for t in curl jq zstd sha256sum sqlite3 cosign; do
+  have "$t" || die "Missing dependency: $t (install it before updating)"
+done
+
+log "Checking ${CHANNEL} channel"
+MANIFEST="$(fetch "$CHANNEL_URL")" || die "Cannot reach the update channel"
+VERSION="$(jq -r '.version // empty' <<<"$MANIFEST")"
+URL="$(jq -r '.url // empty' <<<"$MANIFEST")"
+SIG_URL="$(jq -r '.signature_url // empty' <<<"$MANIFEST")"
+CERT_URL="$(jq -r '.certificate_url // empty' <<<"$MANIFEST")"
+SHA="$(jq -r '.sha256 // empty' <<<"$MANIFEST")"
+SIZE="$(jq -r '.size // 0' <<<"$MANIFEST")"
+
+valid_version "$VERSION" || die "Manifest version '$VERSION' is not a valid version"
+for u in "$URL" "$SIG_URL" "$CERT_URL"; do
+  valid_url "$u" || die "Manifest contains a URL that is not a plain https URL"
+done
+printf '%s' "$SHA" | grep -qE '^[0-9a-f]{64}$' || die "Manifest sha256 is malformed"
+
+CURRENT="$(current_version || true)"
+if [ -n "$CURRENT" ] && valid_version "$CURRENT"; then
+  [ "$CURRENT" = "$VERSION" ] && { log "Already on $VERSION"; rm -f "$TMPFILE"; exit 0; }
+  version_gt "$VERSION" "$CURRENT" || die "Refusing to move from $CURRENT to older/equal $VERSION"
+fi
+
+# Peak usage is the tarball plus the unpacked tree plus the backup of what it
+# replaces; ask for a generous multiple of the artifact size.
+NEED_KB=$(( (SIZE / 1024) * 4 + 262144 ))
+FREE_KB=$(df -Pk "$APOLLO_DIR" | awk 'NR==2 {print $4}')
+[ "$FREE_KB" -ge "$NEED_KB" ] || die "Not enough disk space: need ~$((NEED_KB/1024)) MB, have $((FREE_KB/1024)) MB"
+
+log "Downloading $VERSION"
+echo "15" > "$TMPFILE"
+mkdir -p "$DL_DIR" "$BACKUP_DIR"
+TARBALL="$DL_DIR/apollo-${VERSION}-aarch64.tar.zst"
+# Never resume onto a complete-but-wrong file: verify a cached copy, else refetch.
+if [ -f "$TARBALL" ] && [ "$(sha256_of "$TARBALL")" = "$SHA" ]; then
+  log "Using verified cached download"
+else
+  rm -f "$TARBALL"
+  curl -fL --retry 3 --connect-timeout 15 --max-time 1800 -o "$TARBALL" --url "$URL"
+fi
+curl -fsSL --max-time 120 -o "$TARBALL.sig"  --url "$SIG_URL"
+curl -fsSL --max-time 120 -o "$TARBALL.pem"  --url "$CERT_URL"
+
+echo "35" > "$TMPFILE"
+log "Verifying"
+GOT="$(sha256_of "$TARBALL")"
+[ "$GOT" = "$SHA" ] || die "Checksum mismatch (expected $SHA, got $GOT)"
+cosign verify-blob --certificate "$TARBALL.pem" --signature "$TARBALL.sig" \
+  --certificate-identity-regexp "$TRUST_IDENTITY" \
+  --certificate-oidc-issuer "$TRUST_ISSUER" "$TARBALL" >/dev/null 2>&1 \
+  || die "Signature verification failed — refusing to install"
+
+echo "45" > "$TMPFILE"
+log "Unpacking"
+STAGING="$(mktemp -d "${APOLLO_DIR}/.staging.XXXXXX")"
+tar -C "$STAGING" --zstd --no-same-owner -xf "$TARBALL"
+STAGED_VERSION="$(jq -r '.version // empty' "$STAGING/version.json" 2>/dev/null || true)"
+[ "$STAGED_VERSION" = "$VERSION" ] || die "Artifact is version '$STAGED_VERSION', manifest said '$VERSION'"
+[ -f "$STAGING/apolloui-v2/.next/standalone/server.js" ] || die "Artifact has no standalone UI server"
+
+# Preserve solo intent before anything stops. /run is cleared on reboot.
+if [ ! -e "$SOLO_REQUEST_FILE" ] && db="$(resolve_database_url)"; then
+  requested="$(sqlite3 "$db" "SELECT COALESCE(requested_status,'') FROM service_status WHERE service_name='solo' ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)"
+  (umask 077; printf '%s\n' "$requested" > "$SOLO_REQUEST_FILE")
+fi
+
+echo "60" > "$TMPFILE"
+log "Stopping services"
+# The node runs binaries and configuration out of this checkout.
+systemctl stop ckpool.service node.service apollo-ui-v2.service apollo-api.service
+if systemctl is-active --quiet node.service || pgrep -u futurebit -x bitcoind >/dev/null 2>&1; then
+  die "Bitcoin node did not stop cleanly; aborting update"
+fi
+
+echo "70" > "$TMPFILE"
+log "Installing $VERSION"
+backup_code
+SWAPPED=1
+for d in $OWNED; do [ -e "$STAGING/$d" ] && mv "$STAGING/$d" "$APOLLO_DIR/$d"; done
+mkdir -p "$UI_DIR/.next"
+mv "$STAGING/apolloui-v2/.next/standalone" "$UI_DIR/.next/standalone"
+# backend/ is merged, not replaced: it must keep bitcoind and the miner/ckpool
+# binaries that the artifact deliberately does not carry.
+tar -C "$STAGING/backend" -cf - . | tar -C "$APOLLO_DIR/backend" -xf -
+for f in knexfile.js package.json version.json; do
+  [ -e "$STAGING/$f" ] && cp "$STAGING/$f" "$APOLLO_DIR/$f"
+done
+# Device state lives outside the release and is never touched: .env,
+# apolloui-v2/.env, and everything under the state dir.
+chown -R futurebit:futurebit "$APOLLO_DIR"
+
+echo "85" > "$TMPFILE"
+log "Applying units and configuration"
+for unit in apollo-bootstrap apollo-api apollo-ui-v2 apollo-miner node ckpool rc-local swap; do
+  [ -f "$APOLLO_DIR/backend/systemd/$unit.service" ] \
+    && install -m 644 "$APOLLO_DIR/backend/systemd/$unit.service" "/etc/systemd/system/$unit.service"
+done
+[ -f "$APOLLO_DIR/backend/rc.local" ] && install -m 755 "$APOLLO_DIR/backend/rc.local" /etc/rc.local
+systemctl daemon-reload
+systemctl enable apollo-bootstrap.service apollo-api.service apollo-ui-v2.service \
+  apollo-miner.service node.service rc-local.service >/dev/null 2>&1 || true
+
+restore_solo_intent
+
+echo "95" > "$TMPFILE"
+log "Starting services"
+systemctl start apollo-bootstrap.service apollo-api.service apollo-ui-v2.service
+systemctl start node.service apollo-miner.service || err "A mining service did not start cleanly"
+health_ok || die "Health check failed after installing $VERSION"
+
+echo "100" > "$TMPFILE"
+log "Updated to $VERSION"
 rm -f "$TMPFILE"
-echo "10" > "$TMPFILE"
-
-# Preserve solo intent across the first update to a monitor version that
-# understands the update marker. /run is root-owned and cleared on reboot.
-if [ ! -e "$SOLO_REQUEST_FILE" ] && preserve_db=$(resolve_database_url); then
-    requested_status=$(sqlite3 "$preserve_db" \
-        "SELECT COALESCE(requested_status, '')
-           FROM service_status
-          WHERE service_name = 'solo'
-          ORDER BY id DESC
-          LIMIT 1;" 2>/dev/null || true)
-    (umask 077; printf '%s\n' "$requested_status" > "$SOLO_REQUEST_FILE")
-fi
-
-# The node executes binaries and configuration selected from this checkout.
-# Stop it before replacing either repository; systemd will start it after reboot.
-systemctl stop ckpool.service
-systemctl stop node.service
-
-if systemctl is-active --quiet ckpool.service ||
-   pgrep -u futurebit -x ckpool >/dev/null 2>&1; then
-    echo -e "${RED}CKPool did not stop cleanly; aborting update${NC}" >&2
-    false
-fi
-if systemctl is-active --quiet node.service ||
-   pgrep -u futurebit -x bitcoind >/dev/null 2>&1; then
-    echo -e "${RED}Bitcoin node did not stop cleanly; aborting update${NC}" >&2
-    false
-fi
-
-git config --global --add safe.directory "$APOLLO_DIR"
-git config --global --add safe.directory "$UI_DIR"
-
-# Where to pull from. source.conf is authoritative: a device installed from one
-# source can be pointed at another, but its checkout keeps the remote it was
-# cloned with until we reconcile it here.
-. "${APOLLO_DIR}/backend/lib/source-config.sh"
-echo -e "${YELLOW} ---> Code source: ${APOLLO_GIT_BASE}${NC}"
-git -C "$APOLLO_DIR" remote set-url origin "$APOLLO_API_URL"
-git -C "$UI_DIR" remote set-url origin "$APOLLO_UI_URL"
-chown -R futurebit:futurebit "$APOLLO_DIR"
-
-git -C "$APOLLO_DIR" reset --hard
-git -C "$APOLLO_DIR" pull --ff-only
-git -C "$UI_DIR" reset --hard
-git -C "$UI_DIR" pull --ff-only
-
-chown -R futurebit:futurebit "$APOLLO_DIR"
-echo "20" > "$TMPFILE"
-
-echo -e "${YELLOW} ---> Running update_system script${NC}"
-bash "${APOLLO_DIR}/backend/update_system"
