@@ -49,27 +49,42 @@ if [ -z "${APOLLO_UPDATE_LIB:-}" ]; then
 
 [ "$EUID" -eq 0 ] || die "Update script must be run by root or with sudo"
 
-# --- get out of the caller's cgroup ------------------------------------------
+# --- detach from the caller entirely -----------------------------------------
 # The UI spawns this script as a child of apollo-api (src/services/mcu.js uses a
 # plain spawn, with no setsid or detached), so it runs inside that unit's cgroup
 # — and one of the first things it does is stop apollo-api.service. systemd's
 # default KillMode=control-group makes that a SIGTERM to ourselves, in the middle
 # of the swap, leaving every service stopped and nothing to start them again.
 #
-# A run started by hand over SSH already lives in the session scope and was never
-# at risk, which is exactly why testing it that way did not reveal this.
+# A transient SERVICE, not `--scope`. A scope was the first attempt and it was not
+# enough: it moves us out of the cgroup but leaves us a child of the `sudo` that
+# started us, and sudo IS in apollo-api's cgroup. When that cgroup is terminated
+# sudo takes the SIGTERM and relays it to its child, so escaping the cgroup buys
+# nothing against a signal delivered by our own parent. Observed on hardware
+# twice, as an update that died at "Stopping services" with no error message at
+# all. A transient service is parented by systemd, so sudo exits with nobody left
+# to signal.
+#
+# A run started by hand over SSH lives in the session scope and was never at risk
+# either way, which is exactly why testing it that way did not reveal any of this.
 #
 # Output goes to a log file rather than staying on the inherited stdout: that pipe
 # belongs to the process we are about to stop, and writing to it afterwards would
 # fail under `set -e` — trading one self-inflicted abort for another.
 LOG_FILE="${APOLLO_UPDATE_LOG:-$STATE_DIR/update.log}"
-if [ -z "${APOLLO_UPDATE_SCOPED:-}" ] && [ -d /run/systemd/system ] && have systemd-run; then
+if [ -z "${APOLLO_UPDATE_DETACHED:-}" ] && [ -d /run/systemd/system ] && have systemd-run; then
   mkdir -p "$STATE_DIR"
+  # A leftover failed unit from an earlier run would make systemd-run refuse.
+  systemctl reset-failed apollo-update.service >/dev/null 2>&1 || true
   echo "Update started. Follow it with: tail -f $LOG_FILE"
-  export APOLLO_UPDATE_SCOPED=1
-  exec systemd-run --quiet --scope -- "$0" "$@"
+  # --setenv and not export: systemd gives a transient service a fresh
+  # environment, so nothing from here is inherited.
+  exec systemd-run --quiet --collect --unit=apollo-update \
+    --setenv=APOLLO_UPDATE_DETACHED=1 \
+    --setenv="APOLLO_UPDATE_LOG=$LOG_FILE" \
+    -- "$0" "$@"
 fi
-if [ -n "${APOLLO_UPDATE_SCOPED:-}" ]; then
+if [ -n "${APOLLO_UPDATE_DETACHED:-}" ]; then
   mkdir -p "$STATE_DIR"
   exec >>"$LOG_FILE" 2>&1
   echo "=== update started $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
@@ -338,6 +353,37 @@ prune_backups() {
   return 0
 }
 
+# Verifies the outcome of the stop, because the aggregate exit code of
+# `systemctl stop` reports unit *state* and not whether the shutdown did its job:
+# a perfectly clean bitcoind shutdown can still leave node.service "failed",
+# purely because it runs under a `screen` wrapper that exits non-zero.
+#
+# A function with explicit `if`s rather than `cmd && die` one-liners: it is the
+# form whose behaviour under `set -e` is obvious at a glance, and it is directly
+# exercised by tests/ota/rollback.test.sh for both the all-stopped and the
+# still-running case. (`cmd && die` turns out to be safe here — bash exempts the
+# left side of `&&` — but proving that took an experiment, which is reason enough
+# not to make the next reader repeat it.)
+verify_all_stopped() {
+  local u
+  for u in ckpool node apollo-miner apollo-ui-v2 apollo-api apollo-bootstrap; do
+    if systemctl is-active --quiet "$u.service"; then
+      die "$u.service did not stop; aborting update"
+    fi
+  done
+  # A unit can report inactive while its daemon survives: ckpool_stop.sh ends in
+  # `|| true` and ckpool_start.sh daemonises with -B, so the stop reports success
+  # with the process alive. An orphan holds the stratum port and its pre-update
+  # config, and the new instance then cannot bind.
+  if pgrep -u futurebit -x bitcoind >/dev/null 2>&1; then
+    die "Bitcoin node did not stop cleanly; aborting update"
+  fi
+  if pgrep -u futurebit -x ckpool >/dev/null 2>&1; then
+    die "ckpool did not stop cleanly; aborting update"
+  fi
+  return 0
+}
+
 # Same set the success path starts, and in the same order: bootstrap first,
 # because node and apollo-miner Require it. ckpool is deliberately absent — its
 # intent lives in the database and serviceMonitor acts on it.
@@ -522,19 +568,7 @@ systemctl stop apollo-bootstrap.service || true
 # reports unit *state* and not whether the shutdown did its job: the same clean
 # bitcoind shutdown can leave node.service "failed" purely through that screen
 # wrapper. What actually matters is verified here instead — nothing still running.
-for u in ckpool node apollo-miner apollo-ui-v2 apollo-api apollo-bootstrap; do
-  systemctl is-active --quiet "$u.service" && die "$u.service did not stop; aborting update"
-done
-if pgrep -u futurebit -x bitcoind >/dev/null 2>&1; then
-  die "Bitcoin node did not stop cleanly; aborting update"
-fi
-# ckpool needs its own check and not belt-and-braces: ckpool_stop.sh ends in
-# `|| true` and ckpool_start.sh daemonises with -B, so `systemctl stop` reports
-# success with the process still alive. An orphan keeps the stratum port and the
-# pre-update config, and the new instance then cannot bind.
-if pgrep -u futurebit -x ckpool >/dev/null 2>&1; then
-  die "ckpool did not stop cleanly; aborting update"
-fi
+verify_all_stopped
 
 echo "70" > "$TMPFILE"
 log "Installing $VERSION"

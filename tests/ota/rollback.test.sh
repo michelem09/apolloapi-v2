@@ -168,6 +168,56 @@ EOF
   done
 )
 
+# --- the stop verification must succeed when everything IS stopped ------------
+# Written inline as `is-active --quiet && die`, this aborted the update in exactly
+# the case it exists to bless: a correctly inactive unit makes is-active exit 1,
+# the && list inherits that status, the for loop inherits it in turn, and set -e
+# kills the script with no message. Run under `set -e`, as the updater runs.
+(
+  make_device
+  cat > "$STUBS/systemctl" <<'EOF'
+#!/bin/bash
+# Everything is inactive and nothing is running — the healthy post-stop state.
+[ "$1" = "is-active" ] && exit 1
+echo "systemctl $*" >> "$SYSTEMCTL_LOG"
+exit 0
+EOF
+  cat > "$STUBS/pgrep" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+  chmod +x "$STUBS/systemctl" "$STUBS/pgrep"
+
+  if ( set -Eeuo pipefail; verify_all_stopped ); then
+    ok "verify_all_stopped succeeds when every unit is stopped"
+  else
+    bad "verify_all_stopped succeeds when every unit is stopped" \
+        "returned non-zero, which aborts the update under set -e"
+  fi
+)
+
+# --- and must abort when something is still running ---------------------------
+(
+  make_device
+  cat > "$STUBS/systemctl" <<'EOF'
+#!/bin/bash
+# node.service refused to stop.
+[ "$1" = "is-active" ] && { [ "$3" = "node.service" ] && exit 0 || exit 1; }
+exit 0
+EOF
+  cat > "$STUBS/pgrep" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+  chmod +x "$STUBS/systemctl" "$STUBS/pgrep"
+
+  if ( set -Eeuo pipefail; verify_all_stopped ) >/dev/null 2>&1; then
+    bad "verify_all_stopped aborts when a unit is still active" "it returned success"
+  else
+    ok "verify_all_stopped aborts when a unit is still active"
+  fi
+)
+
 # --- backups are pruned -------------------------------------------------------
 # Nothing pruned them, so ~199 MB accumulated per update until the disk preflight
 # refused every further run and the device could no longer take security fixes.

@@ -33,7 +33,7 @@ describe('update lifecycle contract', () => {
     // The whole stop region, not one command: bootstrap is stopped separately
     // and last, because everything else declares Requires= on it and stopping it
     // in the same transaction races their ExecStop.
-    const stop = script.match(/log "Stopping services"[\s\S]*?for u in /);
+    const stop = script.match(/log "Stopping services"[\s\S]*?verify_all_stopped/);
     expect(stop).not.toBeNull();
     for (const unit of [
       'ckpool.service',
@@ -56,10 +56,8 @@ describe('update lifecycle contract', () => {
     // state, not whether the shutdown worked, and a clean bitcoind shutdown can
     // still leave node.service "failed" because of its screen wrapper. What
     // replaces it is stronger: every unit is verified inactive afterwards.
-    expect(script).toMatch(
-      /for u in [^\n]*; do\n\s*systemctl is-active --quiet "\$u\.service" && die/
-    );
-    const verifyLoop = script.match(/for u in ([^;]+); do\n\s*systemctl is-active --quiet/);
+    expect(script).toContain('verify_all_stopped');
+    const verifyLoop = script.match(/for u in ([^;]+); do\n\s*if systemctl is-active --quiet/);
     expect(verifyLoop).not.toBeNull();
     for (const unit of [
       'ckpool',
@@ -88,13 +86,19 @@ describe('update lifecycle contract', () => {
     const script = readBackendScript('update');
 
     // src/services/mcu.js spawns this as a plain child of apollo-api, so without
-    // the re-exec it sits in apollo-api's cgroup and `systemctl stop
-    // apollo-api.service` SIGTERMs it mid-swap (verified on hardware: a process
-    // in that cgroup is killed, the same process inside a transient scope is not).
-    const reexec = script.indexOf('exec systemd-run --quiet --scope');
+    // detaching it sits in apollo-api's cgroup and `systemctl stop
+    // apollo-api.service` takes it down mid-swap.
+    const reexec = script.indexOf('exec systemd-run --quiet --collect --unit=');
     const stop = script.indexOf('systemctl stop ');
     expect(reexec).toBeGreaterThan(-1);
     expect(stop).toBeGreaterThan(reexec);
+
+    // Specifically NOT `--scope`, and this is a regression guard rather than a
+    // style preference. A scope moves the process out of the cgroup but leaves it
+    // a child of sudo, which sits in apollo-api's cgroup and relays the SIGTERM
+    // to it. That version failed on hardware twice, dying at "Stopping services"
+    // with no error message. Only a transient service reparents to systemd.
+    expect(script).not.toMatch(/systemd-run[^\n]*--scope/);
 
     // The inherited stdout belongs to the process being stopped, so it must not
     // still be in use once that happens.
