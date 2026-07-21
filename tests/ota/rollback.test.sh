@@ -28,7 +28,7 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=37
+EXPECTED_ASSERTIONS=44
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -182,6 +182,58 @@ EOF
     if grep -q "start.*$unit" "$SYSTEMCTL_LOG"; then ok "restarts $unit"
     else bad "restarts $unit" "not started"; fi
   done
+)
+
+# --- a rollback after a PARTIAL backup must not destroy the live copies -------
+# backup_code moves the owned directories one at a time. If it dies partway, the
+# ones it has not reached are still live and intact — and the backup cannot
+# replace them. Deleting them anyway left the device with no backend/, so not
+# even backend/update remained to retry with.
+(
+  make_device
+  preserve_binaries
+  # Simulate backup_code aborting after src/ and config/: no .complete marker.
+  BACKUP_CODE="$APOLLO_STATE_DIR/backups/code-pre-partial"
+  mkdir -p "$BACKUP_CODE"
+  printf '%s\n' "$BACKUP_CODE" > "$APOLLO_STATE_DIR/backups/.last-code-backup"
+  mv "$APOLLO_ROOT_DIR/src" "$BACKUP_CODE/src"
+  mv "$APOLLO_ROOT_DIR/config" "$BACKUP_CODE/config"
+  echo 'LIVE' > "$APOLLO_ROOT_DIR/backend/marker"
+
+  restore_code >/dev/null 2>&1
+  check "the moved directory is restored" \
+    "$(cat "$APOLLO_ROOT_DIR/src/marker" 2>/dev/null)" "OLD"
+  check "an untouched live directory survives" \
+    "$(cat "$APOLLO_ROOT_DIR/backend/marker" 2>/dev/null)" "LIVE"
+  if [ -d "$APOLLO_ROOT_DIR/node_modules" ]; then ok "node_modules is not destroyed"
+  else bad "node_modules is not destroyed" "it was deleted with no replacement"; fi
+  # An incomplete backup must not let an absence mean "did not exist before".
+  if [ -f "$APOLLO_ROOT_DIR/package.json" ]; then ok "root files are kept when the backup is partial"
+  else bad "root files are kept when the backup is partial" "package.json was removed"; fi
+)
+
+# --- an orphaned bitcoind from a crashed run is adopted, not deleted ----------
+# A run killed between preserve_binaries and place_binaries leaves bitcoind only
+# at $PRESERVED_BIN — it is not in the code backup either. The next run used to
+# `rm -rf` it and then complete successfully with no bitcoind on the device.
+(
+  make_device
+  preserve_binaries                      # run 1 moves it aside
+  check "the tree has no bitcoind mid-update" "$(flavours)" "0"
+  # run 1 is SIGKILLed here: no trap, nothing restores it.
+  preserve_binaries                      # run 2 starts
+  place_binaries
+  check "run 2 adopts the orphan instead of deleting it" "$(flavours)" "6"
+)
+
+# --- restore_code reports failure instead of claiming success -----------------
+(
+  make_device
+  BACKUP_CODE=''
+  printf '%s\n' "$APOLLO_STATE_DIR/backups/nonexistent" > "$APOLLO_STATE_DIR/backups/.last-code-backup"
+  if restore_code >/dev/null 2>&1; then
+    bad "a missing backup is reported as a failure" "restore_code returned 0"
+  else ok "a missing backup is reported as a failure"; fi
 )
 
 # --- the database rolls back with the code ------------------------------------

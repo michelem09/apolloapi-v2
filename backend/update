@@ -222,13 +222,25 @@ restore_solo_intent() {
 # rollback is the whole point.
 cleanup() {
   local status=$?
-  trap - ERR EXIT TERM INT HUP
-  [ -n "$STAGING" ] && rm -rf "$STAGING"
+  # ERR and EXIT are cleared so this cannot re-enter. TERM/INT/HUP are IGNORED
+  # rather than reset to their default: resetting them left the rollback — the
+  # one part that must not be interrupted — unprotected from exactly the signals
+  # the main body had just been hardened against. A shutdown, or the transient
+  # unit hitting its stop timeout, killed the restore halfway: old code under the
+  # new release's units, nothing restarted, and progress left at 95, which the UI
+  # reads as success.
+  trap - ERR EXIT
+  trap '' TERM INT HUP
+
+  # `|| true` on every cleanup rm: the traps are already gone, so a failing rm
+  # (EIO or a read-only remount on a dying eMMC — precisely when the rollback
+  # matters) would abort cleanup here, before restoring anything, silently.
+  if [ -n "$STAGING" ]; then rm -rf "$STAGING" || true; fi
 
   if [ "$COMPLETED" -eq 1 ]; then exit 0; fi
   [ "$status" -eq 0 ] && status=1
 
-  [ -n "$TARBALL" ] && rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"
+  if [ -n "$TARBALL" ]; then rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem" || true; fi
   if [ "$MUTATED" -eq 1 ]; then
     # Stop first. On the `health_ok || die` path everything has already been
     # started again against the half-installed release, and apollo-api holds the
@@ -286,7 +298,22 @@ ROOT_FILES='knexfile.js package.json version.json'
 UNITS='apollo-bootstrap apollo-api apollo-ui-v2 apollo-miner node ckpool rc-local swap'
 
 preserve_binaries() {
-  rm -rf "$PRESERVED_BIN"
+  # An existing $PRESERVED_BIN is an orphan left by a run that died between here
+  # and place_binaries without its traps firing — SIGKILL, OOM, power cut. Since
+  # the artifact ships no bitcoind and the code backup does not contain it either
+  # (this runs before backup_code moves backend/), that orphan can be the device's
+  # ONLY copy. Deleting it unconditionally, as this used to, destroyed ~214 MB of
+  # bitcoind permanently, and the run then reported success.
+  if [ -d "$PRESERVED_BIN" ]; then
+    if [ -d "$APOLLO_DIR/backend/node/bin" ]; then
+      # The tree has its own copy, so the orphan is stale and safe to drop.
+      rm -rf "$PRESERVED_BIN"
+    else
+      # The orphan is all there is. Keep it; place_binaries will put it back.
+      err "Recovered bitcoind preserved by an interrupted update"
+      return 0
+    fi
+  fi
   [ -d "$APOLLO_DIR/backend/node/bin" ] && mv "$APOLLO_DIR/backend/node/bin" "$PRESERVED_BIN"
   return 0
 }
@@ -324,7 +351,12 @@ backup_code() {
   for d in $OWNED; do [ -e "$APOLLO_DIR/$d" ] && mv "$APOLLO_DIR/$d" "$BACKUP_CODE/$d"; done
   [ -e "$UI_DIR/.next" ] && { mkdir -p "$BACKUP_CODE/apolloui-v2"; mv "$UI_DIR/.next" "$BACKUP_CODE/apolloui-v2/.next"; }
   for f in $ROOT_FILES; do [ -e "$APOLLO_DIR/$f" ] && cp -p "$APOLLO_DIR/$f" "$BACKUP_CODE/$f"; done
-  backup_database
+  backup_database || return 1
+  # Written last. Its presence is what lets restore_code read an ABSENCE as
+  # meaningful ("this did not exist before the update") rather than as "the
+  # backup never got that far" — two situations that look identical on disk and
+  # call for opposite behaviour.
+  : > "$BACKUP_CODE/.complete"
   return 0
 }
 
@@ -478,20 +510,50 @@ restore_code() {
   local b; b="${BACKUP_CODE:-$(cat "$BACKUP_DIR/.last-code-backup" 2>/dev/null || true)}"
   [ -n "$b" ] && [ -d "$b" ] || { err "No code backup to restore from"; return 1; }
   err "Restoring the previous code from $b"
-  restore_database
+
+  # Did backup_code finish? If it aborted partway — ENOSPC, EIO, a signal — then
+  # some directories were moved into the backup and the rest are still live and
+  # intact. Deleting a live directory that the backup cannot replace destroys the
+  # good copy: a failure at `migrations` used to take out node_modules and
+  # backend/ too, leaving the device without even backend/update to retry with.
+  local complete=0
+  [ -f "$b/.complete" ] && complete=1
+
+  local rc=0 d f
+  restore_database || rc=1
   rescue_binaries
-  local d f
-  for d in $OWNED; do rm -rf "$APOLLO_DIR/$d"; [ -e "$b/$d" ] && mv "$b/$d" "$APOLLO_DIR/$d"; done
-  rm -rf "$UI_DIR/.next"; [ -e "$b/apolloui-v2/.next" ] && mv "$b/apolloui-v2/.next" "$UI_DIR/.next"
-  place_binaries
-  # Absent in the backup means absent before the update — the file must go, not
-  # survive as the new release's copy.
-  for f in $ROOT_FILES; do
-    if [ -e "$b/$f" ]; then cp -p "$b/$f" "$APOLLO_DIR/$f"; else rm -f "$APOLLO_DIR/$f"; fi
+
+  for d in $OWNED; do
+    if [ -e "$b/$d" ]; then
+      rm -rf "$APOLLO_DIR/$d" || rc=1
+      mv "$b/$d" "$APOLLO_DIR/$d" || rc=1
+    elif [ "$complete" -eq 1 ] && [ ! -e "$APOLLO_DIR/$d" ]; then
+      err "Neither the device nor the backup has $d"
+      rc=1
+    fi
+    # Not in the backup and the backup is incomplete: the live copy was never
+    # moved, so it is the previous version already. Leave it.
   done
+
+  if [ -e "$b/apolloui-v2/.next" ]; then
+    rm -rf "$UI_DIR/.next" || rc=1
+    mv "$b/apolloui-v2/.next" "$UI_DIR/.next" || rc=1
+  fi
+  place_binaries
+
+  for f in $ROOT_FILES; do
+    if [ -e "$b/$f" ]; then
+      cp -p "$b/$f" "$APOLLO_DIR/$f" || rc=1
+    elif [ "$complete" -eq 1 ]; then
+      # Only a COMPLETE backup lets an absence mean "it did not exist before" —
+      # which is how a first-ever version.json gets removed on rollback.
+      rm -f "$APOLLO_DIR/$f" || rc=1
+    fi
+  done
+
   chown -R futurebit:futurebit "$APOLLO_DIR" || true
-  restore_units
-  return 0
+  restore_units || rc=1
+  return "$rc"
 }
 
 health_ok() {
