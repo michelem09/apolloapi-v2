@@ -132,6 +132,24 @@ describe('update lifecycle contract', () => {
     expect(gate).toBeGreaterThan(provision);
   });
 
+  it('leaves a terminal progress value on every exit path', () => {
+    const script = readBackendScript('update');
+
+    // Deleting the file on success made a completed update look identical to one
+    // that never started: Mcu.updateProgress reports a missing file as 0, and the
+    // modal renders "Updating... 0%" with no close button, forever.
+    const success = script.slice(script.indexOf('COMPLETED=1\n\n# The verified'));
+    expect(success).not.toMatch(/rm -f "\$TMPFILE"/);
+
+    // "Already on <version>" is the most easily reached path in the script, and
+    // it used to exit through cleanup's FAILURE branch: the flag was still 0, so
+    // an up-to-date device wrote -1, printed "Update failed" and exited 1.
+    const alreadyOn = script.match(/if \[ "\$CURRENT" = "\$VERSION" \]; then[\s\S]*?\n  fi/);
+    expect(alreadyOn).not.toBeNull();
+    expect(alreadyOn[0]).toContain('COMPLETED=1');
+    expect(alreadyOn[0].indexOf('COMPLETED=1')).toBeLessThan(alreadyOn[0].indexOf('exit 0'));
+  });
+
   it('reports failure to the UI rather than deleting the progress file', () => {
     const script = readBackendScript('update');
 

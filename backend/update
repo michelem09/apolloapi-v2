@@ -614,7 +614,16 @@ valid_number "$SIZE" || die "Manifest size is malformed"
 
 CURRENT="$(current_version || true)"
 if [ -n "$CURRENT" ] && valid_version "$CURRENT"; then
-  [ "$CURRENT" = "$VERSION" ] && { log "Already on $VERSION"; rm -f "$TMPFILE"; exit 0; }
+  # COMPLETED first: without it this `exit 0` runs the EXIT trap with the flag
+  # still 0, so cleanup took the failure branch — a device that is simply up to
+  # date wrote -1, printed "Update failed" and exited 1. It is also the most
+  # easily reached path in the script.
+  if [ "$CURRENT" = "$VERSION" ]; then
+    log "Already on $VERSION"
+    COMPLETED=1
+    echo "100" > "$TMPFILE"
+    exit 0
+  fi
   version_gt "$VERSION" "$CURRENT" || die "Refusing to move from $CURRENT to older/equal $VERSION"
 fi
 
@@ -770,5 +779,12 @@ COMPLETED=1
 rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"
 prune_backups
 
+# The 100 stays. Deleting it made a SUCCESSFUL update indistinguishable from one
+# that never started — Mcu.updateProgress reports a missing file as plain 0, and
+# the modal renders "Updating... 0%" with its close button hidden and keeps
+# polling forever. The browser polls on its own 3 s grid, and the window between
+# writing 100 and this point covers an rm of the tarball plus prune_backups
+# deleting a ~198 MB tree on eMMC, so a fair share of successful updates landed
+# a poll after the delete. The next run truncates the file before it starts, and
+# serviceMonitor keys off the value rather than the file's existence.
 log "Updated to $VERSION"
-rm -f "$TMPFILE"

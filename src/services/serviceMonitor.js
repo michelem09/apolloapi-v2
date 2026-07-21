@@ -9,6 +9,25 @@ const TOPICS = require('../graphql/topics');
 
 const execAsync = promisify(exec);
 
+const UPDATE_PROGRESS_FILE = '/tmp/update_progress';
+
+// True only while backend/update is actually working. The file holds a percentage
+// while the update runs and a terminal value afterwards — -1 for failed, 100 for
+// succeeded — which it leaves in place so the UI can report the outcome once the
+// API is back. Anything unreadable or unparseable counts as "not running": the
+// cost of getting that wrong is suppressing service recovery indefinitely.
+function isUpdateRunning() {
+  let raw;
+  try {
+    raw = fs.readFileSync(UPDATE_PROGRESS_FILE, 'utf8');
+  } catch (err) {
+    return false; // absent, or unreadable
+  }
+  const value = parseInt(raw.trim(), 10);
+  if (Number.isNaN(value)) return false;
+  return value >= 0 && value < 100;
+}
+
 class ServiceMonitor {
   constructor(knex, services) {
     this.knex = knex;
@@ -304,10 +323,16 @@ class ServiceMonitor {
       // This ensures the UI reflects reality instead of fighting user actions
       let isWithinGracePeriod = false;
       
-      // The updater intentionally stops services while /tmp/update_progress
-      // exists. Preserve the user's requested state instead of classifying
-      // those stops as manual actions.
-      const updateInProgress = fs.existsSync('/tmp/update_progress');
+      // The updater intentionally stops services while an update is running, so
+      // those stops must not be read as manual actions.
+      //
+      // The file's CONTENT decides, not its existence: the updater deliberately
+      // leaves a terminal value behind (-1 failed, 100 succeeded) so the UI can
+      // report the outcome after the API comes back. Treating the file's mere
+      // presence as "in progress" meant one failed update disabled this whole
+      // block for good — including the auto-restart of a crashed bitcoind or
+      // miner — since nothing clears it until the next update runs.
+      const updateInProgress = isUpdateRunning();
       if (existing && !updateInProgress) {
         // Get time since last request (if any)
         const currentTime = Date.now();
@@ -776,3 +801,7 @@ class ServiceMonitor {
 }
 
 module.exports = (knex, services) => new ServiceMonitor(knex, services);
+// Exported for the tests: the difference between "an update is running" and "an
+// update finished a while ago" decides whether service recovery stays disabled.
+module.exports.isUpdateRunning = isUpdateRunning;
+module.exports.UPDATE_PROGRESS_FILE = UPDATE_PROGRESS_FILE;
