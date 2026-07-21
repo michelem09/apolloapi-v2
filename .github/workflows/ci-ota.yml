@@ -6,16 +6,15 @@ name: ci-ota
 on:
   push:
     branches: ['**']
-    paths:
+    paths: &ota_paths
       - 'bin/apollo-update'
+      - 'bootstrap.sh'
       - 'tests/ota/**'
+      - 'backend/lib/source-config.sh'
       - 'Dockerfile.ota-test'
       - '.github/workflows/ci-ota.yml'
   pull_request:
-    paths:
-      - 'bin/apollo-update'
-      - 'tests/ota/**'
-      - 'Dockerfile.ota-test'
+    paths: *ota_paths
   workflow_dispatch:
 
 jobs:
@@ -28,6 +27,7 @@ jobs:
           submodules: false
       - run: sudo apt-get update && sudo apt-get install -y zstd jq
       - run: bash tests/ota/apollo-update.test.sh
+      - run: bash tests/ota/bootstrap.test.sh
 
   # Faithful: a clean linux/arm64 box with REAL cosign, applying the actual
   # signed artifact from this repo's dev channel. Proves the signature check and
