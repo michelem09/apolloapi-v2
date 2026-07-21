@@ -1,0 +1,314 @@
+name: release
+
+# Builds the signed release artifact for OTA updates. Everything runs on an ARM
+# runner because the backend has native dependencies (sqlite3) that must be
+# compiled for the device's aarch64 ABI — an x86 build would produce a tarball
+# that cannot start.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (no leading v), for dry runs off a tag'
+        required: true
+
+permissions:
+  contents: write   # create the Release and upload assets
+  id-token: write   # OIDC token for cosign keyless signing
+
+env:
+  # The one place that decides what counts as an official build.
+  OFFICIAL_OWNER: jstefanop
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: false   # .gitmodules points upstream on purpose; resolved below
+          fetch-depth: 0
+
+      - name: Resolve the UI submodule from this repo's owner
+        # .gitmodules stays pinned to the upstream repo so a fork URL is never
+        # proposed upstream. Overriding it locally makes the build work unchanged
+        # on a fork and on the official repo.
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          git config submodule.apolloui-v2.url "https://github.com/${OWNER}/apolloui-v2.git"
+          git submodule update --init --depth 1
+          git -C apolloui-v2 log --oneline -1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc   # must match the device ABI for sqlite3
+
+      - name: Derive version, channel and tag
+        id: meta
+        # Every value below is read from env, never interpolated into the script
+        # body: `${{ }}` is substituted textually before bash parses the line, and
+        # git happily allows backticks, `$`, `;` and quotes in a tag name.
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -Eeuo pipefail
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${REF_NAME#v}"
+          fi
+
+          # Strict gate. Everything downstream — shell, JSON, the tag we publish
+          # to — is derived from VERSION, so validating it once here is what makes
+          # the rest safe, and a malformed tag fails the build instead of running.
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$'; then
+            echo "refusing version '$VERSION' — expected 1.2.3 or 1.2.3-rc1" >&2
+            exit 1
+          fi
+
+          # Artifacts built anywhere other than the official repo are always 'dev'.
+          # A fork signs with a different keyless identity, so this keeps a fork
+          # build from presenting itself as something a production device accepts.
+          if [ "$OWNER" != "$OFFICIAL_OWNER" ]; then
+            CHANNEL=dev
+          elif printf '%s' "$VERSION" | grep -qiE '(-rc|-beta|-alpha)'; then
+            CHANNEL=beta
+          else
+            CHANNEL=stable
+          fi
+
+          # One-line summary for the "update available" row in the UI. Comes from
+          # the annotated tag so it is written deliberately when cutting a
+          # release, rather than improvised from a commit subject.
+          #
+          # actions/checkout rewrites refs/tags/<tag> to point straight at the
+          # commit (`fetch +<sha>:refs/tags/<tag>`), which quietly degrades an
+          # annotated tag to a lightweight one — %(contents:subject) then returns
+          # the commit subject, which reads plausibly and is the wrong text. Fetch
+          # the tag object back and only trust it if it really is one.
+          SUMMARY=""
+          git fetch --force origin "refs/tags/v${VERSION}:refs/tags/v${VERSION}" 2>/dev/null || true
+          if [ "$(git cat-file -t "v${VERSION}" 2>/dev/null)" = "tag" ]; then
+            SUMMARY=$(git tag -l --format='%(contents:subject)' "v${VERSION}")
+          fi
+          [ -n "$SUMMARY" ] || SUMMARY="Apollo ${VERSION}"
+
+          {
+            echo "version=$VERSION"
+            echo "channel=$CHANNEL"
+            echo "tag=v${VERSION}"          # derived, never the raw ref
+            echo "tarball=apollo-${VERSION}-aarch64.tar.zst"
+            echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "summary=$SUMMARY"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $VERSION on channel $CHANNEL"
+
+      - name: Install dependencies
+        run: |
+          yarn install --frozen-lockfile
+          yarn --cwd apolloui-v2 install --frozen-lockfile --ignore-engines
+
+      - name: Test
+        # A signature attests provenance, not that the code works. Refusing to
+        # publish a failing build is the only thing standing between a bad commit
+        # and a signed artifact the fleet would happily install.
+        run: |
+          yarn test
+          yarn --cwd apolloui-v2 test
+
+      - name: Build the UI
+        # postbuild (scripts/assemble-standalone.sh) folds in .next/static, public
+        # and the .env symlink.
+        run: yarn --cwd apolloui-v2 build
+
+      - name: Prune to production dependencies
+        run: yarn install --frozen-lockfile --production
+
+      - name: Stage the release tree
+        id: stage
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+          BUILD_TIME: ${{ steps.meta.outputs.build_time }}
+        run: |
+          set -Eeuo pipefail
+          STAGE="$RUNNER_TEMP/stage"
+          mkdir -p "$STAGE/apolloui-v2/.next"
+
+          cp -r src config migrations knexfile.js package.json node_modules "$STAGE/"
+
+          # Keep the nesting: apollo-ui-v2.service runs
+          # `node .next/standalone/server.js` relative to the UI root, and
+          # OTA_UPDATE_REDESIGN.md §2.3 documents this same layout. Flattening it
+          # here would leave the unit looking for a server.js that is one level up.
+          # static/ and public/ already live inside standalone (postbuild), so
+          # copying them again would nest them a second time.
+          cp -r apolloui-v2/.next/standalone "$STAGE/apolloui-v2/.next/standalone"
+
+          # backend/ carries the launch scripts, systemd units and the small
+          # miner/ckpool binaries. bitcoind (backend/node/bin, ~214 MB across four
+          # flavours) is deliberately excluded: it ships as its own package, which
+          # is the whole reason the tarball can stay small.
+          mkdir -p "$STAGE/backend"
+          tar -C backend --exclude='node/bin' -cf - . | tar -C "$STAGE/backend" -xf -
+
+          # These arrive with steps 4 and 5; included automatically once they exist.
+          [ -f bin/apollo-update ] && install -Dm755 bin/apollo-update "$STAGE/bin/apollo-update" || true
+          [ -f bootstrap.sh ]      && install -Dm755 bootstrap.sh      "$STAGE/bootstrap.sh"      || true
+
+          # jq, not a heredoc: routing values through env: protects against shell
+          # metacharacters but not against a quote landing inside a JSON string.
+          jq -n \
+            --arg version "$VERSION" \
+            --arg git_sha "$GITHUB_SHA" \
+            --arg build_time "$BUILD_TIME" \
+            --arg channel "$CHANNEL" \
+            '{version: $version, git_sha: $git_sha, build_time: $build_time, channel: $channel}' \
+            > "$STAGE/version.json"
+
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          du -sh "$STAGE"
+
+      - name: Pack and hash
+        id: pack
+        env:
+          STAGE: ${{ steps.stage.outputs.stage }}
+          TARBALL: ${{ steps.meta.outputs.tarball }}
+        run: |
+          set -Eeuo pipefail
+          tar -C "$STAGE" --zstd -cf "$TARBALL" .
+          SHA=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$TARBALL")
+          echo "sha256=$SHA"  >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE"   >> "$GITHUB_OUTPUT"
+          echo "$TARBALL: $((SIZE/1024/1024)) MB, sha256 $SHA"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign the artifact (keyless)
+        env:
+          TARBALL: ${{ steps.meta.outputs.tarball }}
+        run: |
+          # Keyless: the signature is bound to this repo+workflow identity via OIDC,
+          # so there is no key to store or rotate. The verifier on the device must
+          # pin the expected identity per channel.
+          cosign sign-blob --yes \
+            --output-signature "${TARBALL}.sig" \
+            --output-certificate "${TARBALL}.pem" \
+            "$TARBALL"
+
+      - name: Generate the manifest
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          TARBALL: ${{ steps.meta.outputs.tarball }}
+          BUILD_TIME: ${{ steps.meta.outputs.build_time }}
+          SUMMARY: ${{ steps.meta.outputs.summary }}
+          SHA: ${{ steps.pack.outputs.sha256 }}
+          SIZE: ${{ steps.pack.outputs.size }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -Eeuo pipefail
+          # Built from the derived TAG, which is also what the release is published
+          # to — using the raw ref here made manual dispatch emit a manifest whose
+          # URLs pointed at a tag that was never created.
+          BASE="${SERVER_URL}/${REPOSITORY}/releases/download/${TAG}"
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg channel "$CHANNEL" \
+            --arg sha256 "$SHA" \
+            --argjson size "$SIZE" \
+            --arg min_from "2.1.0" \
+            --arg url "${BASE}/${TARBALL}" \
+            --arg sig "${BASE}/${TARBALL}.sig" \
+            --arg cert "${BASE}/${TARBALL}.pem" \
+            --arg issuer "https://token.actions.githubusercontent.com" \
+            --arg repository "$REPOSITORY" \
+            --arg workflow_ref "$WORKFLOW_REF" \
+            --arg git_sha "$GITHUB_SHA" \
+            --arg build_time "$BUILD_TIME" \
+            --arg summary "$SUMMARY" \
+            --arg notes_url "${SERVER_URL}/${REPOSITORY}/releases/tag/${TAG}" \
+            '{version: $version, channel: $channel, sha256: $sha256, size: $size,
+              min_from_version: $min_from, url: $url, signature_url: $sig,
+              certificate_url: $cert,
+              summary: $summary, notes_url: $notes_url,
+              signing_identity: {issuer: $issuer, repository: $repository,
+                                 workflow_ref: $workflow_ref},
+              git_sha: $git_sha, build_time: $build_time}' \
+            > "apollo-${VERSION}-manifest.json"
+
+          # The channel manifest is what a device actually polls. The per-version
+          # file above is useless for discovery: you must already know the version
+          # to fetch it. Same content, published at a stable well-known URL.
+          cp "apollo-${VERSION}-manifest.json" "${CHANNEL}.json"
+
+          cat "apollo-${VERSION}-manifest.json"
+
+      - name: Publish the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          TARBALL: ${{ steps.meta.outputs.tarball }}
+          SHA: ${{ steps.pack.outputs.sha256 }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+
+          NOTES=$(mktemp)
+          {
+            printf 'Channel: `%s` · sha256 `%s`\n\n' "$CHANNEL" "$SHA"
+            printf 'Signed with cosign keyless, bound to `%s`.\n' "$REPOSITORY"
+            if [ "$CHANNEL" = "dev" ]; then
+              printf '\n> **Development build.** Built outside the official repository, so its\n'
+              printf '> signing identity differs and production devices reject it by design.\n'
+              printf '> `bitcoind` is not bundled — it ships as a separate package.\n'
+            fi
+          } > "$NOTES"
+
+          PRERELEASE=""
+          [ "$CHANNEL" != "stable" ] && PRERELEASE="--prerelease"
+
+          gh release create "$TAG" $PRERELEASE \
+            --title "Apollo ${VERSION}" \
+            --notes-file "$NOTES" \
+            --target "${GITHUB_SHA}" \
+            "$TARBALL" "${TARBALL}.sig" "${TARBALL}.pem" \
+            "apollo-${VERSION}-manifest.json"
+
+      - name: Point the channel at this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          # What a device actually polls. A release under a fixed tag gives the
+          # channel manifest a URL that never changes, so the device asks one
+          # well-known address instead of having to discover releases first.
+          # If hosting later moves to updates.futurebit.io, that is a config
+          # change on the device — the pipeline keeps publishing here.
+          POINTER="channel-${CHANNEL}"
+
+          if ! gh release view "$POINTER" >/dev/null 2>&1; then
+            gh release create "$POINTER" --prerelease \
+              --title "Channel: ${CHANNEL}" \
+              --notes "Moving pointer to the latest ${CHANNEL} build. Not a release: the assets here are replaced on every build."
+          fi
+
+          gh release upload "$POINTER" "${CHANNEL}.json" --clobber
+          echo "channel manifest now points at ${VERSION}"

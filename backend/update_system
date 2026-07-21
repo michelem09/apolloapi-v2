@@ -143,6 +143,7 @@ echo "50" > "$TMPFILE"
 echo -e "${YELLOW} ---> Building UI (could take a few minutes)${NC}"
 rm -rf .next
 yarn build
+
 yarn cache clean
 
 echo "70" > "$TMPFILE"

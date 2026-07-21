@@ -78,6 +78,7 @@ yarn --ignore-engines
 echo -e "${YELLOW} ---> Building UI (could take a few minutes)${NC}"
 rm -rf .next
 yarn build
+
 yarn cache clean
 
 chown -R futurebit:futurebit "$APOLLO_DIR"
