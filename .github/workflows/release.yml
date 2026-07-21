@@ -153,12 +153,13 @@ jobs:
           # copying them again would nest them a second time.
           cp -r apolloui-v2/.next/standalone "$STAGE/apolloui-v2/.next/standalone"
 
-          # backend/ carries the launch scripts, systemd units and the small
-          # miner/ckpool binaries. bitcoind (backend/node/bin, ~214 MB across four
-          # flavours) is deliberately excluded: it ships as its own package, which
-          # is the whole reason the tarball can stay small.
+          # backend/ carries the launch scripts, systemd units and binaries. The
+          # release is aarch64, so drop the x86_64 bitcoind builds (useless on the
+          # device); the aarch64 ones stay so node.service works after a migration.
+          # Splitting bitcoind into separate on-demand packages is step 6; until
+          # then it rides inside the release, ~107 MB, ugly but working.
           mkdir -p "$STAGE/backend"
-          tar -C backend --exclude='node/bin' -cf - . | tar -C "$STAGE/backend" -xf -
+          tar -C backend --exclude='node/bin/*/x86_64' -cf - . | tar -C "$STAGE/backend" -xf -
 
           # These arrive with steps 4 and 5; included automatically once they exist.
           [ -f bin/apollo-update ] && install -Dm755 bin/apollo-update "$STAGE/bin/apollo-update" || true
