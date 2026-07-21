@@ -28,20 +28,22 @@ for u in apollo-bootstrap apollo-api apollo-ui-v2 node ckpool apollo-miner; do
 done
 echo '#!/bin/bash' > "$SRC/bin/apollo-update"; chmod +x "$SRC/bin/apollo-update"
 echo "code" > "$SRC/src/init.js"
+echo '#!/bin/sh' > "$SRC/backend/rc.local"
 cp "$ROOT/bootstrap.sh" "$SRC/bootstrap.sh"
 
 run_bootstrap() {  # $1 = APOLLO_DIR
   APOLLO_DIR="$1" APOLLO_STATE_DIR="$WORK/state" \
   APOLLO_SYSTEMCTL="$WORK/bin/systemctl" APOLLO_NODE="$WORK/bin/node" \
   APOLLO_CLI_DEST="$WORK/bin/apollo-update-installed" APOLLO_SYSTEMD_DIR="$WORK/systemd" \
-  APOLLO_HEALTH_URL="file://$WORK/health" \
+  APOLLO_RC_LOCAL="$WORK/rc.local" APOLLO_HEALTH_URL="file://$WORK/health" \
   bash "$SRC/bootstrap.sh" >>"$WORK/log" 2>&1
 }
 
 echo "bootstrap.sh — tier 1"
 
-# happy path onto a fresh device (no current yet)
-mkdir -p "$WORK/systemd"
+# happy path onto a fresh device (no current yet), with a legacy UI .env present
+mkdir -p "$WORK/systemd" "$WORK/opt/apolloui-v2"
+printf 'NEXTAUTH_SECRET="s3cr3t"\n' > "$WORK/opt/apolloui-v2/.env"
 run_bootstrap "$WORK/opt"; rc=$?
 [ $rc -eq 0 ] && ok "migration succeeds" || bad "migration failed (rc=$rc)"
 [ "$(readlink "$WORK/opt/current")" = "$WORK/opt/releases/9.9.9" ] && ok "current points at the release" || bad "current symlink wrong"
@@ -51,6 +53,9 @@ run_bootstrap "$WORK/opt"; rc=$?
 [ -x "$WORK/bin/apollo-update-installed" ] && ok "CLI installed" || bad "CLI not installed"
 grep -q "daemon-reload" "$BOOT_CALLS" && ok "daemon-reload was run" || bad "no daemon-reload"
 grep -qxF complete "$WORK/state/migration.state" && ok "completion marker written" || bad "no completion marker"
+[ -x "$WORK/rc.local" ] && ok "rc.local installed" || bad "rc.local not installed"
+grep -q 's3cr3t' "$WORK/opt/apolloui-v2.env" 2>/dev/null \
+  && ok "UI env migrated to the device-stable path" || bad "UI env not migrated"
 
 # idempotent: a second run must not rebuild the release
 BEFORE="$(stat -c %Y "$WORK/opt/releases/9.9.9" 2>/dev/null || stat -f %m "$WORK/opt/releases/9.9.9")"

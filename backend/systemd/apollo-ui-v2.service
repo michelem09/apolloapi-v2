@@ -24,6 +24,13 @@ Environment=PATH=/usr/local/nvm/versions/node/v21.6.2/bin:/usr/local/sbin:/usr/l
 WorkingDirectory=/opt/apolloapi/current/apolloui-v2
 Environment=HOSTNAME=0.0.0.0
 Environment=PORT=3000
+# UI env is device state, not code: NEXTAUTH_SECRET and the NEXT_PUBLIC_* device
+# flags (set at boot by set_UI_mode.sh) live in a fixed device file and are
+# injected here, so the standalone server reads them from the environment. It
+# must not live inside the release: the standalone loads .env relative to itself,
+# which moves with current/ and left the server with no NEXTAUTH_SECRET → login
+# broke after a migration.
+EnvironmentFile=-/opt/apolloapi/apolloui-v2.env
 ExecStart=/usr/local/nvm/versions/node/v21.6.2/bin/node .next/standalone/server.js
 Restart=always
 SyslogIdentifier=ApolloUIv2

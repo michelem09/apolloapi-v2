@@ -11,7 +11,7 @@
 #
 # By default this script does nothing.
 
-/opt/apolloapi/backend/firewall || \
+/opt/apolloapi/current/backend/firewall || \
     echo "[rc.local] WARN: firewall configuration failed" >&2
 # Detect board type from Armbian release file
 if [ -f /etc/armbian-release ]; then
@@ -20,7 +20,7 @@ fi
 
 if [ "${BOARD_NAME:-}" = "Solo Node" ]; then
     # Run Solo Node UI mode detector
-    /opt/apolloapi/backend/utils/set_UI_mode.sh || \
+    /opt/apolloapi/current/backend/utils/set_UI_mode.sh || \
         echo "[rc.local] WARN: UI mode detection failed" >&2
 else
     # Configure GPIOs for non–Solo Node boards
@@ -34,4 +34,4 @@ else
         echo "[rc.local] WARN: CPU governor setup failed" >&2
 fi
 #mount nvme drive
-/opt/apolloapi/backend/first_run
+/opt/apolloapi/current/backend/first_run

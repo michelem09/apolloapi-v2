@@ -7,6 +7,7 @@ After=network.target apollo-bootstrap.service
 Environment=NODE_ENV=production
 Environment=APOLLO_BOOTSTRAPPED=1
 EnvironmentFile=-/opt/apolloapi/.env
+Environment=APOLLO_ENV_FILE=/opt/apolloapi/.env
 Type=simple
 User=futurebit
 Group=futurebit

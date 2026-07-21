@@ -17,7 +17,9 @@
 # Today the only stable hint is the sentinel file /etc/apolloapi/apollo-iii
 # (or the APOLLO_III_FORCE env). Replace with the real probe when available.
 
-ENV_FILE="/opt/apolloapi/apolloui-v2/.env"
+# Device-stable UI env, outside any release, read by apollo-ui-v2.service via
+# EnvironmentFile. Not the in-release .env, which is replaced on every update.
+ENV_FILE="/opt/apolloapi/apolloui-v2.env"
 CHASSIS_SENTINEL="/etc/apolloapi/chassis"
 APOLLO_III_SENTINEL="/etc/apolloapi/apollo-iii"
 
@@ -46,7 +48,7 @@ declare -A USB_TYPES
 
 for port in "${USB_PORTS[@]}"; do
     echo "Checking $port"
-    boardType=$(/opt/apolloapi/backend/apollo-miner/apollo-helper -s "$port" 2>/dev/null)
+    boardType=$(/opt/apolloapi/current/backend/apollo-miner/apollo-helper -s "$port" 2>/dev/null)
     if [[ "$boardType" == *"Apollo-BTC"* || "$boardType" == *"RD6"* ]]; then
         USB_TYPES["apollo-i"]=1
     elif [[ "$boardType" == *"Apollo-2"* ]]; then

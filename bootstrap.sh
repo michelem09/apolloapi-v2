@@ -92,15 +92,29 @@ activate() {
   log "current -> $(readlink "$CURRENT_LINK")"
 }
 
-# --- 5. install the units (they reference current/) + CLI ------------------
+# Move the UI env (NEXTAUTH_SECRET etc.) out of the checkout to a device-stable
+# path, so apollo-ui-v2.service can inject it via EnvironmentFile and it survives
+# updates. set_UI_mode.sh appends the NEXT_PUBLIC_* flags to this same file.
+migrate_ui_env() {
+  done_step migrate_ui_env && return
+  local dst="$APOLLO_DIR/apolloui-v2.env" legacy="$APOLLO_DIR/apolloui-v2/.env"
+  if [ ! -f "$dst" ] && [ -f "$legacy" ]; then
+    cp "$legacy" "$dst"; chown --reference="$legacy" "$dst" 2>/dev/null || true
+    log "UI env migrated to $dst"
+  fi
+  mark migrate_ui_env
+}
+
+# --- 5. install the units (they reference current/) + CLI + rc.local -------
 install_units_and_cli() {
   for u in $UNITS; do
     [ -f "$DEST/backend/systemd/$u.service" ] \
       && install -m 644 "$DEST/backend/systemd/$u.service" "$SYSTEMD_DIR/$u.service"
   done
   install -m 755 "$DEST/bin/apollo-update" "$CLI_DEST"
+  [ -f "$DEST/backend/rc.local" ] && install -m 755 "$DEST/backend/rc.local" "${APOLLO_RC_LOCAL:-/etc/rc.local}"
   $SYSTEMCTL daemon-reload
-  log "units and CLI installed"
+  log "units, CLI and rc.local installed"
 }
 
 # --- 6. restart + health ---------------------------------------------------
@@ -119,6 +133,7 @@ main() {
   preflight
   backup_units
   install_release
+  migrate_ui_env
   activate
   install_units_and_cli
   # node/ckpool/miner follow current/ now; restart them so they pick up the new
