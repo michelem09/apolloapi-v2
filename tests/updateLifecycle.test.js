@@ -40,4 +40,24 @@ describe('update lifecycle contract', () => {
     expect(script).not.toMatch(/systemctl stop[^\n]*\|\| true/);
     expect(script).toContain('pgrep -u futurebit -x bitcoind');
   });
+
+  it('validates every manifest field it consumes, before it consumes it', () => {
+    const script = readBackendScript('update');
+
+    // The manifest is attacker-controlled until cosign has verified the artifact,
+    // so anything read out of it is untrusted input. SIZE is the dangerous one:
+    // it reaches an arithmetic expansion, where bash re-evaluates the value as an
+    // expression and expands array subscripts inside it — `x[$(cmd)]` runs cmd as
+    // root, and it happens before the checksum and signature checks.
+    const guard = script.indexOf("printf '%s' \"$SIZE\" | grep -qE '^[0-9]+$'");
+    const use = script.indexOf('NEED_KB=$((');
+    expect(guard).toBeGreaterThan(-1);
+    expect(use).toBeGreaterThan(guard);
+
+    // The channel URL is built from source.conf, which the app user can write.
+    const urlGuard = script.indexOf('valid_url "$CHANNEL_URL"');
+    const fetchUrl = script.indexOf('fetch "$CHANNEL_URL"');
+    expect(urlGuard).toBeGreaterThan(-1);
+    expect(fetchUrl).toBeGreaterThan(urlGuard);
+  });
 });

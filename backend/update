@@ -205,6 +205,12 @@ for t in curl jq zstd sha256sum sqlite3 cosign; do
   have "$t" || die "Missing dependency: $t (install it before updating)"
 done
 
+# The channel URL is assembled from source.conf, which the app user can write, so
+# it gets the same schema check as the URLs inside the manifest. Without it an
+# APOLLO_GIT_BASE of http://… downgrades the fetch and makes the manifest — the
+# input to everything below — trivially MITM-able.
+valid_url "$CHANNEL_URL" || die "Update channel is not a plain https URL"
+
 log "Checking ${CHANNEL} channel"
 MANIFEST="$(fetch "$CHANNEL_URL")" || die "Cannot reach the update channel"
 VERSION="$(jq -r '.version // empty' <<<"$MANIFEST")"
@@ -219,6 +225,11 @@ for u in "$URL" "$SIG_URL" "$CERT_URL"; do
   valid_url "$u" || die "Manifest contains a URL that is not a plain https URL"
 done
 printf '%s' "$SHA" | grep -qE '^[0-9a-f]{64}$' || die "Manifest sha256 is malformed"
+# SIZE is used in an arithmetic expansion below, and bash re-evaluates a variable's
+# value there as an expression — array subscripts inside it undergo full expansion,
+# so an unvalidated size of the form `x[$(cmd)]` runs cmd as root. That happens
+# BEFORE the checksum and cosign checks, which would bypass signing entirely.
+printf '%s' "$SIZE" | grep -qE '^[0-9]+$' || die "Manifest size is malformed"
 
 CURRENT="$(current_version || true)"
 if [ -n "$CURRENT" ] && valid_version "$CURRENT"; then
