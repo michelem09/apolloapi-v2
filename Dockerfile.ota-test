@@ -1,0 +1,31 @@
+# Tier-2 test image for bin/apollo-update: a linux/arm64 box with REAL cosign,
+# zstd and jq, exercising the updater against the actual signed artifact
+# published on the fork. On Apple Silicon this runs natively, so the aarch64
+# tarball is the same code the device would run.
+#
+# What is still stubbed: systemctl (no init in a container) and the health probe
+# (no running API). Those are covered on apollo2. What is REAL here and nowhere
+# else off-device: the cosign keyless signature check against the fork identity.
+FROM node:21-bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates zstd jq sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# cosign, arm64
+RUN curl -fsSL -o /usr/local/bin/cosign \
+      https://github.com/sigstore/cosign/releases/download/v2.5.2/cosign-linux-arm64 \
+    && chmod +x /usr/local/bin/cosign \
+    && cosign version
+
+# systemctl stub: record the calls, since there is no init in a container.
+RUN printf '#!/bin/bash\nprintf "%%s\\n" "restart $*" >> "${OTA_CALLS:-/tmp/calls}"\n' \
+      > /usr/local/bin/systemctl \
+    && chmod +x /usr/local/bin/systemctl
+
+COPY bin/apollo-update /opt/apolloapi/bin/apollo-update
+COPY backend/lib/source-config.sh /opt/apolloapi/backend/lib/source-config.sh
+COPY tests/ota/tier2-in-container.sh /tier2.sh
+RUN chmod +x /opt/apolloapi/bin/apollo-update /tier2.sh
+
+ENTRYPOINT ["/tier2.sh"]

@@ -1,0 +1,64 @@
+name: ci-ota
+
+# Tests for the updater CLI. Runs on every change to it, not only on a release
+# tag, since a broken apollo-update is a broken update path for the whole fleet.
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'bin/apollo-update'
+      - 'tests/ota/**'
+      - 'Dockerfile.ota-test'
+      - '.github/workflows/ci-ota.yml'
+  pull_request:
+    paths:
+      - 'bin/apollo-update'
+      - 'tests/ota/**'
+      - 'Dockerfile.ota-test'
+  workflow_dispatch:
+
+jobs:
+  # Fast: the mechanism with systemctl, cosign and the network stubbed. No Docker.
+  tier1:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: false
+      - run: sudo apt-get update && sudo apt-get install -y zstd jq
+      - run: bash tests/ota/apollo-update.test.sh
+
+  # Faithful: a clean linux/arm64 box with REAL cosign, applying the actual
+  # signed artifact from this repo's dev channel. Proves the signature check and
+  # the fork/official identity split with real crypto. Skips on forks whose dev
+  # channel has no release yet.
+  tier2:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: false
+      - name: Does this owner have a dev-channel release?
+        id: gate
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          url="https://github.com/${OWNER}/apolloapi-v2/releases/download/channel-dev/dev.json"
+          if curl -fsIL "$url" >/dev/null 2>&1; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "no dev-channel release for ${OWNER} yet — skipping tier 2"
+          fi
+      - name: Build the test image
+        if: steps.gate.outputs.ready == 'true'
+        run: |
+          tar -czh Dockerfile.ota-test bin/apollo-update \
+            backend/lib/source-config.sh tests/ota/tier2-in-container.sh \
+          | docker build --platform linux/arm64 -f Dockerfile.ota-test -t apollo-ota-test -
+      - name: Run against the real artifact
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          FORK_OWNER: ${{ github.repository_owner }}
+        run: docker run --rm -e FORK_OWNER --platform linux/arm64 apollo-ota-test

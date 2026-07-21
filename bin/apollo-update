@@ -1,0 +1,300 @@
+#!/bin/bash
+# apollo-update — OTA updater for Apollo devices.
+#
+# Applies a release as an atomic symlink swap over a prepared layout:
+#
+#   $APOLLO_ROOT/releases/<version>/   one directory per release
+#   $APOLLO_ROOT/current  -> releases/<version>   the active release
+#   $APOLLO_ROOT/previous -> releases/<old>       the rollback target
+#
+# Design: OTA_UPDATE_REDESIGN.md §2.5–§2.6. The one-shot migration onto this
+# layout is a separate step (bootstrap.sh); this tool assumes it exists.
+#
+# Everything the tool cannot do on a plain build box is behind one indirection,
+# so it is testable off-device:
+#   APOLLO_SYSTEMCTL   service control command        (default: systemctl)
+#   APOLLO_HEALTH_URL  health endpoint to probe       (default: http://localhost:5000/health)
+#   APOLLO_CHANNEL_URL manifest to poll               (default: derived from source config)
+#   APOLLO_ROOT        release layout root            (default: /opt/apolloapi)
+#   APOLLO_STATE_DIR   persistent state root          (default: /var/lib/apollo)
+# The signing identity the device trusts is derived from the same source config
+# that decides where code comes from, so a fork device trusts the fork's identity
+# and an official device trusts John's — never taken from the (untrusted) manifest.
+set -Eeuo pipefail
+
+# --- configuration ---------------------------------------------------------
+
+APOLLO_DIR="${APOLLO_DIR:-/opt/apolloapi}"
+APOLLO_ROOT="${APOLLO_ROOT:-$APOLLO_DIR}"
+APOLLO_STATE_DIR="${APOLLO_STATE_DIR:-/var/lib/apollo}"
+SYSTEMCTL="${APOLLO_SYSTEMCTL:-systemctl}"
+HEALTH_URL="${APOLLO_HEALTH_URL:-http://localhost:5000/health}"
+HEALTH_TIMEOUT="${APOLLO_HEALTH_TIMEOUT:-60}"
+SERVICES="${APOLLO_SERVICES:-apollo-api apollo-ui-v2 apollo-miner node ckpool}"
+
+RELEASES_DIR="$APOLLO_ROOT/releases"
+CURRENT_LINK="$APOLLO_ROOT/current"
+PREVIOUS_LINK="$APOLLO_ROOT/previous"
+DL_DIR="${APOLLO_DL_DIR:-$APOLLO_STATE_DIR/cache/dl}"
+BACKUP_DIR="${APOLLO_BACKUP_DIR:-$APOLLO_STATE_DIR/backups}"
+
+# Resolve the code source the same way the install/update scripts do, so the
+# channel URL and the trusted signing identity follow source.conf. Optional:
+# an explicit APOLLO_CHANNEL_URL / APOLLO_TRUST_IDENTITY override it entirely.
+_lib="$APOLLO_DIR/backend/lib/source-config.sh"
+if [ -r "$_lib" ]; then . "$_lib"; fi
+APOLLO_GIT_BASE="${APOLLO_GIT_BASE:-https://github.com/jstefanop}"
+APOLLO_API_REPO="${APOLLO_API_REPO:-apolloapi-v2}"
+CHANNEL="${APOLLO_CHANNEL:-stable}"
+
+CHANNEL_URL="${APOLLO_CHANNEL_URL:-${APOLLO_GIT_BASE}/${APOLLO_API_REPO}/releases/download/channel-${CHANNEL}/${CHANNEL}.json}"
+TRUST_IDENTITY="${APOLLO_TRUST_IDENTITY:-^${APOLLO_GIT_BASE}/${APOLLO_API_REPO}/\.github/workflows/release\.yml@}"
+TRUST_ISSUER="${APOLLO_TRUST_ISSUER:-https://token.actions.githubusercontent.com}"
+
+# --- helpers ---------------------------------------------------------------
+
+log()  { printf '%s\n' "$*" >&2; }
+die()  { printf 'apollo-update: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+sha256_of() {
+  if have sha256sum; then sha256sum "$1" | cut -d' ' -f1
+  elif have shasum; then shasum -a 256 "$1" | cut -d' ' -f1
+  else die "no sha256 tool (sha256sum or shasum)"; fi
+}
+
+fetch() { curl -fsSL --retry 3 --connect-timeout 15 "$1"; }
+
+current_version() {
+  # Prefer the release's version.json; fall back to package.json for a device
+  # not yet cut over to the release layout.
+  if [ -f "$CURRENT_LINK/version.json" ]; then
+    jq -r '.version' "$CURRENT_LINK/version.json"
+  elif [ -f "$APOLLO_DIR/version.json" ]; then
+    jq -r '.version' "$APOLLO_DIR/version.json"
+  elif [ -f "$APOLLO_DIR/package.json" ]; then
+    jq -r '.version' "$APOLLO_DIR/package.json"
+  else
+    echo "unknown"
+  fi
+}
+
+# Replace the symlink in one step. On the device (GNU coreutils) this is an
+# atomic rename over the existing symlink; -T stops mv from descending into the
+# directory the old symlink points at and moving the new link *inside* it.
+# BSD/macOS mv has no -T (only relevant to off-device tests), where `ln -sfn`
+# replaces a symlink-to-directory correctly.
+swap_symlink() {
+  local target="$1" link="$2" tmp
+  tmp="$(mktemp -u "${link}.XXXXXX")"
+  ln -s "$target" "$tmp"
+  if ! mv -T "$tmp" "$link" 2>/dev/null; then
+    rm -f "$tmp"
+    ln -sfn "$target" "$link"
+  fi
+}
+
+restart_services() { $SYSTEMCTL restart $SERVICES; }
+
+health_ok() {
+  local deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then return 0; fi
+    sleep 2
+  done
+  return 1
+}
+
+# --- commands --------------------------------------------------------------
+
+cmd_current() { current_version; }
+
+cmd_list() {
+  [ -d "$RELEASES_DIR" ] || return 0
+  local active; active="$(readlink "$CURRENT_LINK" 2>/dev/null | xargs -r basename || true)"
+  for d in "$RELEASES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    local v; v="$(basename "$d")"
+    [ "$v" = "$active" ] && echo "$v (current)" || echo "$v"
+  done
+}
+
+# Emits JSON so the backend/GraphQL layer can consume it directly.
+cmd_check() {
+  local manifest cur latest
+  manifest="$(fetch "$CHANNEL_URL")" || die "cannot reach $CHANNEL_URL"
+  latest="$(jq -r '.version' <<<"$manifest")"
+  cur="$(current_version)"
+  local avail=false
+  [ "$cur" != "$latest" ] && [ "$latest" != "null" ] && avail=true
+  jq -n \
+    --arg current "$cur" --arg latest "$latest" \
+    --argjson updateAvailable "$avail" \
+    --arg channel "$CHANNEL" \
+    --arg summary "$(jq -r '.summary // ""' <<<"$manifest")" \
+    --arg notesUrl "$(jq -r '.notes_url // ""' <<<"$manifest")" \
+    '{current: $current, latest: $latest, updateAvailable: $updateAvailable,
+      channel: $channel, summary: $summary, notesUrl: $notesUrl}'
+}
+
+verify_signature() {
+  local tarball="$1" sig="$2" cert="$3"
+  have cosign || die "cosign not installed — cannot verify the release signature"
+  # Keyless: bind the signature to the identity the device is configured to
+  # trust. A swapped manifest pointing at an attacker's signed artifact fails
+  # here, because its identity does not match TRUST_IDENTITY.
+  cosign verify-blob \
+    --certificate "$cert" --signature "$sig" \
+    --certificate-identity-regexp "$TRUST_IDENTITY" \
+    --certificate-oidc-issuer "$TRUST_ISSUER" \
+    "$tarball" >/dev/null 2>&1 \
+    || die "signature verification failed for $tarball"
+}
+
+cmd_apply() {
+  local want="${1:-latest}" manifest
+  if [ "$want" = "latest" ]; then
+    manifest="$(fetch "$CHANNEL_URL")" || die "cannot reach $CHANNEL_URL"
+  else
+    manifest="$(fetch "${APOLLO_GIT_BASE}/${APOLLO_API_REPO}/releases/download/v${want}/apollo-${want}-manifest.json")" \
+      || die "no manifest for version $want"
+  fi
+
+  local version url sig_url cert_url sha
+  version="$(jq -r '.version' <<<"$manifest")"
+  url="$(jq -r '.url' <<<"$manifest")"
+  sig_url="$(jq -r '.signature_url' <<<"$manifest")"
+  cert_url="$(jq -r '.certificate_url' <<<"$manifest")"
+  sha="$(jq -r '.sha256' <<<"$manifest")"
+  [ "$version" != "null" ] || die "manifest has no version"
+
+  if [ -e "$RELEASES_DIR/$version" ] && [ "$(readlink "$CURRENT_LINK" | xargs -r basename)" = "$version" ]; then
+    log "already on $version"; return 0
+  fi
+
+  log "==> downloading $version"
+  mkdir -p "$DL_DIR"
+  local tb="$DL_DIR/apollo-${version}-aarch64.tar.zst"
+  curl -fL --retry 3 -C - -o "$tb" "$url" || die "download failed"
+  curl -fsSL -o "$tb.sig" "$sig_url"  || die "signature download failed"
+  curl -fsSL -o "$tb.pem" "$cert_url" || die "certificate download failed"
+
+  log "==> verifying integrity"
+  local got; got="$(sha256_of "$tb")"
+  [ "$got" = "$sha" ] || die "sha256 mismatch: expected $sha, got $got"
+
+  log "==> verifying signature"
+  verify_signature "$tb" "$tb.sig" "$tb.pem"
+
+  log "==> extracting"
+  local partial="$RELEASES_DIR/${version}.partial"
+  rm -rf "$partial"; mkdir -p "$partial"
+  tar -C "$partial" --zstd -xf "$tb"
+  rm -rf "$RELEASES_DIR/$version"
+  mv "$partial" "$RELEASES_DIR/$version"
+
+  backup_db "$version"
+  run_migrations "$version"
+
+  # Remember the release we are leaving, so rollback has a target.
+  local prev; prev="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
+  log "==> activating $version"
+  swap_symlink "$RELEASES_DIR/$version" "$CURRENT_LINK"
+  [ -n "$prev" ] && swap_symlink "$prev" "$PREVIOUS_LINK"
+
+  restart_services
+  if health_ok; then
+    log "==> $version is healthy"
+    prune_releases
+    echo "$version"
+  else
+    log "!! health check failed — rolling back"
+    [ -n "$prev" ] && swap_symlink "$prev" "$CURRENT_LINK"
+    restart_services
+    die "update to $version failed health check; rolled back"
+  fi
+}
+
+cmd_rollback() {
+  [ -L "$PREVIOUS_LINK" ] || die "no previous release to roll back to"
+  local target cur
+  target="$(readlink "$PREVIOUS_LINK")"
+  cur="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
+  log "==> rolling back to $(basename "$target")"
+  swap_symlink "$target" "$CURRENT_LINK"
+  [ -n "$cur" ] && swap_symlink "$cur" "$PREVIOUS_LINK"
+  restart_services
+  health_ok || die "rollback restarted but health check failed"
+  basename "$target"
+}
+
+backup_db() {
+  local version="$1" db="$APOLLO_STATE_DIR/db/futurebit.sqlite"
+  [ -f "$db" ] || return 0
+  mkdir -p "$BACKUP_DIR"
+  # A consistent snapshot, not a cp of a live file.
+  if have sqlite3; then
+    sqlite3 "$db" ".backup '$BACKUP_DIR/futurebit.sqlite.pre-${version}.bak'"
+  else
+    cp "$db" "$BACKUP_DIR/futurebit.sqlite.pre-${version}.bak"
+  fi
+}
+
+run_migrations() {
+  local version="$1" rel="$RELEASES_DIR/$version"
+  [ "${APOLLO_SKIP_MIGRATIONS:-0}" = "1" ] && { log "   (migrations skipped)"; return 0; }
+  [ -f "$rel/knexfile.js" ] || { log "   (no knexfile; skipping migrations)"; return 0; }
+  local knex="$rel/node_modules/knex/bin/cli.js"
+  [ -f "$knex" ] || { log "   (knex not bundled; skipping migrations)"; return 0; }
+  log "==> running migrations"
+  ( cd "$rel" && DATABASE_URL="$APOLLO_STATE_DIR/db/futurebit.sqlite" NODE_ENV=production \
+      node "$knex" migrate:latest --knexfile knexfile.js ) \
+    || die "migrations failed"
+}
+
+# Keep current, previous and nothing older.
+prune_releases() {
+  local keep_a keep_b
+  # `|| true`: on a fresh device there is no previous link yet, and a failing
+  # readlink under `set -e`/pipefail would abort apply *after* it already
+  # activated — reporting failure for an update that worked.
+  keep_a="$(readlink "$CURRENT_LINK" 2>/dev/null | xargs -r basename || true)"
+  keep_b="$(readlink "$PREVIOUS_LINK" 2>/dev/null | xargs -r basename || true)"
+  for d in "$RELEASES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    local v; v="$(basename "$d")"
+    [ "$v" = "$keep_a" ] && continue
+    [ "$v" = "$keep_b" ] && continue
+    rm -rf "$d"
+  done
+}
+
+# --- dispatch --------------------------------------------------------------
+
+usage() {
+  cat >&2 <<EOF
+apollo-update <command>
+
+  check              print, as JSON, whether a newer version is available
+  apply [version]    download, verify, activate a release (default: latest)
+  rollback           swap back to the previous release
+  current            print the active version
+  list               list installed releases
+EOF
+  exit "${1:-0}"
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    check)    cmd_check "$@" ;;
+    apply)    cmd_apply "$@" ;;
+    rollback) cmd_rollback "$@" ;;
+    current)  cmd_current "$@" ;;
+    list)     cmd_list "$@" ;;
+    ""|-h|--help|help) usage 0 ;;
+    *) log "unknown command: $cmd"; usage 1 ;;
+  esac
+}
+
+main "$@"
