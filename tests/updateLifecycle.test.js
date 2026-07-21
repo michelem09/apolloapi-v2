@@ -25,20 +25,42 @@ describe('update lifecycle contract', () => {
   it('does not ignore failed service shutdowns in the current updater', () => {
     const script = readBackendScript('update');
 
-    // Asserted on intent and not on one service per line: the updater stops them
-    // in a single `systemctl stop a b c` call, and the order within it is what
-    // matters (ckpool before node, so the pool lets go of the RPC first).
-    const stopLine = script.match(/^\s*systemctl stop .*$/m);
-    expect(stopLine).not.toBeNull();
-    for (const unit of ['ckpool.service', 'node.service', 'apollo-api.service']) {
-      expect(stopLine[0]).toContain(unit);
+    // Every unit the release owns has to be stopped, not just the ones reading
+    // from the checkout: `systemctl start` on an already-active unit is a no-op,
+    // so anything left running never picks up the new release. apollo-miner kept
+    // executing the old binary, and apollo-bootstrap — oneshot with
+    // RemainAfterExit — never re-ran its migrations.
+    const stop = script.match(/systemctl stop [\s\S]*?(?=\n[^\s\\])/);
+    expect(stop).not.toBeNull();
+    for (const unit of [
+      'ckpool.service',
+      'node.service',
+      'apollo-miner.service',
+      'apollo-ui-v2.service',
+      'apollo-api.service',
+      'apollo-bootstrap.service',
+    ]) {
+      expect(stop[0]).toContain(unit);
     }
-    expect(stopLine[0].indexOf('ckpool.service')).toBeLessThan(
-      stopLine[0].indexOf('node.service')
+    // ckpool releases the RPC before the node goes; bootstrap goes last because
+    // node and miner declare Requires= on it.
+    expect(stop[0].indexOf('ckpool.service')).toBeLessThan(stop[0].indexOf('node.service'));
+    expect(stop[0].indexOf('apollo-bootstrap.service')).toBeGreaterThan(
+      stop[0].indexOf('apollo-api.service')
     );
 
     expect(script).not.toMatch(/systemctl stop[^\n]*\|\| true/);
+
+    // Both residual checks: ckpool's stop path cannot report failure, because
+    // ckpool_stop.sh ends in `|| true` and the daemon backgrounds itself.
     expect(script).toContain('pgrep -u futurebit -x bitcoind');
+    expect(script).toContain('pgrep -u futurebit -x ckpool');
+
+    // bootstrap must come back up before the units that Require it.
+    const startBootstrap = script.indexOf('systemctl start apollo-bootstrap.service\n');
+    const startNode = script.indexOf('systemctl start node.service ||');
+    expect(startBootstrap).toBeGreaterThan(-1);
+    expect(startNode).toBeGreaterThan(startBootstrap);
   });
 
   it('leaves the caller cgroup before stopping the service it was spawned from', () => {

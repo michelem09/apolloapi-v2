@@ -287,10 +287,12 @@ restore_units() {
   return 0
 }
 
-# Same set the success path starts, and in the same order. ckpool is deliberately
-# absent: its intent lives in the database and serviceMonitor acts on it.
+# Same set the success path starts, and in the same order: bootstrap first,
+# because node and apollo-miner Require it. ckpool is deliberately absent — its
+# intent lives in the database and serviceMonitor acts on it.
 start_services() {
-  systemctl start apollo-bootstrap.service apollo-api.service apollo-ui-v2.service || true
+  systemctl start apollo-bootstrap.service || true
+  systemctl start apollo-api.service apollo-ui-v2.service || true
   systemctl start node.service apollo-miner.service || true
   return 0
 }
@@ -415,10 +417,26 @@ echo "60" > "$TMPFILE"
 log "Stopping services"
 # Armed before the stop, so a failure during it still restarts what went down.
 STOPPED=1
-# The node runs binaries and configuration out of this checkout.
-systemctl stop ckpool.service node.service apollo-ui-v2.service apollo-api.service
+# Everything the release owns is stopped, not just what reads from the checkout.
+# `systemctl start` on an already-active unit is a no-op, so a unit left running
+# here is a unit that never picks up the new release — the v2.2 script got away
+# with a partial list only because it ended in a reboot. apollo-miner kept running
+# the old binary out of the backup directory; apollo-bootstrap is Type=oneshot
+# with RemainAfterExit=yes, so leaving it active meant its migrations never ran.
+#
+# Order matters: node and apollo-miner have Requires=apollo-bootstrap, so
+# bootstrap goes last on the way down and first on the way up.
+systemctl stop ckpool.service node.service apollo-miner.service \
+  apollo-ui-v2.service apollo-api.service apollo-bootstrap.service
 if systemctl is-active --quiet node.service || pgrep -u futurebit -x bitcoind >/dev/null 2>&1; then
   die "Bitcoin node did not stop cleanly; aborting update"
+fi
+# ckpool needs its own check and not belt-and-braces: ckpool_stop.sh ends in
+# `|| true` and ckpool_start.sh daemonises with -B, so `systemctl stop` reports
+# success with the process still alive. An orphan keeps the stratum port and the
+# pre-update config, and the new instance then cannot bind.
+if pgrep -u futurebit -x ckpool >/dev/null 2>&1; then
+  die "ckpool did not stop cleanly; aborting update"
 fi
 
 echo "70" > "$TMPFILE"
@@ -452,12 +470,29 @@ systemctl daemon-reload
 systemctl enable apollo-bootstrap.service apollo-api.service apollo-ui-v2.service \
   apollo-miner.service node.service rc-local.service >/dev/null 2>&1 || true
 
+# The firewall is applied directly rather than by restarting rc-local.service:
+# rc.local also runs backend/first_run, which partitions, mounts and resizes
+# storage — not something to repeat mid-update. backend/firewall is safe to
+# re-run on its own because it opens by flushing every chain.
+if [ -x "$APOLLO_DIR/backend/firewall" ]; then
+  "$APOLLO_DIR/backend/firewall" >/dev/null 2>&1 || err "Firewall rules were not applied"
+fi
+
 restore_solo_intent
 
 echo "95" > "$TMPFILE"
 log "Starting services"
-systemctl start apollo-bootstrap.service apollo-api.service apollo-ui-v2.service
-systemctl start node.service apollo-miner.service || err "A mining service did not start cleanly"
+# bootstrap first: it owns the migrations, and node/miner Require it, so starting
+# it later would bounce them right after they came up.
+systemctl start apollo-bootstrap.service
+systemctl start apollo-api.service apollo-ui-v2.service
+# A node that will not start is a failed update — health_ok only probes the API
+# and the UI, so without this a device with a dead Bitcoin node reported success.
+# ExecCondition (node_storage_ready.sh) declining is not a failure, so a device
+# whose disk is not ready still passes here.
+systemctl start node.service || die "Bitcoin node did not start after installing $VERSION"
+# The miner stays a warning: solo-node devices have no miner hardware at all.
+systemctl start apollo-miner.service || err "The miner did not start cleanly"
 health_ok || die "Health check failed after installing $VERSION"
 
 echo "100" > "$TMPFILE"
