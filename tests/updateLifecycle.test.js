@@ -41,6 +41,23 @@ describe('update lifecycle contract', () => {
     expect(script).toContain('pgrep -u futurebit -x bitcoind');
   });
 
+  it('leaves the caller cgroup before stopping the service it was spawned from', () => {
+    const script = readBackendScript('update');
+
+    // src/services/mcu.js spawns this as a plain child of apollo-api, so without
+    // the re-exec it sits in apollo-api's cgroup and `systemctl stop
+    // apollo-api.service` SIGTERMs it mid-swap (verified on hardware: a process
+    // in that cgroup is killed, the same process inside a transient scope is not).
+    const reexec = script.indexOf('exec systemd-run --quiet --scope');
+    const stop = script.indexOf('systemctl stop ');
+    expect(reexec).toBeGreaterThan(-1);
+    expect(stop).toBeGreaterThan(reexec);
+
+    // The inherited stdout belongs to the process being stopped, so it must not
+    // still be in use once that happens.
+    expect(script).toMatch(/exec >>"\$LOG_FILE" 2>&1/);
+  });
+
   it('validates every manifest field it consumes, before it consumes it', () => {
     const script = readBackendScript('update');
 

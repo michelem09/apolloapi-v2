@@ -40,6 +40,32 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 [ "$EUID" -eq 0 ] || die "Update script must be run by root or with sudo"
 
+# --- get out of the caller's cgroup ------------------------------------------
+# The UI spawns this script as a child of apollo-api (src/services/mcu.js uses a
+# plain spawn, with no setsid or detached), so it runs inside that unit's cgroup
+# — and one of the first things it does is stop apollo-api.service. systemd's
+# default KillMode=control-group makes that a SIGTERM to ourselves, in the middle
+# of the swap, leaving every service stopped and nothing to start them again.
+#
+# A run started by hand over SSH already lives in the session scope and was never
+# at risk, which is exactly why testing it that way did not reveal this.
+#
+# Output goes to a log file rather than staying on the inherited stdout: that pipe
+# belongs to the process we are about to stop, and writing to it afterwards would
+# fail under `set -e` — trading one self-inflicted abort for another.
+LOG_FILE="${APOLLO_UPDATE_LOG:-$STATE_DIR/update.log}"
+if [ -z "${APOLLO_UPDATE_SCOPED:-}" ] && [ -d /run/systemd/system ] && have systemd-run; then
+  mkdir -p "$STATE_DIR"
+  echo "Update started. Follow it with: tail -f $LOG_FILE"
+  export APOLLO_UPDATE_SCOPED=1
+  exec systemd-run --quiet --scope -- "$0" "$@"
+fi
+if [ -n "${APOLLO_UPDATE_SCOPED:-}" ]; then
+  mkdir -p "$STATE_DIR"
+  exec >>"$LOG_FILE" 2>&1
+  echo "=== update started $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+fi
+
 # --- config, parsed and never executed --------------------------------------
 # source.conf is writable by the app user, so sourcing it would be code
 # execution as root. Read the keys instead.
