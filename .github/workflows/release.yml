@@ -160,6 +160,17 @@ jobs:
           mkdir -p "$STAGE/backend"
           tar -C backend --exclude='node/bin' -cf - . | tar -C "$STAGE/backend" -xf -
 
+          # Materialize the miner/ckpool runtime binaries the launch scripts call.
+          # They are install-time artifacts copied from bin/<arch>/, not tracked
+          # files, so without this the artifact ships the scripts without the
+          # binaries. They are small (~6 MB), so shipping them keeps the device's
+          # backend/ fully owned by the release — only bitcoind is inherited.
+          m="$STAGE/backend/apollo-miner"
+          install -m 755 "$m/bin/aarch64/apollo-miner"    "$m/futurebit-miner"
+          install -m 755 "$m/bin/aarch64/apollo-miner-v2" "$m/futurebit-miner-v2"
+          install -m 755 "$m/bin/aarch64/apollo-helper"   "$m/apollo-helper"
+          install -m 755 "$STAGE/backend/ckpool/bin/aarch64/ckpool" "$STAGE/backend/ckpool/ckpool"
+
           # These arrive with steps 4 and 5; included automatically once they exist.
           [ -f bin/apollo-update ] && install -Dm755 bin/apollo-update "$STAGE/bin/apollo-update" || true
           [ -f bootstrap.sh ]      && install -Dm755 bootstrap.sh      "$STAGE/bootstrap.sh"      || true

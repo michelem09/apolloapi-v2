@@ -137,9 +137,30 @@ cleanup() {
 trap cleanup ERR EXIT
 
 # --- code swap ---------------------------------------------------------------
-# Directories the release fully owns. Replaced wholesale so files deleted
-# upstream do not linger; everything else in the checkout is left alone.
-OWNED='src config migrations node_modules'
+# Directories the release fully owns. Replaced wholesale — never merged — so a
+# file deleted upstream actually disappears from the device. Merging would make
+# a deletion silently ineffective, including one that IS the security fix.
+OWNED='src config migrations node_modules backend'
+
+# The single exception: bitcoind (~103 MB across flavours) is deliberately not in
+# the artifact, so it is carried across the swap instead of being deleted with
+# the rest of backend/. Keeping it to ONE explicit path is the point — a forgotten
+# entry here fails loudly at startup, which is far safer than the silent staleness
+# a merge would leave behind. Step 6 (bitcoind as its own package) removes even this.
+PRESERVED_BIN="$BACKUP_DIR/.preserved-node-bin"
+
+preserve_binaries() {
+  rm -rf "$PRESERVED_BIN"
+  [ -d "$APOLLO_DIR/backend/node/bin" ] && mv "$APOLLO_DIR/backend/node/bin" "$PRESERVED_BIN"
+  return 0
+}
+
+place_binaries() {
+  [ -d "$PRESERVED_BIN" ] || return 0
+  mkdir -p "$APOLLO_DIR/backend/node"
+  rm -rf "$APOLLO_DIR/backend/node/bin"
+  mv "$PRESERVED_BIN" "$APOLLO_DIR/backend/node/bin"
+}
 
 backup_code() {
   BACKUP_CODE="$BACKUP_DIR/code-pre-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -154,9 +175,13 @@ restore_code() {
   local b; b="${BACKUP_CODE:-$(cat "$BACKUP_DIR/.last-code-backup" 2>/dev/null || true)}"
   [ -n "$b" ] && [ -d "$b" ] || return 0
   err "Restoring the previous code from $b"
+  # Rescue bitcoind from whichever backend/ is currently in place first, so the
+  # restore cannot delete it along with the half-installed release.
+  preserve_binaries
   local d
   for d in $OWNED; do rm -rf "$APOLLO_DIR/$d"; [ -e "$b/$d" ] && mv "$b/$d" "$APOLLO_DIR/$d"; done
   rm -rf "$UI_DIR/.next"; [ -e "$b/apolloui-v2/.next" ] && mv "$b/apolloui-v2/.next" "$UI_DIR/.next"
+  place_binaries
   systemctl daemon-reload || true
 }
 
@@ -253,14 +278,13 @@ fi
 
 echo "70" > "$TMPFILE"
 log "Installing $VERSION"
+preserve_binaries
 backup_code
 SWAPPED=1
 for d in $OWNED; do [ -e "$STAGING/$d" ] && mv "$STAGING/$d" "$APOLLO_DIR/$d"; done
 mkdir -p "$UI_DIR/.next"
 mv "$STAGING/apolloui-v2/.next/standalone" "$UI_DIR/.next/standalone"
-# backend/ is merged, not replaced: it must keep bitcoind and the miner/ckpool
-# binaries that the artifact deliberately does not carry.
-tar -C "$STAGING/backend" -cf - . | tar -C "$APOLLO_DIR/backend" -xf -
+place_binaries
 for f in knexfile.js package.json version.json; do
   [ -e "$STAGING/$f" ] && cp "$STAGING/$f" "$APOLLO_DIR/$f"
 done
