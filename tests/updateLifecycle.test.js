@@ -25,8 +25,18 @@ describe('update lifecycle contract', () => {
   it('does not ignore failed service shutdowns in the current updater', () => {
     const script = readBackendScript('update');
 
-    expect(script).toContain('systemctl stop ckpool.service');
-    expect(script).toContain('systemctl stop node.service');
+    // Asserted on intent and not on one service per line: the updater stops them
+    // in a single `systemctl stop a b c` call, and the order within it is what
+    // matters (ckpool before node, so the pool lets go of the RPC first).
+    const stopLine = script.match(/^\s*systemctl stop .*$/m);
+    expect(stopLine).not.toBeNull();
+    for (const unit of ['ckpool.service', 'node.service', 'apollo-api.service']) {
+      expect(stopLine[0]).toContain(unit);
+    }
+    expect(stopLine[0].indexOf('ckpool.service')).toBeLessThan(
+      stopLine[0].indexOf('node.service')
+    );
+
     expect(script).not.toMatch(/systemctl stop[^\n]*\|\| true/);
     expect(script).toContain('pgrep -u futurebit -x bitcoind');
   });
