@@ -8,13 +8,13 @@ Before=apollo-api.service node.service
 Type=oneshot
 User=futurebit
 Group=futurebit
-WorkingDirectory=/opt/apolloapi
+WorkingDirectory=/opt/apolloapi/current
 Environment=NODE_ENV=production
 EnvironmentFile=-/opt/apolloapi/.env
 StateDirectory=apollo
 StateDirectoryMode=0700
 UMask=0077
-ExecStart=/usr/local/nvm/versions/node/v21.6.2/bin/node /opt/apolloapi/src/bootstrap.js
+ExecStart=/usr/local/nvm/versions/node/v21.6.2/bin/node /opt/apolloapi/current/src/bootstrap.js
 RemainAfterExit=yes
 
 [Install]

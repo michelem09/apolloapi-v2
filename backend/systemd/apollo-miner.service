@@ -10,10 +10,10 @@ Type=forking
 User=root
 EnvironmentFile=-/opt/apolloapi/.env
 #Start:
-ExecStart=/opt/apolloapi/backend/apollo-miner/miner_start.sh
-WorkingDirectory=/opt/apolloapi/backend/apollo-miner
+ExecStart=/opt/apolloapi/current/backend/apollo-miner/miner_start.sh
+WorkingDirectory=/opt/apolloapi/current/backend/apollo-miner
 #Stop:
-ExecStop=/opt/apolloapi/backend/apollo-miner/miner_stop.sh
+ExecStop=/opt/apolloapi/current/backend/apollo-miner/miner_stop.sh
 #Restart
 Restart=always
 RestartSec=30s

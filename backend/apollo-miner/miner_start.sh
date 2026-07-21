@@ -4,7 +4,7 @@
 # mode, apollo-miner.* stat files) lives outside it so the checkout stays clean
 # for prebuilt OTA updates. The bootstrap creates RUNTIME_DIR (futurebit-owned)
 # before this unit runs; mkdir -p here is only a fallback.
-BIN_DIR=/opt/apolloapi/backend/apollo-miner
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
 STATE_DIR="${APOLLO_STATE_DIR:-/var/lib/apollo}"
 RUNTIME_DIR="${STATE_DIR}/miner"
 

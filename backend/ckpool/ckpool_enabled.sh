@@ -1,7 +1,9 @@
 #!/bin/bash
 set -Eeuo pipefail
 
-APOLLO_DIR="${APOLLO_DIR:-/opt/apolloapi}"
+# Derive from the script's own location so it works whether the code lives at
+# /opt/apolloapi (legacy checkout) or /opt/apolloapi/current/... (release layout).
+APOLLO_DIR="${APOLLO_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
 DATABASE_URL="${DATABASE_URL:-${APOLLO_DIR}/futurebit.sqlite}"
 
 if ! enabled=$(sqlite3 "$DATABASE_URL" \

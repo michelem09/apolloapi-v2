@@ -9,11 +9,11 @@ Before=ckpool.service
 Type=simple
 User=futurebit
 Group=futurebit
-WorkingDirectory=/opt/apolloapi
+WorkingDirectory=/opt/apolloapi/current
 EnvironmentFile=-/opt/apolloapi/.env
-ExecCondition=/opt/apolloapi/backend/node/node_storage_ready.sh
-ExecStart=/opt/apolloapi/backend/node/node_start.sh
-ExecStop=/opt/apolloapi/backend/node/node_stop.sh
+ExecCondition=/opt/apolloapi/current/backend/node/node_storage_ready.sh
+ExecStart=/opt/apolloapi/current/backend/node/node_start.sh
+ExecStop=/opt/apolloapi/current/backend/node/node_stop.sh
 KillSignal=SIGTERM
 # node_stop waits up to 600s for dbcache flushes; keep systemd outside that window.
 TimeoutStopSec=700

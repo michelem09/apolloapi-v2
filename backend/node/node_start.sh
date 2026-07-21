@@ -4,7 +4,9 @@ set -Eeuo pipefail
 DEVICE="${APOLLO_NODE_DEVICE:-/dev/nvme0n1p1}"
 MOUNTPOINT="${APOLLO_NODE_MOUNTPOINT:-/media/nvme}"
 DATADIR="${APOLLO_BITCOIN_DATADIR:-${MOUNTPOINT}/Bitcoin}"
-APOLLO_DIR="${APOLLO_DIR:-/opt/apolloapi}"
+# Derive from the script's own location so it works whether the code lives at
+# /opt/apolloapi (legacy checkout) or /opt/apolloapi/current/... (release layout).
+APOLLO_DIR="${APOLLO_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
 STATE_DIR="${APOLLO_STATE_DIR:-/var/lib/apollo}"
 DATABASE_URL="${DATABASE_URL:-${APOLLO_DIR}/futurebit.sqlite}"
 

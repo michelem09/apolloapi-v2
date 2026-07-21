@@ -1,7 +1,9 @@
 #!/bin/bash
 set -Eeuo pipefail
 
-APOLLO_DIR="${APOLLO_DIR:-/opt/apolloapi}"
+# Derive from the script's own location so it works whether the code lives at
+# /opt/apolloapi (legacy checkout) or /opt/apolloapi/current/... (release layout).
+APOLLO_DIR="${APOLLO_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
 STATE_DIR="${APOLLO_STATE_DIR:-/var/lib/apollo}"
 LOG_DIR="${STATE_DIR}/ckpool/logs"
 

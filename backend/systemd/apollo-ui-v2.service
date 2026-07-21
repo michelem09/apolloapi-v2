@@ -21,7 +21,7 @@ Environment=PATH=/usr/local/nvm/versions/node/v21.6.2/bin:/usr/local/sbin:/usr/l
 # HOSTNAME is set explicitly on purpose: server.js binds to `process.env.HOSTNAME
 # || '0.0.0.0'`, and on Linux that variable is often already the machine name — in
 # which case the UI would bind to the loopback and vanish from the LAN.
-WorkingDirectory=/opt/apolloapi/apolloui-v2
+WorkingDirectory=/opt/apolloapi/current/apolloui-v2
 Environment=HOSTNAME=0.0.0.0
 Environment=PORT=3000
 ExecStart=/usr/local/nvm/versions/node/v21.6.2/bin/node .next/standalone/server.js

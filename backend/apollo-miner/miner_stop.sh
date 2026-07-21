@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /opt/apolloapi/backend/apollo-miner
+cd "$(dirname "$0")"
 
 
 reset_hashboards()

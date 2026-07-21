@@ -10,8 +10,8 @@ EnvironmentFile=-/opt/apolloapi/.env
 Type=simple
 User=futurebit
 Group=futurebit
-ExecStart=/usr/local/nvm/versions/node/v21.6.2/bin/node /opt/apolloapi/src/init.js
-WorkingDirectory=/opt/apolloapi
+ExecStart=/usr/local/nvm/versions/node/v21.6.2/bin/node /opt/apolloapi/current/src/init.js
+WorkingDirectory=/opt/apolloapi/current
 Restart=on-failure
 RestartSec=5s
 
