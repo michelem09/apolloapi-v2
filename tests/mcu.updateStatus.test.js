@@ -86,6 +86,35 @@ describe('Mcu.updateStatus', () => {
     expect(status.record.state).toBe('interrupted');
   });
 
+  it('does not call a finished update interrupted because it sampled out of order', async () => {
+    // The real end of every successful run: the record still says "running" when
+    // the API starts looking, the updater writes its terminal record, and the
+    // unit exits. Run in parallel, the file read (about a millisecond) landed
+    // before that write while the systemctl fork (tens of milliseconds) landed
+    // after the exit — so a healthy update was reported as `interrupted`, which
+    // the banner renders as "the updater died without recording anything".
+    //
+    // Modelled the way it actually happens: the updater finishes DURING the
+    // systemd query, which is the slow one.
+    writeRecord({ run_id: 'RUN-1', state: 'running', phase: 'starting services' });
+    build((cmd, cb) => {
+      // DEFERRED, and that is the entire point. A synchronous callback here made
+      // this test pass against the parallel version too: the write landed before
+      // the read was even started, so it asserted nothing. systemctl is a fork —
+      // it answers tens of milliseconds later, long after a file read would have.
+      setTimeout(() => {
+        // The updater writes its terminal record and only then exits, so by the
+        // time systemd reports the unit gone this has already happened.
+        writeRecord({ run_id: 'RUN-1', state: 'succeeded', phase: 'done', progress: 100 });
+        cb(Object.assign(new Error('inactive'), { code: 3 }));
+      }, 20);
+    });
+
+    const status = await mcuService.getUpdateStatus();
+    expect(status.running).toBe(false);
+    expect(status.record.state).toBe('succeeded');
+  });
+
   it('distinguishes a rollback that worked from one that did not', async () => {
     build(inactive);
     writeRecord({ run_id: 'r1', state: 'recovery-failed', reason: 'disk full' });

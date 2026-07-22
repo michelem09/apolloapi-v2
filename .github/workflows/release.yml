@@ -18,12 +18,25 @@ permissions:
   contents: write   # create the Release and upload assets
   id-token: write   # OIDC token for cosign keyless signing
 
-# One release at a time. The channel pointer is uploaded with --clobber, so two
-# tags pushed minutes apart would land last-writer-wins — and a channel that
-# moves BACKWARDS leaves every device on the newer release refusing to install
-# it ("refusing to move to older/equal") until someone notices.
+# One release at a time, PER TAG — not one release at a time overall.
+#
+# A shared group does not serialise: GitHub keeps at most one pending run per
+# group and cancels the previous pending one when a new run arrives, and
+# cancel-in-progress only protects the run already executing. Three tags pushed
+# within a few minutes — shipping a fix on top of a fix, which is this branch's
+# actual working pattern — meant the middle one was cancelled outright: no
+# tarball, no signature, no manifest, no Release, and no alert either, because a
+# cancelled run is not a failed run. The tag existed in git with nothing behind
+# it.
+#
+# Keyed on the ref, every release runs. What the shared group was reaching for —
+# the channel pointer is uploaded with --clobber, so two releases finishing out
+# of order could leave the channel pointing BACKWARDS, and a device on the newer
+# release then refuses to install it ("refusing to move to older/equal") — is
+# handled where it belongs, in the pointer step itself, which now refuses to
+# move the channel to an older version.
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -293,6 +306,15 @@ jobs:
           cat "apollo-${VERSION}-manifest.json"
 
       - name: Publish the Release
+        # Tag pushes only, exactly like the channel step below. Without this a
+        # workflow_dispatch dry run created the git tag at the branch head plus a
+        # public Release — and `gh release create` is not idempotent, so the real
+        # `git push origin v<version>` was then rejected, and forcing it made the
+        # workflow die here with "release already exists". The same
+        # non-idempotency broke "Re-run failed jobs": a transient failure in the
+        # final upload restarted from step one and died here, leaving a fully
+        # signed release the channel permanently did not point at.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.meta.outputs.version }}
@@ -311,7 +333,8 @@ jobs:
             if [ "$CHANNEL" = "dev" ]; then
               printf '\n> **Development build.** Built outside the official repository, so its\n'
               printf '> signing identity differs and production devices reject it by design.\n'
-              printf '> `bitcoind` is not bundled — it ships as a separate package.\n'
+              printf '> `bitcoind` IS bundled (six aarch64 flavours) until it moves\n'
+              printf '> to separate on-demand packages.\n'
             fi
           } > "$NOTES"
 
@@ -351,6 +374,26 @@ jobs:
             gh release create "$POINTER" --prerelease \
               --title "Channel: ${CHANNEL}" \
               --notes "Moving pointer to the latest ${CHANNEL} build. Not a release: the assets here are replaced on every build."
+          fi
+
+          # Never move the channel backwards. The upload is --clobber and the
+          # runs are only serialised per tag, so two releases finishing out of
+          # order would otherwise leave the channel on the older one — and every
+          # device already on the newer release then refuses it ("refusing to
+          # move to older/equal") until a human notices. Compared with sort -V,
+          # which orders 2.2.10 above 2.2.9; the updater's own comparison
+          # deliberately agrees on that point.
+          CURRENT_POINTER=''
+          if gh release download "$POINTER" --pattern "${CHANNEL}.json" \
+               --output current-channel.json --clobber >/dev/null 2>&1; then
+            CURRENT_POINTER="$(jq -r '.version // empty' current-channel.json)"
+          fi
+          if [ -n "$CURRENT_POINTER" ] && [ "$CURRENT_POINTER" != "$VERSION" ]; then
+            NEWEST="$(printf '%s\n%s\n' "$CURRENT_POINTER" "$VERSION" | sort -V | tail -1)"
+            if [ "$NEWEST" != "$VERSION" ]; then
+              echo "::warning::channel ${CHANNEL} already points at ${CURRENT_POINTER}, which is newer than ${VERSION} — leaving it alone"
+              exit 0
+            fi
           fi
 
           gh release upload "$POINTER" "${CHANNEL}.json" --clobber

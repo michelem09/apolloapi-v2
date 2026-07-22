@@ -259,10 +259,22 @@ class McuService {
   // was its own — on boards with no RTC, whose clock is known to ship wrong, and
   // in the minutes right after a restart when NTP has not converged.
   async getUpdateStatus() {
-    const [running, record] = await Promise.all([
-      this._updateUnitActive(),
-      this._readUpdateRecord(),
-    ]);
+    // Sequential, and in this order, which is the whole point.
+    //
+    // Run in parallel, these two are sampled at different instants: the file read
+    // resolves in about a millisecond, the systemctl fork in tens of them. So a
+    // record could be read while the updater was still at "starting services",
+    // the unit could exit before systemctl replied, and the guard below would
+    // rewrite a healthy, completed update as `interrupted` — telling the user the
+    // updater had died without recording anything, about an update that had just
+    // installed cleanly.
+    //
+    // Asking systemd FIRST removes the window instead of narrowing it: the
+    // updater writes its terminal record before it exits, so `running === false`
+    // means that write has already happened, and the record read afterwards
+    // cannot still say "running" unless the run really was killed.
+    const running = await this._updateUnitActive();
+    const record = await this._readUpdateRecord();
 
     // An update the client is waiting on that is neither running nor finished.
     if (record && record.state === 'running' && !running) {

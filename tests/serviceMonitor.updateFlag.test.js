@@ -1,5 +1,3 @@
-const { promisify } = require('util');
-
 // Whether an update is running is asked of systemd, not inferred from a file.
 //
 // Both earlier versions latched. Keyed on the progress file's EXISTENCE, one
@@ -9,8 +7,14 @@ const { promisify } = require('util');
 // not reboot on their own — so the block it guards, which includes the auto
 // restart of a crashed bitcoind or miner, stayed off on exactly the device that
 // had just been through a failed update.
+//
+// Driven through the ServiceMonitor instance, which is what production calls.
+// These assertions used to run against a module-level copy of the same two-liner
+// that no device ever executed: four green tests, error handling that differed
+// from the shipped path, and no coverage at all of the line that matters.
 describe('serviceMonitor update-in-progress detection', () => {
-  let isUpdateRunning;
+  let monitor;
+  let UPDATE_UNIT;
   let execMock;
 
   const withSystemctl = (impl) => {
@@ -21,16 +25,27 @@ describe('serviceMonitor update-in-progress detection', () => {
       exec: (cmd, cb) => execMock(cmd, cb),
     }));
     // eslint-disable-next-line global-require
-    ({ isUpdateRunning } = require('../src/services/serviceMonitor'));
+    const factory = require('../src/services/serviceMonitor');
+    UPDATE_UNIT = factory.UPDATE_UNIT;
+    monitor = factory(null, {});
   };
 
   afterEach(() => {
     jest.dontMock('child_process');
   });
 
+  const updateRunning = () => monitor._isSystemdActive(UPDATE_UNIT);
+
+  it('names the transient unit the updater actually creates', () => {
+    withSystemctl((cmd, cb) => cb(null, { stdout: 'active\n', stderr: '' }));
+    // A contract with backend/update's `systemd-run --unit=`; a mismatch here is
+    // silent and permanent.
+    expect(UPDATE_UNIT).toBe('apollo-update.service');
+  });
+
   it('reports an update running while the transient unit is active', async () => {
     withSystemctl((cmd, cb) => cb(null, { stdout: 'active\n', stderr: '' }));
-    await expect(isUpdateRunning()).resolves.toBe(true);
+    await expect(updateRunning()).resolves.toBe(true);
     expect(execMock.mock.calls[0][0]).toContain('is-active apollo-update.service');
   });
 
@@ -38,18 +53,35 @@ describe('serviceMonitor update-in-progress detection', () => {
     // systemd clears this by itself however the updater died — which is the whole
     // point of asking it instead of reading a file nothing ever cleans up.
     withSystemctl((cmd, cb) => cb(Object.assign(new Error('inactive'), { code: 3 })));
-    await expect(isUpdateRunning()).resolves.toBe(false);
+    await expect(updateRunning()).resolves.toBe(false);
   });
 
   it('reports no update when the unit failed', async () => {
     withSystemctl((cmd, cb) => cb(Object.assign(new Error('failed'), { code: 4 })));
-    await expect(isUpdateRunning()).resolves.toBe(false);
+    await expect(updateRunning()).resolves.toBe(false);
   });
 
   it('treats an unusable systemctl as no update', async () => {
     // A false positive suppresses service recovery indefinitely; a false negative
     // costs one poll misreading a deliberate stop. Fail towards recovery.
     withSystemctl((cmd, cb) => cb(new Error('systemctl: command not found')));
-    await expect(isUpdateRunning()).resolves.toBe(false);
+    await expect(updateRunning()).resolves.toBe(false);
+  });
+
+  it('does not keep a second, untested copy of the check', () => {
+    // The defect this file was rewritten against: the shipped path and the tested
+    // path were different functions.
+    // eslint-disable-next-line global-require
+    const factory = require('../src/services/serviceMonitor');
+    expect(factory.isUpdateRunning).toBeUndefined();
+    // eslint-disable-next-line global-require
+    const fs = require('fs');
+    // eslint-disable-next-line global-require
+    const path = require('path');
+    const src = fs.readFileSync(
+      path.join(__dirname, '..', 'src', 'services', 'serviceMonitor.js'),
+      'utf8'
+    );
+    expect(src.match(/systemctl is-active/g)).toHaveLength(1);
   });
 });

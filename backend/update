@@ -674,6 +674,23 @@ restore_code() {
 
   for d in $OWNED; do
     if [ -e "$b/$d" ]; then
+      # An INCOMPLETE backup means backup_code was interrupted, and `mv` across
+      # filesystems is copy-then-unlink — BACKUP_DIR lives under STATE_DIR while
+      # this lives under APOLLO_DIR, which the disk check right below already
+      # treats as two mounts. So an interruption can leave a HALF-WRITTEN copy in
+      # the backup while the complete original is still live, and `[ -e ]` cannot
+      # tell that from a finished one: the restore deleted the good tree,
+      # installed the truncated copy, and both commands succeeded, so the run
+      # recorded a clean "rolled-back" while apollo-api never started again.
+      #
+      # Only the entry the interruption caught can be partial — everything before
+      # it completed — and the live copy still being there is the evidence, since
+      # a finished `mv` removes it.
+      if [ "$complete" -eq 0 ] && [ -e "$APOLLO_DIR/$d" ]; then
+        err "Backup copy of $d is incomplete; keeping the live one"
+        rm -rf "$b/$d" 2>/dev/null || true
+        continue
+      fi
       rm -rf "$APOLLO_DIR/$d" || rc=1
       mv "$b/$d" "$APOLLO_DIR/$d" || rc=1
     elif [ "$complete" -eq 1 ] && [ ! -e "$APOLLO_DIR/$d" ]; then
@@ -684,9 +701,21 @@ restore_code() {
     # moved, so it is the previous version already. Leave it.
   done
 
+  # Same asymmetry that was already fixed for ROOT_FILES and for the units: an
+  # absence in a COMPLETE backup means the device had no .next before this
+  # update, so leaving the one the release installed keeps the NEW UI bundle
+  # serving against the ROLLED-BACK backend — every query hitting fields the
+  # restored schema does not expose.
   if [ -e "$b/apolloui-v2/.next" ]; then
+    if [ "$complete" -eq 0 ] && [ -e "$UI_DIR/.next" ]; then
+      err "Backup copy of .next is incomplete; keeping the live one"
+      rm -rf "$b/apolloui-v2/.next" 2>/dev/null || true
+    else
+      rm -rf "$UI_DIR/.next" || rc=1
+      mv "$b/apolloui-v2/.next" "$UI_DIR/.next" || rc=1
+    fi
+  elif [ "$complete" -eq 1 ]; then
     rm -rf "$UI_DIR/.next" || rc=1
-    mv "$b/apolloui-v2/.next" "$UI_DIR/.next" || rc=1
   fi
 
   for f in $ROOT_FILES; do
@@ -846,12 +875,39 @@ for unit in $UNITS; do
 done
 # bitcoind now travels in the release, so its absence is a broken artifact and
 # not a device that simply never had it. Checked BEFORE the swap, because
-# backend/ is replaced wholesale: installing an artifact without these would
-# leave the device with no node at all.
-for flavour in $(ls "$APOLLO_DIR/backend/node/bin" 2>/dev/null | grep -v '^bitcoin.conf$' || true); do
-  [ -x "$STAGING/backend/node/bin/$flavour/aarch64/bitcoind" ] \
-    || die "Artifact is missing bitcoind for $flavour — refusing to install"
-done
+# backend/ is replaced wholesale: installing an artifact without it would leave
+# the device with no node at all.
+#
+# The invariant is the flavour this device is CONFIGURED to run, not every
+# flavour that happens to be on its disk. Demanding a superset of the disk made
+# each release a permanent, SSH-only dead end the moment a flavour was retired:
+# a device on release N would refuse release N+1 forever, and the only thing that
+# could fix it is the release it refuses. A stray `core-29.2.bak` left by an SSH
+# session became a phantom flavour with the same effect, and the unquoted $(ls)
+# word-split and glob-expanded on the way there. It also contradicted the plan
+# already written into release.yml — bitcoind as its own on-demand package builds
+# an artifact with no backend/node/bin/*/aarch64/bitcoind at all.
+#
+# Skipped entirely when the artifact ships no bin/ directory: that is what step 6
+# looks like, and this check must not be the thing that blocks it.
+if [ -d "$STAGING/backend/node/bin" ]; then
+  NODE_FLAVOUR=''
+  if db="$(resolve_database_url)"; then
+    NODE_FLAVOUR="$(sqlite3 "$db" "SELECT COALESCE(node_software,'') FROM settings ORDER BY created_at DESC, id DESC LIMIT 1;" 2>/dev/null || true)"
+  fi
+  single_line "$NODE_FLAVOUR" || NODE_FLAVOUR=''
+  if [ -n "$NODE_FLAVOUR" ]; then
+    [ -x "$STAGING/backend/node/bin/$NODE_FLAVOUR/aarch64/bitcoind" ] \
+      || die "Artifact is missing bitcoind for $NODE_FLAVOUR, the flavour this device runs — refusing to install"
+  else
+    # Settings unreadable — a DB being migrated, a fresh device. We cannot name
+    # the flavour, but an artifact carrying a bin/ directory with no bitcoind in
+    # it at all is broken whatever the device runs.
+    err "Could not read the configured node flavour; checking the artifact carries at least one"
+    ls "$STAGING"/backend/node/bin/*/aarch64/bitcoind >/dev/null 2>&1 \
+      || die "Artifact carries no bitcoind at all — refusing to install"
+  fi
+fi
 for f in $ROOT_FILES; do
   [ -e "$STAGING/$f" ] || die "Artifact is missing $f — refusing to install"
 done

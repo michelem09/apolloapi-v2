@@ -22,22 +22,6 @@ const UPDATE_UNIT = 'apollo-update.service';
 // reconciliation AND the auto-restart of a crashed bitcoind or miner — was
 // skipped for good, on a device that had just been through a failed update and
 // needed that recovery most.
-//
-// The updater runs as a named transient unit, so systemd is authoritative and
-// self-clearing however the process dies. Anything unexpected counts as "not
-// running": the cost of a false positive is suppressing service recovery
-// indefinitely, the cost of a false negative is one poll misreading a deliberate
-// stop as a manual action.
-async function isUpdateRunning() {
-  try {
-    const { stdout } = await execAsync(`systemctl is-active ${UPDATE_UNIT}`);
-    return stdout.trim() === 'active';
-  } catch (err) {
-    // is-active exits non-zero for inactive/failed/unknown — all "not running".
-    return false;
-  }
-}
-
 class ServiceMonitor {
   constructor(knex, services) {
     this.knex = knex;
@@ -336,15 +320,18 @@ class ServiceMonitor {
       // The updater intentionally stops services while an update is running, so
       // those stops must not be read as manual actions.
       //
-      // The file's CONTENT decides, not its existence: the updater deliberately
-      // leaves a terminal value behind (-1 failed, 100 succeeded) so the UI can
-      // report the outcome after the API comes back. Treating the file's mere
-      // presence as "in progress" meant one failed update disabled this whole
-      // block for good — including the auto-restart of a crashed bitcoind or
-      // miner — since nothing clears it until the next update runs.
-      // Through the class's own systemd helper, so it goes the same route as
-      // every other unit query — and so tests that stub systemd states cover it
-      // too, instead of it slipping past them to the real exec.
+      // Asked of systemd, through the class's own helper. Both earlier versions
+      // read the progress file and latched: on its EXISTENCE, one failed update
+      // suppressed this whole block for good — including the auto-restart of a
+      // crashed bitcoind or miner — and on its VALUE, an updater killed during
+      // the health check left a mid-range number behind and did the same.
+      // Nothing clears that file but the next update, and these devices do not
+      // reboot on their own. A transient unit is self-clearing however the
+      // process dies.
+      //
+      // There was briefly a second, module-level copy of this two-liner, and the
+      // tests exercised THAT one while production ran this line — four green
+      // assertions against code no device executes.
       const updateInProgress = await this._isSystemdActive(UPDATE_UNIT);
       if (existing && !updateInProgress) {
         // Get time since last request (if any)
@@ -814,7 +801,4 @@ class ServiceMonitor {
 }
 
 module.exports = (knex, services) => new ServiceMonitor(knex, services);
-// Exported for the tests: the difference between "an update is running" and "an
-// update finished a while ago" decides whether service recovery stays disabled.
-module.exports.isUpdateRunning = isUpdateRunning;
 module.exports.UPDATE_UNIT = UPDATE_UNIT;

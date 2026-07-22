@@ -118,7 +118,21 @@ describe('update lifecycle contract', () => {
     // bitcoind travels in the release now, so its absence is a broken artifact,
     // not a device that never had it. Without this the wholesale replacement of
     // backend/ would leave the device with no node at all.
-    expect(script).toMatch(/Artifact is missing bitcoind for \$flavour/);
+    //
+    // The invariant is the flavour the device is CONFIGURED to run, read from
+    // settings. Keying on the device's own directory listing instead demanded
+    // every future artifact be a superset of what was already on disk: retiring
+    // a flavour bricked the OTA channel of every device on the previous release,
+    // permanently, because the only thing that could fix it was the release it
+    // refused — and a stray file in that directory did the same. It also
+    // contradicted step 6, whose artifact carries no bitcoind at all.
+    expect(script).toMatch(/SELECT COALESCE\(node_software/);
+    expect(script).toMatch(/the flavour this device runs/);
+    expect(script).not.toMatch(/for flavour in \$\(ls "\$APOLLO_DIR\/backend\/node\/bin"/);
+    // Skipped, not failed, when the artifact ships no bin/ directory — that is
+    // what a step-6 release looks like.
+    const check = script.slice(script.indexOf('if [ -d "$STAGING/backend/node/bin" ]; then'));
+    expect(check.slice(0, 1200)).toContain('resolve_database_url');
     expect(script).toMatch(/Artifact is missing the \$unit unit/);
 
     const assertion = script.indexOf('Artifact is missing $d');

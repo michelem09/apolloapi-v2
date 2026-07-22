@@ -28,7 +28,7 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=56
+EXPECTED_ASSERTIONS=62
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -523,6 +523,67 @@ EOF
   check "it carries the version it was moving to" "$(field to)" "2.2.1"
   check "progress is a number, not a string" "$(field progress type)" "number"
   check "quotes and backslashes in the reason survive" "$(field reason)" "$REASON"
+  rm -rf "$ROOT"
+)
+
+# --- an interrupted backup must not be restored over an intact tree ------------
+# BACKUP_DIR is under STATE_DIR and the tree under APOLLO_DIR, which the script's
+# own disk check treats as two mounts — and across mounts `mv` is copy-then-
+# unlink. An interruption therefore leaves a HALF-WRITTEN copy in the backup with
+# the complete original still live, and `[ -e ]` cannot tell that from a finished
+# move: the restore deleted the good tree, installed the truncated copy, and both
+# commands succeeded, so the run recorded a clean "rolled-back" while apollo-api
+# never started again.
+(
+  make_device
+  claim_backup
+  # A backup interrupted partway: node_modules copied but not removed from the
+  # device (the copy-then-unlink case), everything else untouched. No .complete.
+  mkdir -p "$BACKUP_CODE/node_modules"
+  echo 'TRUNCATED' > "$BACKUP_CODE/node_modules/half"
+  echo 'GOOD' > "$APOLLO_ROOT_DIR/node_modules/whole"
+  check "the interrupted backup has no completion marker" \
+    "$([ -e "$BACKUP_CODE/.complete" ] && echo yes || echo no)" "no"
+
+  restore_code >/dev/null 2>&1
+  check "the intact live copy is kept" \
+    "$(cat "$APOLLO_ROOT_DIR/node_modules/whole" 2>/dev/null)" "GOOD"
+  check "the truncated copy is not installed" \
+    "$([ -e "$APOLLO_ROOT_DIR/node_modules/half" ] && echo yes || echo no)" "no"
+  rm -rf "$ROOT"
+)
+
+# --- .next is removed on rollback when the backup has none --------------------
+# The asymmetry already fixed for ROOT_FILES and the units. A device whose .next
+# was missing at update time (a failed on-device build, or one wiped by a chown
+# fix) backs up nothing for it, the install writes a new standalone bundle, and a
+# rollback that leaves it behind serves the NEW UI against the ROLLED-BACK
+# backend — every query hitting fields the restored schema does not expose.
+(
+  make_device
+  rm -rf "$APOLLO_ROOT_DIR/apolloui-v2/.next"
+  claim_backup; backup_code 2>/dev/null
+  check "a complete backup was taken" \
+    "$([ -e "$BACKUP_CODE/.complete" ] && echo yes || echo no)" "yes"
+  # The install writes the new bundle.
+  mkdir -p "$APOLLO_ROOT_DIR/apolloui-v2/.next/standalone"
+  echo 'NEW' > "$APOLLO_ROOT_DIR/apolloui-v2/.next/marker"
+  restore_code >/dev/null 2>&1
+  check "the release's .next does not survive the rollback" \
+    "$([ -e "$APOLLO_ROOT_DIR/apolloui-v2/.next" ] && echo yes || echo no)" "no"
+  rm -rf "$ROOT"
+)
+
+# --- a rollback still restores a .next that WAS there --------------------------
+(
+  make_device
+  echo 'OLD-BUNDLE' > "$APOLLO_ROOT_DIR/apolloui-v2/.next/marker"
+  claim_backup; backup_code 2>/dev/null
+  mkdir -p "$APOLLO_ROOT_DIR/apolloui-v2/.next"
+  echo 'NEW-BUNDLE' > "$APOLLO_ROOT_DIR/apolloui-v2/.next/marker"
+  restore_code >/dev/null 2>&1
+  check "the previous .next comes back" \
+    "$(cat "$APOLLO_ROOT_DIR/apolloui-v2/.next/marker" 2>/dev/null)" "OLD-BUNDLE"
   rm -rf "$ROOT"
 )
 
