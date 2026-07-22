@@ -281,22 +281,44 @@ class McuService {
     // updater writes its terminal record before it exits, so `running === false`
     // means that write has already happened, and the record read afterwards
     // cannot still say "running" unless the run really was killed.
-    const running = await this._updateUnitActive();
+    const active = await this._updateUnitActive();
     const record = await this._readUpdateRecord();
 
-    // An update the client is waiting on that is neither running nor finished.
-    if (record && record.state === 'running' && !running) {
+    // Only a definite "the unit is gone" may contradict a record that says the
+    // run is alive. `null` means systemd could not be asked, and rewriting a live
+    // run to a terminal state on the strength of a failed fork is how a healthy
+    // update got reported as dead with no way back.
+    if (record && record.state === 'running' && active === false) {
       return { running: false, record: { ...record, state: 'interrupted' } };
     }
-    return { running, record };
+    // Unknown reports as not running — the client waits on that, which is the
+    // recoverable direction — while the record is passed through untouched.
+    return { running: active === true, record };
   }
 
+  // true | false | null, and the null matters.
+  //
+  // `is-active` exits 3 for inactive and 4 for no-such-unit, so the catch is the
+  // NORMAL path and cannot be treated as "anything went wrong means not
+  // running". A fork that fails for any other reason — EAGAIN or ENOMEM while
+  // the box unpacks and backs up hundreds of megabytes, which is the memory
+  // pressure this whole redesign exists to remove, or a hung dbus — would
+  // otherwise answer "not running" about a run that is very much alive. One such
+  // answer was enough: the record still says `running`, so it was rewritten to
+  // `interrupted`, which is terminal, so the client stopped polling and told the
+  // user the update had died — permanently, mid-swap, while suggesting a reboot.
+  //
+  // null is "we could not ask", which leaves the record alone.
   async _updateUnitActive() {
     try {
       const { stdout } = await execPromise('systemctl is-active apollo-update.service');
       return stdout.trim() === 'active';
     } catch (error) {
-      return false; // inactive, failed, unknown — all "not running"
+      if (error && (error.code === 3 || error.code === 4)) return false;
+      const said = (error && error.stdout ? String(error.stdout) : '').trim();
+      if (said === 'inactive' || said === 'failed' || said === 'unknown') return false;
+      if (said === 'active' || said === 'activating') return true;
+      return null;
     }
   }
 

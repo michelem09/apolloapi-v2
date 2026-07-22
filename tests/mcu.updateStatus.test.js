@@ -115,6 +115,31 @@ describe('Mcu.updateStatus', () => {
     expect(status.record.state).toBe('succeeded');
   });
 
+  it('does not call a live run interrupted because systemd could not be asked', async () => {
+    // `is-active` exits 3 for inactive, so the catch is the normal path — which
+    // is why "any failure means not running" was wrong. A fork that fails for
+    // another reason (EAGAIN/ENOMEM while the box unpacks and backs up hundreds
+    // of megabytes; a hung dbus) answered "gone" about a run in mid-swap. One
+    // such answer rewrote the record to `interrupted`, which is terminal, so the
+    // client stopped polling and reported the update dead — permanently, while
+    // the swap was still happening.
+    writeRecord({ run_id: 'RUN-1', state: 'running', phase: 'installing' });
+    build((cmd, cb) => cb(Object.assign(new Error('fork failed'), { code: 'EAGAIN' })));
+
+    const status = await mcuService.getUpdateStatus();
+    expect(status.record.state).toBe('running');
+    // Reported as not running, which is the direction the client recovers from:
+    // it keeps waiting rather than concluding.
+    expect(status.running).toBe(false);
+  });
+
+  it('still trusts an explicit inactive', async () => {
+    writeRecord({ run_id: 'RUN-1', state: 'running', phase: 'installing' });
+    build((cmd, cb) => cb(Object.assign(new Error('inactive'), { code: 3 })));
+    const status = await mcuService.getUpdateStatus();
+    expect(status.record.state).toBe('interrupted');
+  });
+
   it('distinguishes a rollback that worked from one that did not', async () => {
     build(inactive);
     writeRecord({ run_id: 'r1', state: 'recovery-failed', reason: 'disk full' });

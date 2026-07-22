@@ -376,25 +376,58 @@ jobs:
               --notes "Moving pointer to the latest ${CHANNEL} build. Not a release: the assets here are replaced on every build."
           fi
 
-          # Never move the channel backwards. The upload is --clobber and the
-          # runs are only serialised per tag, so two releases finishing out of
-          # order would otherwise leave the channel on the older one — and every
-          # device already on the newer release then refuses it ("refusing to
-          # move to older/equal") until a human notices. Compared with sort -V,
-          # which orders 2.2.10 above 2.2.9; the updater's own comparison
-          # deliberately agrees on that point.
-          CURRENT_POINTER=''
-          if gh release download "$POINTER" --pattern "${CHANNEL}.json" \
-               --output current-channel.json --clobber >/dev/null 2>&1; then
-            CURRENT_POINTER="$(jq -r '.version // empty' current-channel.json)"
-          fi
-          if [ -n "$CURRENT_POINTER" ] && [ "$CURRENT_POINTER" != "$VERSION" ]; then
-            NEWEST="$(printf '%s\n%s\n' "$CURRENT_POINTER" "$VERSION" | sort -V | tail -1)"
-            if [ "$NEWEST" != "$VERSION" ]; then
-              echo "::warning::channel ${CHANNEL} already points at ${CURRENT_POINTER}, which is newer than ${VERSION} — leaving it alone"
+          # THE comparison, not a second one written to agree with it.
+          #
+          # This guard shipped comparing with `sort -V`, under a comment claiming
+          # parity with the updater. sort -V ranks 2.3.0-rc1 ABOVE 2.3.0 — the
+          # trap version_gt's own comment opens by warning about, and which
+          # semver.js repeats — so the first rc→final sequence would have frozen
+          # the channel: workflow green, artifact signed, pointer never moved, no
+          # device ever offered it. Sourcing the updater makes agreement
+          # structural instead of aspirational.
+          # shellcheck disable=SC1091
+          APOLLO_UPDATE_LIB=1 source backend/update
+
+          read_pointer() {
+            # Absent is not the same as unreadable. A first release legitimately
+            # has no pointer; a rate limit or a 5xx must not be read as one, or
+            # the guard silently disables itself on exactly the runs where two
+            # releases are in flight.
+            if ! gh release view "$POINTER" >/dev/null 2>&1; then
+              printf ''
+              return 0
+            fi
+            rm -f current-channel.json
+            gh release download "$POINTER" --pattern "${CHANNEL}.json" \
+              --output current-channel.json \
+              || die_step "could not read the current ${CHANNEL} pointer"
+            jq -r '.version // empty' current-channel.json
+          }
+          die_step() { echo "::error::$*"; exit 1; }
+
+          # Compare-and-set, retried, because releases are only serialised per
+          # tag: two tags pushed a minute apart — the working pattern this branch
+          # was built with — run concurrently, and `--clobber` is last-writer-
+          # wins. A single check before the upload cannot prevent an older run
+          # overwriting a newer one afterwards. Re-reading after the write does:
+          # whoever is newest keeps re-uploading until it sticks, and whoever is
+          # older stops as soon as it sees something newer.
+          for attempt in 1 2 3; do
+            CURRENT_POINTER="$(read_pointer)"
+            if [ -n "$CURRENT_POINTER" ] && [ "$CURRENT_POINTER" != "$VERSION" ] \
+               && ! version_gt "$VERSION" "$CURRENT_POINTER"; then
+              echo "::notice::channel ${CHANNEL} points at ${CURRENT_POINTER}, which is not older than ${VERSION} — leaving it alone"
               exit 0
             fi
-          fi
 
-          gh release upload "$POINTER" "${CHANNEL}.json" --clobber
-          echo "channel manifest now points at ${VERSION}"
+            gh release upload "$POINTER" "${CHANNEL}.json" --clobber
+            sleep 5
+
+            SETTLED="$(read_pointer)"
+            if [ "$SETTLED" = "$VERSION" ]; then
+              echo "channel manifest now points at ${VERSION}"
+              exit 0
+            fi
+            echo "::warning::pointer became ${SETTLED} after our write (attempt ${attempt})"
+          done
+          die_step "could not settle the ${CHANNEL} pointer on ${VERSION}"

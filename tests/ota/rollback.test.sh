@@ -28,7 +28,7 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=70
+EXPECTED_ASSERTIONS=78
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -224,12 +224,16 @@ EOF
 # even backend/update remained to retry with.
 (
   make_device
-  # The real flow: the run claims its backup, then backup_code moves the owned
+  # The real flow: the run claims its backup, then backup_code saves the owned
   # directories one at a time. Simulate it aborting after src/ and config/ — the
   # .complete marker is never written.
+  #
+  # Through save_entry, not a hand-rolled `mv`: the per-entry marker it writes is
+  # what restore_code now reads, and a test that reproduces the move itself
+  # proves only that the test agrees with the test.
   claim_backup
-  mv "$APOLLO_ROOT_DIR/src" "$BACKUP_CODE/src"
-  mv "$APOLLO_ROOT_DIR/config" "$BACKUP_CODE/config"
+  save_entry src
+  save_entry config
   echo 'LIVE' > "$APOLLO_ROOT_DIR/backend/marker"
 
   restore_code >/dev/null 2>&1
@@ -664,6 +668,85 @@ lines, a "quote", a backslash \ and a tab	here'
   check "the newline did not survive into the string" \
     "$("$NODE_BIN" -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).reason.includes(String.fromCharCode(10))' "$REC" 2>/dev/null)" \
     "false"
+  rm -rf "$ROOT"
+)
+
+# --- the DELETE half of a cross-filesystem move -------------------------------
+# The previous guard reasoned only about the copy half: "the live copy still
+# being there proves the backup is partial". Across mounts mv is copy-THEN-
+# delete, and during the delete the backup is already COMPLETE while the live
+# tree is being truncated — so that rule kept the truncated tree, deleted the
+# only good copy, and returned 0, recording a clean "rolled-back" over a device
+# that would never start again. save_entry writes its marker between the two
+# halves so nothing has to guess.
+(
+  make_device
+  claim_backup
+  echo 'GOOD' > "$APOLLO_ROOT_DIR/src/whole"
+  # Interrupted during the DELETE: the backup is complete and marked, the live
+  # tree is half gone. Built by hand because no signal can be delivered inside
+  # rm -rf from here, but it is the exact on-disk state that produces.
+  cp -a "$APOLLO_ROOT_DIR/src" "$BACKUP_CODE/src"
+  : > "$(saved_marker "$BACKUP_CODE" src)"
+  rm -f "$APOLLO_ROOT_DIR/src/whole"          # truncation in progress
+
+  restore_code >/dev/null 2>&1
+  check "the complete backup wins over the truncated live tree" \
+    "$(cat "$APOLLO_ROOT_DIR/src/whole" 2>/dev/null)" "GOOD"
+  rm -rf "$ROOT"
+)
+
+# --- a directory that never existed is not a failed recovery ------------------
+# `absent from a complete backup and absent live` was read as a lost tree and
+# turned into recovery-failed — "this device needs manual recovery over SSH" and
+# a banner telling the user to contact support — over a directory that was
+# byte-for-byte what it had always been. A device whose node_modules was removed
+# to free space is the ordinary case.
+(
+  make_device
+  rm -rf "$APOLLO_ROOT_DIR/node_modules"
+  claim_backup
+  backup_code 2>/dev/null
+  check "the backup completed" "$([ -e "$BACKUP_CODE/.complete" ] && echo yes || echo no)" "yes"
+
+  restore_code >/dev/null 2>&1
+  RC=$?
+  check "restore_code succeeds" "$RC" "0"
+  check "and the old code came back" "$(cat "$APOLLO_ROOT_DIR/src/marker" 2>/dev/null)" "OLD"
+  rm -rf "$ROOT"
+)
+
+
+# --- the marker is written BETWEEN the copy and the delete --------------------
+# That ordering IS the fix; the scenario above builds the interrupted state by
+# hand, so it passes either way — a mutation that moved the marker after the
+# delete left the suite green. Proved directly instead: make the delete fail and
+# require the marker to already exist, which can only be true if it was written
+# first.
+(
+  make_device
+  claim_backup
+  # Force the cross-filesystem branch (copy + marker + delete) and break the
+  # delete. A function shadows the builtin lookup for this subshell only.
+  same_fs() { return 1; }
+  rm() { command rm "$@"; }        # keep normal rm for the harness…
+  save_entry src
+  RC=$?
+  check "save_entry reports the failed delete" "$RC" "0"
+
+  # …now break it for the call under test.
+  make_device
+  claim_backup
+  same_fs() { return 1; }
+  rm() { return 1; }
+  save_entry src
+  RC=$?
+  unset -f rm
+  check "a failed delete is reported" "$RC" "1"
+  check "but the marker is already there" \
+    "$([ -f "$(saved_marker "$BACKUP_CODE" src)" ] && echo yes || echo no)" "yes"
+  check "and the backup copy is complete" \
+    "$(cat "$BACKUP_CODE/src/marker" 2>/dev/null)" "OLD"
   rm -rf "$ROOT"
 )
 

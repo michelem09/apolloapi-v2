@@ -437,16 +437,25 @@ cleanup() {
   # Restarting is unconditional once anything has been stopped: an explicit `die`
   # between the stop and the end used to leave the API, UI, node and ckpool all
   # down, with no Restart= recovery because the stop was deliberate.
+  local serving=1
   if [ "$STOPPED" -eq 1 ]; then
     err "Restarting services"
-    start_services
+    start_services || serving=0
   fi
   restore_solo_intent || true
 
   local result reason
   reason="${FAIL_REASON:-The update stopped unexpectedly}"
-  if [ "$MUTATED" -eq 0 ]; then
+  if [ "$MUTATED" -eq 0 ] && [ "$serving" -eq 1 ]; then
     result='aborted'
+  elif [ "$serving" -eq 0 ]; then
+    # Nothing was installed, or it was put back — but the device is not serving,
+    # so neither "untouched" nor "restored" is true. This is the state that needs
+    # a human, and saying anything softer sends the user to look at a device that
+    # cannot answer.
+    result='recovery-failed'
+    reason="$reason — and the services could not be started again"
+    err "SERVICES DID NOT COME BACK — this device needs manual recovery over SSH"
   elif [ "$restored" -eq 1 ]; then
     result='rolled-back'
   else
@@ -512,11 +521,56 @@ claim_backup() {
   return 0
 }
 
+# Same filesystem? Decides whether `mv` is an atomic rename or a copy followed by
+# a delete, which is the difference between "no partial state can exist" and "two
+# opposite partial states can, and look alike from outside".
+# df, not stat: -c and -f mean different things on GNU and BSD, and the tests run
+# on macOS while the device runs Linux.
+same_fs() {
+  local a b
+  a="$(df -P "$1" 2>/dev/null | awk 'NR==2{print $1}')"
+  b="$(df -P "$2" 2>/dev/null | awk 'NR==2{print $1}')"
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+
+saved_marker() { printf '%s/.saved-%s' "$1" "$(printf '%s' "$2" | tr '/' '_')"; }
+
+# Put one entry in the backup, and record that it is THERE — not that we started
+# putting it there.
+#
+# Across filesystems `mv` is copy-then-delete, so an interruption leaves either a
+# half-written backup with the original intact, or a complete backup with the
+# original half-deleted. On disk those look the same, and the correct response is
+# opposite in each case: restoring the first destroys a good tree, skipping the
+# second leaves a truncated one. Guessing from "is the live copy still there"
+# gets exactly one of them right, which is what shipped.
+#
+# So the copy and the delete are done separately, with the marker written between
+# them. A marker means the backup is complete and usable, whatever happened next.
+# On one filesystem `mv` is a rename, which cannot be interrupted halfway, so the
+# copy is skipped entirely and only the marker is written.
+save_entry() {  # relative path under APOLLO_DIR
+  local rel="$1" src dst mark
+  src="$APOLLO_DIR/$rel"; dst="$BACKUP_CODE/$rel"
+  mark="$(saved_marker "$BACKUP_CODE" "$rel")"
+  [ -e "$src" ] || return 0
+  mkdir -p "$(dirname "$dst")" || return 1
+  if same_fs "$APOLLO_DIR" "$BACKUP_CODE"; then
+    mv "$src" "$dst" || return 1
+    : > "$mark"
+  else
+    cp -a "$src" "$dst" || return 1
+    : > "$mark"
+    rm -rf "$src" || return 1
+  fi
+  return 0
+}
+
 backup_code() {
   [ -n "${BACKUP_CODE:-}" ] || claim_backup
   local d f
-  for d in $OWNED; do [ -e "$APOLLO_DIR/$d" ] && mv "$APOLLO_DIR/$d" "$BACKUP_CODE/$d"; done
-  [ -e "$UI_DIR/.next" ] && { mkdir -p "$BACKUP_CODE/apolloui-v2"; mv "$UI_DIR/.next" "$BACKUP_CODE/apolloui-v2/.next"; }
+  for d in $OWNED; do save_entry "$d" || return 1; done
+  save_entry "apolloui-v2/.next" || return 1
   for f in $ROOT_FILES; do [ -e "$APOLLO_DIR/$f" ] && cp -p "$APOLLO_DIR/$f" "$BACKUP_CODE/$f"; done
   backup_database || return 1
   # Written last. Its presence is what lets restore_code read an ABSENCE as
@@ -684,11 +738,29 @@ stop_services() {
 # Same set the success path starts, and in the same order: bootstrap first,
 # because node and apollo-miner Require it. ckpool is deliberately absent — its
 # intent lives in the database and serviceMonitor acts on it.
+# Returns non-zero if the device is not serving afterwards.
+#
+# Every start is still `|| true` — a miner that will not come up must not stop
+# the UI from coming up — but the OUTCOME is checked, because the verdict depends
+# on it. Silence here let cleanup record `aborted`, whose banner says "your
+# device is untouched and still running v2.2.0", on a box whose API, UI, node and
+# miner were all down: the window between stopping the services and the first
+# mutation is real (verify_all_stopped has four separate `die`s in it), and
+# "we stopped your services and could not start them again" was a state the
+# vocabulary had no way to say.
 start_services() {
   systemctl start apollo-bootstrap.service || true
   systemctl start apollo-api.service apollo-ui-v2.service || true
   systemctl start node.service apollo-miner.service || true
-  return 0
+  # The API is the one that decides whether this device can be reached at all —
+  # including to retry the update. Give it a moment: a start is asynchronous.
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    systemctl is-active --quiet apollo-api.service && return 0
+    sleep 2
+  done
+  err "apollo-api did not come back after restarting services"
+  return 1
 }
 
 restore_code() {
@@ -715,51 +787,47 @@ restore_code() {
   local rc=0 d f
   restore_database || rc=1
 
-  for d in $OWNED; do
-    if [ -e "$b/$d" ]; then
-      # An INCOMPLETE backup means backup_code was interrupted, and `mv` across
-      # filesystems is copy-then-unlink — BACKUP_DIR lives under STATE_DIR while
-      # this lives under APOLLO_DIR, which the disk check right below already
-      # treats as two mounts. So an interruption can leave a HALF-WRITTEN copy in
-      # the backup while the complete original is still live, and `[ -e ]` cannot
-      # tell that from a finished one: the restore deleted the good tree,
-      # installed the truncated copy, and both commands succeeded, so the run
-      # recorded a clean "rolled-back" while apollo-api never started again.
-      #
-      # Only the entry the interruption caught can be partial — everything before
-      # it completed — and the live copy still being there is the evidence, since
-      # a finished `mv` removes it.
-      if [ "$complete" -eq 0 ] && [ -e "$APOLLO_DIR/$d" ]; then
-        err "Backup copy of $d is incomplete; keeping the live one"
-        rm -rf "$b/$d" 2>/dev/null || true
-        continue
-      fi
-      rm -rf "$APOLLO_DIR/$d" || rc=1
-      mv "$b/$d" "$APOLLO_DIR/$d" || rc=1
-    elif [ "$complete" -eq 1 ] && [ ! -e "$APOLLO_DIR/$d" ]; then
-      err "Neither the device nor the backup has $d"
-      rc=1
+  # The marker, not the presence of a directory, decides.
+  #
+  # `[ -e "$b/$d" ]` cannot tell a finished copy from a half-written one, and the
+  # heuristic that replaced it — "the live copy still being there proves the
+  # backup is partial" — reasons only about the COPY half of a cross-filesystem
+  # mv. During the DELETE half the backup is already complete while the live tree
+  # is being truncated, and that heuristic then keeps the truncated tree and
+  # deletes the only good copy, returning 0 so the run records a clean
+  # "rolled-back". save_entry writes the marker between the two halves precisely
+  # so nothing here has to guess.
+  restore_entry() {  # relative path
+    local rel="$1" live="$APOLLO_DIR/$1" mark
+    mark="$(saved_marker "$b" "$rel")"
+    if [ -f "$mark" ]; then
+      rm -rf "$live" || return 1
+      mkdir -p "$(dirname "$live")" || return 1
+      mv "$b/$rel" "$live" || return 1
+      return 0
     fi
-    # Not in the backup and the backup is incomplete: the live copy was never
-    # moved, so it is the previous version already. Leave it.
-  done
+    # No marker: this entry is not in the backup in a usable state. Which of the
+    # two reasons decides what to do, and only `.complete` can tell them apart —
+    # the same rule ROOT_FILES and the units already used.
+    rm -rf "${b:?}/$rel" 2>/dev/null || true
+    if [ "$complete" -eq 1 ]; then
+      # The backup finished and never saved this: it did not exist before the
+      # update. Anything here now was put there by the release, so it goes —
+      # otherwise a rollback leaves the NEW UI bundle serving against the
+      # RESTORED backend. Absent from both is simply nothing to do; the old code
+      # called that a lost tree and raised recovery-failed, telling the user to
+      # find someone with SSH over a directory that had never been there.
+      rm -rf "$live" 2>/dev/null || true
+    elif [ -e "$live" ]; then
+      # The backup was interrupted before reaching this entry, so the live copy
+      # was never moved and is already the previous version.
+      err "No complete backup of $rel; keeping the live copy"
+    fi
+    return 0
+  }
 
-  # Same asymmetry that was already fixed for ROOT_FILES and for the units: an
-  # absence in a COMPLETE backup means the device had no .next before this
-  # update, so leaving the one the release installed keeps the NEW UI bundle
-  # serving against the ROLLED-BACK backend — every query hitting fields the
-  # restored schema does not expose.
-  if [ -e "$b/apolloui-v2/.next" ]; then
-    if [ "$complete" -eq 0 ] && [ -e "$UI_DIR/.next" ]; then
-      err "Backup copy of .next is incomplete; keeping the live one"
-      rm -rf "$b/apolloui-v2/.next" 2>/dev/null || true
-    else
-      rm -rf "$UI_DIR/.next" || rc=1
-      mv "$b/apolloui-v2/.next" "$UI_DIR/.next" || rc=1
-    fi
-  elif [ "$complete" -eq 1 ]; then
-    rm -rf "$UI_DIR/.next" || rc=1
-  fi
+  for d in $OWNED; do restore_entry "$d" || rc=1; done
+  restore_entry "apolloui-v2/.next" || rc=1
 
   for f in $ROOT_FILES; do
     if [ -e "$b/$f" ]; then
@@ -1022,8 +1090,17 @@ systemctl daemon-reload
 for unit in $UNITS; do
   [ "$unit" = ckpool ] && continue
   [ -f "$SYSTEMD_DIR/$unit.service" ] || continue
+  # A failure here is a failed update, not a warning. The comment above names the
+  # consequence exactly — the device comes back from its next power cycle with no
+  # API, no UI and no mining — and `err` deliberately does not set FAIL_REASON,
+  # so the run went on to record `succeeded` and the banner turned green over a
+  # device that would never boot properly again. The pre-tarball updater aborted
+  # on this; downgrading it to a log line was a regression.
+  #
+  # This runs before the health gate, so `die` takes the ordinary rollback path
+  # and the device keeps the release it was already running.
   systemctl enable "$unit.service" >/dev/null 2>&1 \
-    || err "WARNING: could not enable $unit.service — it will not start at boot"
+    || die "Could not enable $unit.service — the device would not start it at boot"
 done
 
 # The firewall is applied directly rather than by restarting rc-local.service:
@@ -1046,13 +1123,39 @@ log "Starting services"
 # it later would bounce them right after they came up.
 systemctl start apollo-bootstrap.service
 systemctl start apollo-api.service apollo-ui-v2.service
+# What the user asked for, for the two services they can turn off from the UI.
+#
+# Only `solo` had its intent preserved. node and apollo-miner were started
+# unconditionally, and the old updater got away with it because it ended in a
+# reboot, where boot-time reconciliation re-applied requested_status. This one
+# never reboots: the updater exits, apollo-update.service disappears, and on the
+# next 10-second poll serviceMonitor sees a unit active while the database says
+# offline, outside every grace period — which it reads as the user having started
+# it by hand, and writes requested_status='online'. So every update silently
+# turned a deliberately stopped miner back on, permanently, in a way nothing can
+# tell apart from a real manual start.
+wanted() {  # service name in service_status -> 0 if the user wants it running
+  local db requested
+  db="$(resolve_database_url)" || return 0   # unknown: start it, as before
+  requested="$(sqlite3 "$db" "SELECT COALESCE(requested_status,'') FROM service_status WHERE service_name='$1' ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)"
+  [ "$requested" != "offline" ]
+}
+
 # A node that will not start is a failed update — health_ok only probes the API
 # and the UI, so without this a device with a dead Bitcoin node reported success.
 # ExecCondition (node_storage_ready.sh) declining is not a failure, so a device
 # whose disk is not ready still passes here.
-systemctl start node.service || die "Bitcoin node did not start after installing $VERSION"
+if wanted node; then
+  systemctl start node.service || die "Bitcoin node did not start after installing $VERSION"
+else
+  err "Leaving node.service stopped: it was turned off before the update"
+fi
 # The miner stays a warning: solo-node devices have no miner hardware at all.
-systemctl start apollo-miner.service || err "The miner did not start cleanly"
+if wanted miner; then
+  systemctl start apollo-miner.service || err "The miner did not start cleanly"
+else
+  err "Leaving apollo-miner.service stopped: it was turned off before the update"
+fi
 health_ok || die "Health check failed after installing $VERSION"
 
 COMPLETED=1
