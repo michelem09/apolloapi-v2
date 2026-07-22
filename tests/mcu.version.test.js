@@ -107,3 +107,59 @@ describe('Mcu.version — read from the signed update channel', () => {
     expect(installed).toMatch(/^\d+\.\d+\.\d+/);
   });
 });
+
+// source.conf is parsed in two languages, and they have to agree: if they do not,
+// the banner names one channel and the updater installs from another.
+describe('source.conf parsing matches the shell', () => {
+  let stateDir;
+  let mcuService;
+  let axios;
+
+  beforeEach(() => {
+    stateDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'apollo-src2-'));
+    jest.resetModules();
+    jest.doMock('../src/paths', () => ({
+      ...jest.requireActual('../src/paths'),
+      getStateDir: () => stateDir,
+    }));
+    // eslint-disable-next-line global-require
+    axios = require('axios');
+    axios.get.mockReset();
+    axios.get.mockResolvedValue({ data: { version: '9.9.9' } });
+    // eslint-disable-next-line global-require
+    const fsPromises = require('fs').promises;
+    const existing = fsPromises.readFile;
+    jest.spyOn(fsPromises, 'readFile').mockImplementation((p, enc) => {
+      if (String(p).endsWith('source.conf')) return realFs.promises.readFile(p, enc);
+      return existing(p, enc);
+    });
+    // eslint-disable-next-line global-require
+    mcuService = require('../src/services/mcu')(null, {});
+  });
+
+  afterEach(() => {
+    realFs.rmSync(stateDir, { recursive: true, force: true });
+    jest.dontMock('../src/paths');
+  });
+
+  const write = (contents) =>
+    realFs.writeFileSync(path.join(stateDir, 'source.conf'), contents);
+
+  it('strips an inline comment, as conf_get does', async () => {
+    // The shipped example file is comment-heavy, so this is the natural edit.
+    // Unstripped, the channel became "dev   # switch to stable before shipping"
+    // and the URL 404'd — reported to the user as "you are up to date".
+    write('APOLLO_CHANNEL=dev   # switch to stable before shipping\n');
+    await mcuService.getVersion();
+    expect(axios.get.mock.calls[0][0]).toContain('channel-dev/dev.json');
+  });
+
+  it('reads a CRLF file', async () => {
+    // A regex anchored on \n alone matched nothing on CRLF, so every key was
+    // dropped and a fork device silently asked the official stable channel.
+    write('APOLLO_GIT_BASE="https://github.com/michelem09"\r\nAPOLLO_CHANNEL=dev\r\n');
+    await mcuService.getVersion();
+    expect(axios.get.mock.calls[0][0]).toContain('michelem09');
+    expect(axios.get.mock.calls[0][0]).toContain('channel-dev/dev.json');
+  });
+});

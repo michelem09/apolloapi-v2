@@ -18,6 +18,14 @@ permissions:
   contents: write   # create the Release and upload assets
   id-token: write   # OIDC token for cosign keyless signing
 
+# One release at a time. The channel pointer is uploaded with --clobber, so two
+# tags pushed minutes apart would land last-writer-wins — and a channel that
+# moves BACKWARDS leaves every device on the newer release refusing to install
+# it ("refusing to move to older/equal") until someone notices.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   # The one place that decides what counts as an official build.
   OFFICIAL_OWNER: jstefanop
@@ -307,6 +315,14 @@ jobs:
             "apollo-${VERSION}-manifest.json"
 
       - name: Point the channel at this release
+        # Tag pushes only. On a workflow_dispatch the cosign certificate carries
+        # …/release.yml@refs/heads/<branch>, while a device's trust regexp — root
+        # owned, deliberately not overridable from source.conf — requires
+        # @refs/tags/v. So a dry run that moved the pointer would give the whole
+        # fleet a 40 MB download that every device is guaranteed to reject at
+        # signature verification, and the channel would stay poisoned until
+        # someone pushed a real tag.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
           CHANNEL: ${{ steps.meta.outputs.channel }}
