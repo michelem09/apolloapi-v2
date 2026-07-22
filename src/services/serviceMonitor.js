@@ -157,20 +157,36 @@ class ServiceMonitor {
   }
 
   // Read a unit's systemd activation state, normalizing is-active exit codes.
+  // The unit's state, or null when we could not ask.
+  //
+  // `is-active` exits 3 for inactive and 4 for no-such-unit, so the catch is the
+  // NORMAL path — and collapsing everything else into 'unknown' hid the case
+  // that matters. A fork failing for another reason (EAGAIN or ENOMEM while the
+  // updater unpacks and backs up hundreds of megabytes, which is the memory
+  // pressure this redesign exists to remove; a hung dbus) is not information
+  // about the unit, and treating it as such is how a deliberate stop becomes a
+  // recorded user decision. Same fix mcu._updateUnitActive got — this file asks
+  // the identical question of the identical unit and was left behind.
   async _systemctlStatus(serviceName) {
     try {
       const { stdout } = await execAsync(`systemctl is-active ${serviceName}`);
       return stdout.trim();
     } catch (error) {
-      // is-active exits 0=active, 3=inactive, 4=failed
+      // What systemd said first, then the exit code: an activating unit also
+      // exits 3, and it is running.
+      const said = error && error.stdout ? String(error.stdout).trim() : '';
+      if (said) return said;
       if (error.code === 3) return 'inactive';
       if (error.code === 4) return 'failed';
-      return error.stdout ? error.stdout.trim() : 'unknown';
+      return null;
     }
   }
 
+  // true | false | null — null is "we could not ask", never "no".
   async _isSystemdActive(serviceName) {
-    return (await this._systemctlStatus(serviceName)) === 'active';
+    const status = await this._systemctlStatus(serviceName);
+    if (status === null) return null;
+    return status === 'active' || status === 'activating';
   }
 
   // Check if Bitcoin node is remote (not localhost)
@@ -275,7 +291,7 @@ class ServiceMonitor {
       }
 
       // Standard systemctl check for local services
-      const status = await this._systemctlStatus(serviceName);
+      const status = (await this._systemctlStatus(serviceName)) ?? 'unknown';
 
       // Get current requested status from database (needed for both status mapping and auto-start)
       const existing = await this.knex('service_status')
@@ -333,7 +349,17 @@ class ServiceMonitor {
       // tests exercised THAT one while production ran this line — four green
       // assertions against code no device executes.
       const updateInProgress = await this._isSystemdActive(UPDATE_UNIT);
-      if (existing && !updateInProgress) {
+      // `=== false`, not `!updateInProgress`: null means systemd could not be
+      // asked, and that must not be read as "no update is running". The updater
+      // deliberately stops node and the miner for MINUTES — far outside the 90 s
+      // grace period, and with `wasStarting` false because they were online
+      // before — so one failed fork sends this straight into the MANUAL STOP
+      // branch, which persists requested_status='offline' for both. That is
+      // indistinguishable from a real manual stop, and it now compounds with the
+      // updater's own `wanted()` check: every later update reads that intent and
+      // deliberately leaves them stopped. The user's miner would never come back
+      // and nothing would say why.
+      if (existing && updateInProgress === false) {
         // Get time since last request (if any)
         const currentTime = Date.now();
         const requestedAtTime = existing.requested_at 

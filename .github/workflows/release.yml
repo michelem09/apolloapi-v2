@@ -429,9 +429,20 @@ jobs:
           for attempt in 1 2 3; do
             CURRENT_POINTER="$(read_pointer)" \
               || die_step "could not read the current ${CHANNEL} pointer"
+            # An unparseable EXISTING pointer is a data fault, not a reason to
+            # stand down. version_gt refuses to order anything it cannot parse,
+            # so garbage in the pointer — a hand-edited file, a partial upload, a
+            # "version": "latest" someone tried — made every future release take
+            # the "leave it alone" branch and exit 0. The channel froze
+            # permanently while the workflow stayed green, the artifact signed,
+            # and no device was ever offered it. ::notice:: is the least visible
+            # annotation GitHub has and never reaches the run summary.
+            if [ -n "$CURRENT_POINTER" ] && ! version_parsable "$CURRENT_POINTER"; then
+              die_step "channel ${CHANNEL} points at '${CURRENT_POINTER}', which is not a version — fix the pointer by hand"
+            fi
             if [ -n "$CURRENT_POINTER" ] && [ "$CURRENT_POINTER" != "$VERSION" ] \
                && ! version_gt "$VERSION" "$CURRENT_POINTER"; then
-              echo "::notice::channel ${CHANNEL} points at ${CURRENT_POINTER}, which is not older than ${VERSION} — leaving it alone"
+              echo "::warning::channel ${CHANNEL} points at ${CURRENT_POINTER}, which is not older than ${VERSION} — leaving it alone"
               exit 0
             fi
 

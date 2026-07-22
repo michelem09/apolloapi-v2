@@ -38,7 +38,27 @@ HEALTH_TIMEOUT="${APOLLO_HEALTH_TIMEOUT:-90}"
 # instead of only asserted on as text. Same reasoning as APOLLO_ROOT_DIR.
 SYSTEMD_DIR="${APOLLO_SYSTEMD_DIR:-/etc/systemd/system}"
 RC_LOCAL="${APOLLO_RC_LOCAL:-/etc/rc.local}"
-VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$'
+# A hard runtime dependency, checked rather than assumed: this is sourced before
+# the ERR trap is armed, so a missing file aborted the script with no record, no
+# progress file removed and no rollback — the client could only wait out the
+# 30-minute backstop. A release that lost backend/lib/ to a staging regression
+# installs cleanly and passes the health check, after which every FUTURE update
+# on that device dies here before it can say why.
+VERSION_LIB="$(dirname "${BASH_SOURCE[0]}")/lib/version.sh"
+if [ ! -r "$VERSION_LIB" ]; then
+  echo "FATAL: $VERSION_LIB is missing — this install is incomplete" >&2
+  exit 1
+fi
+# shellcheck disable=SC1091
+. "$VERSION_LIB"
+
+# One definition of what a version is, from version.sh — the constant that
+# decides what is acceptable belongs with the code that orders it. Two copies
+# under two names could drift into accepting a manifest version that version_gt
+# then refuses to order, which surfaces as "Refusing to move from … to
+# older/equal" — an Update button that fails every press with a message that does
+# not describe the cause.
+VERSION_RE="$VERSION_ORDER_RE"
 
 # What the last update did, for the UI to report once the API is back. It lives in
 # the state dir and not /tmp because the whole point is surviving the window where
@@ -245,10 +265,20 @@ if [ -z "${APOLLO_UPDATE_DETACHED:-}" ] && [ -d /run/systemd/system ] && have sy
     --setenv=APOLLO_UPDATE_DETACHED=1
     --setenv="APOLLO_UPDATE_LOG=$LOG_FILE"
   )
-  for override in APOLLO_ROOT_DIR APOLLO_STATE_DIR APOLLO_SOURCE_CONF \
-                  APOLLO_TRUST_CONF APOLLO_CHANNEL_URL APOLLO_HEALTH_URL \
-                  APOLLO_UI_HEALTH_URL APOLLO_HEALTH_TIMEOUT APOLLO_SYSTEMD_DIR \
-                  APOLLO_RC_LOCAL; do
+  # Enumerated, not listed by hand. The hand-written list was a parallel copy of
+  # the `${APOLLO_*:-}` reads scattered through this file, with nothing keeping
+  # the two in step — so APOLLO_RESTART_TIMEOUT, added to let an operator give a
+  # slow device longer before start_services declares recovery-failed, was a
+  # silent no-op in the detached run that does the work. That is the same defect
+  # already fixed once for the other overrides, reintroduced by adding a knob.
+  #
+  # APOLLO_UPDATE_DETACHED and APOLLO_UPDATE_LOG are set above; APOLLO_UPDATE_LIB
+  # is excluded on purpose, since it makes this script define and return without
+  # doing anything.
+  for override in $(compgen -v APOLLO_ || true); do
+    case "$override" in
+      APOLLO_UPDATE_DETACHED|APOLLO_UPDATE_LOG|APOLLO_UPDATE_LIB) continue ;;
+    esac
     [ -n "${!override:-}" ] && setenv_args+=(--setenv="$override=${!override}")
   done
   # TimeoutStopSec=infinity, because ignoring SIGTERM is not enough. systemd's
@@ -299,8 +329,6 @@ sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
 # Version ordering lives in backend/lib/version.sh, shared verbatim with the
 # release workflow so the thing that decides what may be OFFERED and the thing
 # that decides what may be INSTALLED cannot drift apart.
-# shellcheck disable=SC1091
-. "$(dirname "${BASH_SOURCE[0]}")/lib/version.sh"
 
 # grep tests each LINE, so a multi-line value passes as long as ONE of its lines
 # matches — which defeated the numeric check on the manifest's size field: a value
@@ -517,7 +545,7 @@ save_entry() {  # relative path under APOLLO_DIR
   mark="$(saved_marker "$BACKUP_CODE" "$rel")"
   [ -e "$src" ] || return 0
   mkdir -p "$(dirname "$dst")" || return 1
-  if same_fs "$APOLLO_DIR" "$BACKUP_CODE"; then
+  if [ "${SAME_FS:-}" = 1 ]; then
     mv "$src" "$dst" || return 1
     : > "$mark"
   else
@@ -530,6 +558,11 @@ save_entry() {  # relative path under APOLLO_DIR
 
 backup_code() {
   [ -n "${BACKUP_CODE:-}" ] || claim_backup
+  # Once per run, not once per entry: APOLLO_DIR and BACKUP_CODE are fixed for
+  # the life of the run, and same_fs forks two `df` and an `awk` each time — 24
+  # processes for one invariant answer, on an aarch64 SBC, inside the window
+  # where every service is stopped.
+  same_fs "$APOLLO_DIR" "$BACKUP_CODE" && SAME_FS=1 || SAME_FS=0
   local d f
   for d in $OWNED; do save_entry "$d" || return 1; done
   save_entry "apolloui-v2/.next" || return 1
@@ -966,6 +999,13 @@ done
 for unit in $UNITS; do
   [ -e "$STAGING/backend/systemd/$unit.service" ] \
     || die "Artifact is missing the $unit unit — refusing to install"
+done
+# The updater's own runtime dependencies, which the `backend/` existence test
+# above cannot see. version.sh is sourced before the ERR trap is armed, so a
+# release that lost it installs cleanly, passes the health check, and then kills
+# every FUTURE update on that device with no record of why.
+for f in backend/lib/version.sh backend/utils/install-update-deps.sh; do
+  [ -e "$STAGING/$f" ] || die "Artifact is missing $f — refusing to install"
 done
 # bitcoind now travels in the release, so its absence is a broken artifact and
 # not a device that simply never had it. Checked BEFORE the swap, because

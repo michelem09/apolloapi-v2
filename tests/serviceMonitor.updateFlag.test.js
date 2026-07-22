@@ -61,11 +61,41 @@ describe('serviceMonitor update-in-progress detection', () => {
     await expect(updateRunning()).resolves.toBe(false);
   });
 
-  it('treats an unusable systemctl as no update', async () => {
-    // A false positive suppresses service recovery indefinitely; a false negative
-    // costs one poll misreading a deliberate stop. Fail towards recovery.
+  it('says null — not false — when systemd could not be asked', async () => {
+    // This asserted `false`, which is the defect: `is-active` exits 3 on the
+    // normal path, so "the call failed" cannot mean "the unit is not running".
+    // A fork that fails for another reason — EAGAIN or ENOMEM while the updater
+    // unpacks and backs up hundreds of megabytes — would answer "no update is
+    // running" while one is, and checkService would then read the updater's
+    // deliberate stop of node and the miner as the user's own and persist
+    // requested_status='offline' for both. Compounded with the updater's
+    // `wanted()` check, the miner never comes back.
     withSystemctl((cmd, cb) => cb(new Error('systemctl: command not found')));
-    await expect(updateRunning()).resolves.toBe(false);
+    await expect(updateRunning()).resolves.toBeNull();
+  });
+
+  it('counts an activating unit as running', async () => {
+    // is-active exits 3 for `activating` too, so the exit code alone cannot
+    // distinguish it from inactive — and a transient unit is activating for the
+    // moment right after systemd-run creates it, which is exactly when a client
+    // is looking hardest.
+    withSystemctl((cmd, cb) =>
+      cb(Object.assign(new Error('activating'), { code: 3, stdout: 'activating\n' }))
+    );
+    await expect(updateRunning()).resolves.toBe(true);
+  });
+
+  it('leaves the manual-action branch alone when it cannot ask', async () => {
+    // The consequence, at the call site: `!updateInProgress` was true for null,
+    // so an unanswerable question sent checkService into the branch that
+    // rewrites the user's intent.
+    // eslint-disable-next-line global-require
+    const src = require('fs').readFileSync(
+      require('path').join(__dirname, '..', 'src', 'services', 'serviceMonitor.js'),
+      'utf8'
+    );
+    expect(src).toContain('if (existing && updateInProgress === false) {');
+    expect(src).not.toContain('if (existing && !updateInProgress) {');
   });
 
   it('does not keep a second, untested copy of the check', () => {

@@ -285,6 +285,13 @@ class McuService {
     const active = await this._updateUnitActive();
     const record = await this._readUpdateRecord();
 
+    // Remember that THIS process watched this run be alive. It is what lets the
+    // compatibility progress value be offered only to a browser that was here
+    // for the update, instead of to anyone who happens to poll after a restart.
+    if (active === true && record && record.runId) {
+      this._sawUpdateRunning = record.runId;
+    }
+
     // Only a definite "the unit is gone" may contradict a record that says the
     // run is alive. `null` means systemd could not be asked, and rewriting a live
     // run to a terminal state on the strength of a failed fork is how a healthy
@@ -313,8 +320,11 @@ class McuService {
   async _updateUnitActive() {
     try {
       const { stdout } = await execPromise('systemctl is-active apollo-update.service');
-      const state = stdout.trim();
-      return state === 'active' || state === 'activating';
+      // Exit 0 means `active` and nothing else — `activating` exits 3 and is
+      // handled in the catch. Testing for it here too would be a dead branch
+      // suggesting this side decides something it cannot see, which is the shape
+      // of the defect the catch was just reordered to remove.
+      return stdout.trim() === 'active';
     } catch (error) {
       // What systemd SAID first, then the exit code. The other order made the
       // `activating` case unreachable — is-active exits 3 for it, so the code
@@ -465,12 +475,26 @@ class McuService {
         record.to &&
         record.from !== record.to
       ) {
-        const now = process.hrtime.bigint();
-        if (!this._compatSeen || this._compatSeen.runId !== record.runId) {
-          this._compatSeen = { runId: record.runId, at: now };
+        // Anchored on having seen the run LIVE, not on first noticing its
+        // record. `_compatSeen` lives on this singleton, so anchoring on first
+        // observation reopened the window on every unrelated apollo-api restart
+        // — a crash, a manual restart, a reboot, days later — and served 100
+        // again for ten minutes each time.
+        //
+        // `_sawUpdateRunning` is set by getUpdateStatus while the unit is up, so
+        // the value is only ever offered to a process that actually watched this
+        // update happen. That is exactly the process serving the pre-update
+        // bundle, because the updater restarts the API before the browser
+        // reconnects.
+        if (this._sawUpdateRunning === record.runId) {
+          if (!this._compatSeen || this._compatSeen.runId !== record.runId) {
+            this._compatSeen = { runId: record.runId, at: process.hrtime.bigint() };
+          }
+          const elapsedMs = Number(
+            (process.hrtime.bigint() - this._compatSeen.at) / 1000000n
+          );
+          if (elapsedMs < COMPAT_PROGRESS_WINDOW_MS) return { value: 100 };
         }
-        const elapsedMs = Number((now - this._compatSeen.at) / 1000000n);
-        if (elapsedMs < COMPAT_PROGRESS_WINDOW_MS) return { value: 100 };
       }
 
       return { value: 0 };

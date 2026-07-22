@@ -134,6 +134,14 @@ describe('update lifecycle contract', () => {
     const check = script.slice(script.indexOf('if [ -d "$STAGING/backend/node/bin" ]; then'));
     expect(check.slice(0, 1200)).toContain('resolve_database_url');
     expect(script).toMatch(/Artifact is missing the \$unit unit/);
+    // The updater's own runtime dependencies, which the `backend/` existence
+    // test cannot see: version.sh is sourced before the ERR trap is armed, so a
+    // release that lost it installs cleanly and then kills every FUTURE update
+    // on that device with no record of why.
+    expect(script).toMatch(/Artifact is missing \$f — refusing to install/);
+    expect(script).toContain('backend/lib/version.sh backend/utils/install-update-deps.sh');
+    // And the source itself refuses rather than aborting silently.
+    expect(script).toMatch(/if \[ ! -r "\$VERSION_LIB" \]; then/);
 
     const assertion = script.indexOf('Artifact is missing $d');
     const backup = script.indexOf('backup_code\n');
