@@ -28,7 +28,17 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=82
+# Hand-written assertions. The shared version-ordering fixture adds one per case
+# on top, counted below so a growing table does not need this number edited —
+# while a scenario that dies before asserting still fails the suite.
+HAND_WRITTEN_ASSERTIONS=83
+VERSION_FIXTURE="$REPO/apolloui-v2/src/lib/version-order.fixture.txt"
+if [ ! -f "$VERSION_FIXTURE" ]; then
+  printf '\033[0;31mmissing %s\033[0m — the UI submodule is not checked out\n' "$VERSION_FIXTURE"
+  exit 1
+fi
+FIXTURE_CASES=$(grep -cvE '^\s*(#|$)' "$VERSION_FIXTURE")
+EXPECTED_ASSERTIONS=$((HAND_WRITTEN_ASSERTIONS + FIXTURE_CASES))
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -788,6 +798,28 @@ lines, a "quote", a backslash \ and a tab	here'
   restore_entry "$BACKUP_CODE" 1 src
   check "restore_entry works standalone, from its arguments" \
     "$(cat "$APOLLO_ROOT_DIR/src/marker" 2>/dev/null)" "OLD"
+  rm -rf "$ROOT"
+)
+
+
+# --- the same ordering the UI uses --------------------------------------------
+# CI and the updater are now literally the same code (backend/lib/version.sh),
+# so apolloui-v2's versionGt is the last independent implementation of this rule.
+# The UI decides whether to OFFER an update and this decides whether to INSTALL
+# one: a divergence is a badge that never clears and a button that fails every
+# press. Both suites read this one table; neither may skip it.
+(
+  make_device
+  check "the shared fixture has cases to run" \
+    "$([ "$FIXTURE_CASES" -gt 20 ] && echo yes || echo no)" "yes"
+  while read -r a b expected; do
+    case "$a" in ''|'#'*) continue ;; esac
+    # `""` is how the file writes the empty string.
+    [ "$a" = '""' ] && a=''
+    [ "$b" = '""' ] && b=''
+    got=no; version_gt "$a" "$b" && got=yes
+    check "version_gt '$a' '$b' -> $expected" "$got" "$expected"
+  done < <(grep -vE '^\s*(#|$)' "$VERSION_FIXTURE")
   rm -rf "$ROOT"
 )
 

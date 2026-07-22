@@ -17,8 +17,19 @@
 # outranks rc9. Strict semver §11 says the opposite, and the opposite is useless
 # to us — the release train goes rc9, rc10, rc11.
 
+# What both sides consider a version at all. Anything else is refused rather
+# than guessed at — the JavaScript side already did this ("unparseable: offer
+# nothing rather than a guess"), while this one fed the text straight into an
+# arithmetic expansion and died with `10#not: value too great for base`, taking
+# its caller with it. Found by running both against the shared fixture.
+VERSION_ORDER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$'
+
+version_parsable() { [[ "$1" =~ $VERSION_ORDER_RE ]]; }
+
 version_gt() {  # $1 > $2 ?
   local a="$1" b="$2" ac bc ap bp i x y
+  version_parsable "$a" || return 1
+  version_parsable "$b" || return 1
   ac="${a%%-*}"; bc="${b%%-*}"
   [ "$a" = "$ac" ] && ap='' || ap="${a#*-}"
   [ "$b" = "$bc" ] && bp='' || bp="${b#*-}"
