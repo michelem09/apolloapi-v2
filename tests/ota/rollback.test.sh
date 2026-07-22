@@ -28,7 +28,7 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=62
+EXPECTED_ASSERTIONS=66
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -584,6 +584,32 @@ EOF
   restore_code >/dev/null 2>&1
   check "the previous .next comes back" \
     "$(cat "$APOLLO_ROOT_DIR/apolloui-v2/.next/marker" 2>/dev/null)" "OLD-BUNDLE"
+  rm -rf "$ROOT"
+)
+
+# --- the run id has to actually be random -------------------------------------
+# It was built with `tr -dc … </dev/urandom | head -c 6`. /dev/urandom never
+# ends, so head exits first and tr dies of SIGPIPE — which under pipefail fails
+# the pipeline, so the `|| echo $$` fallback fired on every run and APPENDED the
+# PID instead of replacing anything. A device produced 6 hex + PID; a dev machine
+# produced the PID alone, tr having rejected the bytes under a UTF-8 locale.
+# Uniqueness held by accident. Since the whole outcome protocol rests on a client
+# recognising its own run, "by accident" is not good enough.
+(
+  make_device
+  check "the run id carries a timestamp and a suffix" \
+    "$(printf '%s' "$RUN_ID" | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z-[0-9a-f]+$')" "1"
+  SUFFIX="${RUN_ID##*-}"
+  check "the suffix is hex, not a PID" \
+    "$(printf '%s' "$SUFFIX" | grep -cE '^[0-9a-f]{12}$')" "1"
+
+  # Two ids generated the same second must differ. Same construction as the
+  # script, run twice: this is what the PID fallback could not promise across a
+  # reboot, when PIDs come round again.
+  gen() { R="$(od -An -N6 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"; printf '%s' "$R"; }
+  A="$(gen)"; B="$(gen)"
+  check "two ids in the same second differ" "$([ "$A" != "$B" ] && echo yes || echo no)" "yes"
+  check "neither is empty" "$([ -n "$A" ] && [ -n "$B" ] && echo yes || echo no)" "yes"
   rm -rf "$ROOT"
 )
 

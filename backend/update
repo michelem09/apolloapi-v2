@@ -57,7 +57,18 @@ STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # device's. These boards have no RTC and their clock is known to ship wrong, so
 # that comparison rejected genuine records and accepted stale ones. A client now
 # remembers the run_id it saw when it pressed, and waits for a different one.
-RUN_ID="${STARTED_AT}-$(tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c 6 || echo $$)"
+#
+# od, not `tr </dev/urandom | head -c`: /dev/urandom never ends, so head exits
+# first and tr dies of SIGPIPE — which under `set -o pipefail` makes the whole
+# pipeline fail, so the `|| echo $$` fallback fired on EVERY run and its output
+# was appended to the random part rather than replacing it. Observed on hardware
+# as a 13-character suffix (6 hex + the PID) where 6 were intended, and on a
+# developer machine as the PID alone, tr having refused the input under a UTF-8
+# locale. Uniqueness survived by accident; the randomness the id is supposed to
+# rest on did not. od reads exactly 6 bytes and exits, so nothing is signalled.
+RUN_RAND="$(od -An -N6 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"
+[ -n "$RUN_RAND" ] || RUN_RAND="$$"
+RUN_ID="${STARTED_AT}-${RUN_RAND}"
 
 STAGING=''; TARBALL=''
 # MUTATED is armed BEFORE the first destructive step, not after the last one: it
