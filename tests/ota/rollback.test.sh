@@ -28,7 +28,7 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=66
+EXPECTED_ASSERTIONS=70
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -496,7 +496,9 @@ EOF
   # skips a non-executable entry and finds the next real jq further along.
   # Whitelisting is the only construction where "jq is not installed" is true.
   MINBIN="$ROOT/minbin"; mkdir -p "$MINBIN"
-  for t in dirname mkdir mktemp date sed mv rm cat; do
+  # tr is in this list because json_escape needs it: the record's whitelist is
+  # byte-oriented for a reason (see the newline scenario below).
+  for t in dirname mkdir mktemp date sed mv rm cat tr; do
     ln -sf "$(command -v "$t")" "$MINBIN/$t"
   done
   cp "$STUBS/chown" "$MINBIN/chown"
@@ -522,7 +524,11 @@ EOF
   check "it carries the run id" "$(field run_id)" "$RUN_ID"
   check "it carries the version it was moving to" "$(field to)" "2.2.1"
   check "progress is a number, not a string" "$(field progress type)" "number"
-  check "quotes and backslashes in the reason survive" "$(field reason)" "$REASON"
+  # NOT preserved, deliberately: json_escape is a whitelist, so a quote or a
+  # backslash is dropped rather than escaped. The file always parsing matters
+  # more than the reason reading perfectly.
+  check "the reason is carried, stripped of what could break the file" \
+    "$(field reason)" "deps: apt failed, with a  backslash"
   rm -rf "$ROOT"
 )
 
@@ -610,6 +616,54 @@ EOF
   A="$(gen)"; B="$(gen)"
   check "two ids in the same second differ" "$([ "$A" != "$B" ] && echo yes || echo no)" "yes"
   check "neither is empty" "$([ -n "$A" ] && [ -n "$B" ] && echo yes || echo no)" "yes"
+  rm -rf "$ROOT"
+)
+
+# --- a writer that fails must not take the shell with it ----------------------
+# The write was the last bare command of an `if` body, and set -e takes the shell
+# down on that — from inside cleanup(), which runs with ERR/EXIT already cleared,
+# so the abort was silent. It skipped the two statements after it: the progress
+# file was never removed (leaving exactly the terminal value this design exists
+# to eliminate) and `exit "$status"` never ran. Triggered by ENOSPC on the state
+# dir, which holds both the download cache and the retained backup and is the
+# fullest directory on the box precisely when an update is failing.
+(
+  make_device
+  printf 'PREVIOUS-RECORD\n' > "$APOLLO_STATE_DIR/last-update.json"
+  # A writer that cannot succeed, taking BOTH branches through the same path.
+  have() { return 1; }
+  json_escape() { return 1; }
+  printf() { return 1; }
+  set -Eeuo pipefail          # exactly what the script runs under
+  write_state aborted failed 0 'reason'
+  RC=$?
+  set +eE; set -uo pipefail
+  check "write_state returns instead of aborting the shell" "$RC" "0"
+  check "a record that could not be written leaves the previous one" \
+    "$(cat "$APOLLO_STATE_DIR/last-update.json" 2>/dev/null)" "PREVIOUS-RECORD"
+  rm -rf "$ROOT"
+)
+
+# --- the jq-free record has to be valid JSON, whatever the reason says ---------
+# json_escape ended in `sed 's/[[:cntrl:]]/ /g'` and claimed to fold every
+# control character. sed is line-oriented: it strips the newline before matching
+# and puts it back, so a two-line reason produced a file the API rejects — and a
+# malformed record reads to the client as "no update has ever run", the record
+# becoming a second failure. It is a whitelist now, so it cannot emit anything
+# that breaks the file.
+(
+  make_device
+  NODE_BIN="$(command -v node)"
+  have() { [ "$1" != jq ]; }   # force the fallback writer, keep everything else
+  CURRENT=2.2.0 VERSION=2.2.1 write_state aborted failed 0 'two
+lines, a "quote", a backslash \ and a tab	here'
+  REC="$APOLLO_STATE_DIR/last-update.json"
+  check "the fallback record parses" \
+    "$("$NODE_BIN" -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).state' "$REC" 2>/dev/null || echo PARSE-ERROR)" \
+    "aborted"
+  check "the newline did not survive into the string" \
+    "$("$NODE_BIN" -pe 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).reason.includes(String.fromCharCode(10))' "$REC" 2>/dev/null)" \
+    "false"
   rm -rf "$ROOT"
 )
 

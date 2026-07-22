@@ -116,12 +116,20 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # held) changed nothing on the device and reported nothing either, leaving the
 # client with no record, no progress file and no unit to observe.
 json_escape() {  # arbitrary text -> a JSON string body
-  # Backslash first, then quotes, then every control character folded to a space:
-  # `reason` carries die() messages, which quote versions, paths and command
-  # output, and a raw newline or quote in there would produce a file the API
-  # rejects as malformed — which reads to the caller as "no update ever ran".
-  printf '%s' "$1" \
-    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]/ /g'
+  # A WHITELIST, not an escape chain: keep printable ASCII except " and \, drop
+  # everything else. By construction this cannot emit a character that would make
+  # the file invalid, which an escape chain has to get right case by case — and
+  # did not. The previous version ended in `sed 's/[[:cntrl:]]/ /g'` and claimed
+  # to fold every control character; sed is line-oriented, so it strips the
+  # newline before matching and puts it back afterwards, and a two-line reason
+  # produced a record the API rejected as malformed. The caller then reads that
+  # as "no update has ever run" — the record turning into a second failure, which
+  # is the one thing this function exists not to do.
+  #
+  # tr is byte-oriented, so it has no such blind spot. Losing an accent from a
+  # locale-translated error string is an acceptable price for a file that always
+  # parses.
+  printf '%s' "$1" | tr -cd '\40-\41\43-\133\135-\176'
 }
 
 write_state() {  # state phase progress [reason]
@@ -132,26 +140,50 @@ write_state() {  # state phase progress [reason]
   # Not %d: an unset or non-numeric argument must not make this abort.
   progress="${3:-0}"; case "$progress" in ''|*[!0-9-]*) progress=0 ;; esac
 
+  # `if <writer>; then wrote=1; fi`, and not `<writer> && wrote=1`, for two
+  # reasons that both bit.
+  #
+  # set -e: a bare failing command as the last statement of an `if` BODY takes
+  # the shell down with it — and every call from cleanup() runs with ERR/EXIT
+  # already cleared, so the abort was silent and skipped the two statements
+  # after it: the progress file was never removed (leaving the terminal value
+  # this redesign exists to eliminate) and `exit "$status"` never ran, so the
+  # unit reported the writer's exit code instead of the run's. Only an `if`
+  # CONDITION is exempt from set -e, so the writer has to be one.
+  #
+  # And the outcome has to gate the install. `[ -s "$tmp" ]` alone cannot tell
+  # complete JSON from half a line: on a full filesystem a truncated write
+  # replaced a valid record, write_state returned 0, and JSON.parse then failed
+  # in the API — so the client was told "no update has ever run" instead of "not
+  # enough disk space", with the last good record destroyed. The run most likely
+  # to be out of space is exactly the one that most needs to explain itself.
+  local wrote=0
   if have jq; then
-    jq -n --arg run_id "$RUN_ID" --arg state "$1" --arg phase "$2" \
+    if jq -n --arg run_id "$RUN_ID" --arg state "$1" --arg phase "$2" \
           --argjson progress "$progress" --arg reason "${4:-}" \
           --arg from "${CURRENT:-}" --arg to "${VERSION:-}" \
           --arg started "$STARTED_AT" --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
        '{run_id: $run_id, state: $state, phase: $phase, progress: $progress,
          from: $from, to: $to, reason: $reason,
          started_at: $started, updated_at: $updated}' > "$tmp" 2>/dev/null
+    then wrote=1
+    fi
   else
-    printf '{"run_id":"%s","state":"%s","phase":"%s","progress":%s,"from":"%s","to":"%s","reason":"%s","started_at":"%s","updated_at":"%s"}\n' \
+    if printf '{"run_id":"%s","state":"%s","phase":"%s","progress":%s,"from":"%s","to":"%s","reason":"%s","started_at":"%s","updated_at":"%s"}\n' \
       "$(json_escape "$RUN_ID")" "$(json_escape "$1")" "$(json_escape "$2")" \
       "$progress" "$(json_escape "${CURRENT:-}")" "$(json_escape "${VERSION:-}")" \
       "$(json_escape "${4:-}")" "$(json_escape "$STARTED_AT")" \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" 2>/dev/null
+    then wrote=1
+    fi
   fi
 
-  if [ -s "$tmp" ]; then
+  if [ "$wrote" -eq 1 ] && [ -s "$tmp" ]; then
     mv -f "$tmp" "$LAST_UPDATE_FILE" 2>/dev/null || rm -f "$tmp"
     chown futurebit:futurebit "$LAST_UPDATE_FILE" 2>/dev/null || true
   else
+    # Leave the previous record in place: a stale but valid explanation beats a
+    # truncated one, and beats none.
     rm -f "$tmp"
   fi
   return 0

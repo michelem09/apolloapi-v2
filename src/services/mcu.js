@@ -9,6 +9,14 @@ const { getStateDir } = require('../paths');
 // Convert exec to use promises
 const execPromise = util.promisify(exec);
 
+// How long after an update finished the compatibility value stays available.
+//
+// Only a browser that watched THIS update can legitimately be waiting for it,
+// and that browser polls every three seconds. Ten minutes is generous for a
+// reconnect and short enough that nothing latches: a device that has simply
+// updated at some point in the past must not keep answering 100.
+const COMPAT_PROGRESS_WINDOW_MS = 10 * 60 * 1000;
+
 class McuService {
   constructor(knex, utils) {
     this.knex = knex;
@@ -392,8 +400,32 @@ class McuService {
       // would be a lie it would render as success. A failed update leaves the
       // device on the version that bundle came from, so a page reload gets the
       // user out, and the current bundle reports the outcome properly.
+      // Bounded on both sides, because this value LATCHES in the bundle it
+      // serves. That bundle polls at mount with no `skip`, and its `>= 90` check
+      // sits outside its own `if (updateInProgress)` — so a permanent 100 makes
+      // it declare "Done!" five seconds after every mount, for the rest of the
+      // device's life, hiding the Update button behind "Reload App" that
+      // re-serves the same bundle. That is the exact state the record mechanism
+      // was built to end, moved out of the progress file and into the API.
+      //
+      // The record is never cleared, so "succeeded" alone cannot bound it:
+      //  - from !== to, or nothing was installed. The "Already on <version>"
+      //    path records succeeded WITHOUT replacing the UI, so a device that is
+      //    up to date would latch on every poll forever.
+      //  - and recent, because the only legitimate reader is a browser that
+      //    watched this very update and is waiting to be released.
       const record = await this._readUpdateRecord();
-      if (record && record.state === 'succeeded') return { value: 100 };
+      if (
+        record &&
+        record.state === 'succeeded' &&
+        record.from &&
+        record.to &&
+        record.from !== record.to
+      ) {
+        const finishedAt = Date.parse(record.updatedAt || '');
+        const age = Number.isNaN(finishedAt) ? Infinity : Date.now() - finishedAt;
+        if (age >= 0 && age < COMPAT_PROGRESS_WINDOW_MS) return { value: 100 };
+      }
 
       return { value: 0 };
     } catch (error) {
