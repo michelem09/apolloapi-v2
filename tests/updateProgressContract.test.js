@@ -19,13 +19,28 @@ const read = (...parts) =>
 describe('update state — the contract its consumers share', () => {
   const script = read('backend', 'update');
 
-  it('keeps progress transient', () => {
-    // Deleted on both terminal paths, so nothing can read a leftover as current.
+  it('writes a terminal value on success and none on failure', () => {
+    // The pre-update bundle completes on `value >= 90` and the run stops at 88,
+    // because two gates that can still roll everything back come after it. The
+    // updater is the only thing that knows the run finished AND that the release
+    // was kept, so it says so here rather than the API inferring it — four
+    // attempts at inferring it each traded one defect for another.
+    //
+    // Safe to leave behind now in a way it was not: the next run truncates it
+    // first, and the consumers that made a leftover dangerous are gone —
+    // serviceMonitor asks systemd, the current bundle reads the record. What is
+    // left is a tab on the PRE-update bundle, for which it is true.
     const success = script.slice(script.indexOf('write_state succeeded "done"'));
-    expect(success).toMatch(/rm -f "\$TMPFILE"/);
+    expect(success).toMatch(/echo 100 > "\$TMPFILE"/);
+
+    // Not on failure: that bundle cannot render one, and 100 would read as Done.
     const cleanup = script.match(/^cleanup\(\) \{[\s\S]*?\n\}/m)[0];
     expect(cleanup).toMatch(/rm -f "\$TMPFILE"/);
-    expect(cleanup).not.toMatch(/echo "-1" > "\$TMPFILE"/);
+    expect(cleanup).not.toMatch(/echo \d+ > "\$TMPFILE"/);
+
+    // And truncated at the start of every run, so nothing reads the last one's.
+    const start = script.indexOf('progress "starting" 5');
+    expect(script.slice(0, start)).toMatch(/rm -f "\$TMPFILE"/);
   });
 
   it('does not try to release the pre-update bundle from the API', () => {

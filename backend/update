@@ -51,8 +51,8 @@ if [ ! -r "$VERSION_LIB" ]; then
   # Also to the log the detach machinery exists to produce: this runs before
   # stdout is redirected there, so stderr alone would put the only explanation in
   # the transient unit's journal, where nobody looks.
-  { mkdir -p "${APOLLO_STATE_DIR:-/var/lib/apollo}" 2>/dev/null \
-    && echo "$msg" >> "${APOLLO_STATE_DIR:-/var/lib/apollo}/update.log"; } 2>/dev/null || true
+  { mkdir -p "$STATE_DIR" 2>/dev/null \
+    && echo "$msg" >> "$STATE_DIR/update.log"; } 2>/dev/null || true
   # `return` when sourced: this check runs before the APOLLO_UPDATE_LIB guard, so
   # `exit` here would kill the test harness that sources this file as a library
   # rather than letting it report.
@@ -286,7 +286,12 @@ if [ -z "${APOLLO_UPDATE_DETACHED:-}" ] && [ -d /run/systemd/system ] && have sy
   # is excluded on purpose, since it makes this script define and return without
   # doing anything.
   # `-e`, not `-v`: exported variables only. An override arrives in the
-  # ENVIRONMENT (`APOLLO_ROOT_DIR=… sudo bash backend/update`), while values this
+  # ENVIRONMENT — and it needs `sudo -E` to survive: Debian ships
+  # `Defaults env_reset`, and nothing here adds an env_keep for APOLLO_*, so
+  # `APOLLO_ROOT_DIR=/tmp/sandbox sudo bash backend/update` silently drops the
+  # variable and swaps the REAL /opt/apolloapi. Verified on a device. Use
+  # `sudo -E env APOLLO_ROOT_DIR=/tmp/sandbox bash backend/update`, and read the
+  # "Updating <dir>" line the run prints before believing it. Values this
   # script derives for itself — APOLLO_DIR among them — are plain shell
   # variables. Enumerating all of them swept the script's own state into the
   # child's environment, harmless only because the child re-derives it anyway,
@@ -915,6 +920,11 @@ done
 # input to everything below — trivially MITM-able.
 valid_url "$CHANNEL_URL" || die "Update channel is not a plain https URL"
 
+# Said out loud, first thing, because the sandbox override is easy to lose:
+# `sudo` strips APOLLO_* without -E, and the run then silently targets the real
+# install. One line in the log is what turns that into something an operator can
+# notice before it matters.
+log "Updating $APOLLO_DIR (state in $STATE_DIR)"
 log "Checking ${CHANNEL} channel"
 MANIFEST="$(fetch "$CHANNEL_URL")" || die "Cannot reach the update channel"
 VERSION="$(jq -r '.version // empty' <<<"$MANIFEST")"
@@ -1207,8 +1217,28 @@ write_state succeeded "done" 100
 rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"
 prune_backups
 
-# Progress is transient again. Keeping a terminal value here so the outcome would
-# survive the API restart is what let a leftover read as a fresh result; the
-# outcome now lives in the record, which is where a client looks for it.
-rm -f "$TMPFILE"
+# The one thing the pre-update UI bundle can act on.
+#
+# That bundle polls Mcu.updateProgress and completes on `value >= 90`; the run
+# deliberately stops at 88 because two gates that can still roll everything back
+# come after it. Without this it reads 0 after reconnecting and sits on
+# "Updating... 0%" with its close button hidden, after a SUCCESSFUL update, and
+# the modal tells the user not to power off — so the natural response is to keep
+# waiting rather than to reload.
+#
+# Four attempts were made to synthesise this in the API, from the record. Every
+# one traded a defect for another, because they inferred a browser's signal from
+# device state that browser never touches. Here it is not an inference: the
+# updater is the only thing that knows the run finished and that the release was
+# kept, and it says so in the file that bundle is already reading.
+#
+# Left behind on purpose, and safe now in a way it was not: the next run
+# truncates it before doing anything, and the two consumers that made a leftover
+# dangerous are gone — serviceMonitor asks systemd, and the current bundle reads
+# the record. What remains is a tab still running the PRE-update bundle, for
+# which "the update finished" is true.
+#
+# Only on success. A rollback leaves it removed by cleanup, because that bundle
+# has no way to render a failure and 100 would render as "Done!".
+echo 100 > "$TMPFILE"
 log "Updated to $VERSION"

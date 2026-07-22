@@ -112,9 +112,8 @@ describe('serviceMonitor update-in-progress detection', () => {
     expect(src).not.toContain("_isSystemdActive('node')");
     expect(src).toContain("const nodeStatus = await this._systemctlStatus('node');");
     expect(src).toContain("nodeStatus !== 'active'");
-    // The only remaining callers are the two cycle entry points, which is what
-    // the broadening was for.
-    expect(src.match(/_isSystemdActive\(UPDATE_UNIT\)/g)).toHaveLength(2);
+    // One caller left: the cycle entry point. It is what the broadening was for.
+    expect(src.match(/_isSystemdActive\(UPDATE_UNIT\)/g)).toHaveLength(1);
   });
 
   it('asks systemd once per cycle, not once per service', () => {
@@ -127,8 +126,13 @@ describe('serviceMonitor update-in-progress detection', () => {
       require('path').join(__dirname, '..', 'src', 'services', 'serviceMonitor.js'),
       'utf8'
     );
-    const perService = src.match(/async checkServiceStatus\(serviceName, updateInProgress = false\)/);
+    // No default: a forgotten argument must be a visible error, not a silent
+    // misclassification. `false` re-enables the block that rewrites the user's
+    // intent; `null` skips it and takes the grace handling with it. Both were
+    // tried in this branch and both were wrong.
+    const perService = src.match(/async checkServiceStatus\(serviceName, updateInProgress\) \{/);
     expect(perService).not.toBeNull();
+    expect(src).not.toMatch(/checkServiceStatus\(serviceName, updateInProgress = /);
     // The value is handed down, never re-derived inside the per-service path.
     const body = src.slice(
       src.indexOf('async checkServiceStatus(serviceName'),

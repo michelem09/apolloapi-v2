@@ -252,13 +252,20 @@ class ServiceMonitor {
   // meant one `/bin/sh -c` plus one `systemctl` each, every 10 seconds: about
   // 86,000 process creations a day on an aarch64 SBC, replacing what used to be
   // a single existsSync. The caller asks once and hands the answer down.
-  // Defaults to false — "as far as the caller knows, no update is running" —
-  // and not to null. null means "could not ask", which correctly SKIPS the whole
-  // manual-action block, and that block also holds the grace-period handling
-  // that keeps a starting service pending and stops ckpool's intent being
-  // poisoned while the node comes up. Defaulting to null therefore disabled
-  // those for every direct caller, which is how an existing test caught it.
-  async checkServiceStatus(serviceName, updateInProgress = false) {
+  // `updateInProgress` is REQUIRED, with no default.
+  //
+  // A default makes "the caller forgot" indistinguishable from an answer, and
+  // the two candidates are both wrong in their own direction: `false` silently
+  // re-enables the manual-action block — the one that persists
+  // requested_status='offline' for node and the miner when it sees them stopped,
+  // which is precisely the state the updater creates for minutes — while `null`
+  // skips that block entirely and takes the grace-period handling with it,
+  // including the guard that stops ckpool's intent being poisoned while the node
+  // starts. Both were tried in this branch; the second was caught by a test.
+  //
+  // Requiring it makes a forgotten argument a visible error instead of a silent
+  // misclassification.
+  async checkServiceStatus(serviceName, updateInProgress) {
     try {
       // Get database service name
       const dbServiceName = this.getDatabaseServiceName(serviceName);
@@ -790,19 +797,7 @@ class ServiceMonitor {
     }
   }
 
-  // Get current status of all services
-  async getCurrentStatuses() {
-    try {
-      const updateInProgress = await this._isSystemdActive(UPDATE_UNIT);
-      const promises = this.systemdServices.map((service) =>
-        this.checkServiceStatus(service, updateInProgress)
-      );
-      return await Promise.all(promises);
-    } catch (error) {
-      console.error('Error getting current statuses:', error);
-      return [];
-    }
-  }
+
 
   // Force immediate check
   async forceCheck() {
