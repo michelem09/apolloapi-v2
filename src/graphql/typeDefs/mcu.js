@@ -15,6 +15,7 @@ module.exports = gql`
     version: McuAppVersionOutput! @auth
     update: EmptyOutput! @auth
     updateProgress: McuUpdateProgressOutput! @auth
+    lastUpdate: McuLastUpdateOutput! @auth
     timezone: McuTimezoneOutput! @auth
     setTimezone(input: McuSetTimezoneInput!): McuTimezoneOutput! @auth
   }
@@ -136,5 +137,29 @@ module.exports = gql`
 
   type McuUpdateProgressResult {
     value: Int
+  }
+
+  type McuLastUpdateOutput {
+    result: McuLastUpdateResult
+    error: Error
+  }
+
+  """
+  What the last update attempt did. The updater writes this to the state dir
+  before it finishes, because progress is polled through this API and the updater
+  stops this API — so the UI is disconnected for exactly the window that matters
+  and reconnects with no memory of it. Null when no update has ever run.
+  """
+  type McuLastUpdateResult {
+    "success | rolled-back | failed. 'failed' means the device was never modified."
+    result: String!
+    "Version installed before the attempt."
+    from: String
+    "Version the attempt was installing."
+    to: String
+    "Why it stopped, empty on success."
+    reason: String
+    startedAt: String
+    finishedAt: String
   }
 `;

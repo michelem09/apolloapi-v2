@@ -4,6 +4,7 @@ const axios = require('axios');
 const fs = require('fs').promises;
 const { GraphQLError } = require('graphql');
 const util = require('util');
+const { getStateDir } = require('../paths');
 
 // Convert exec to use promises
 const execPromise = util.promisify(exec);
@@ -234,6 +235,43 @@ class McuService {
     } catch (error) {
       console.log('Error getting update progress:', error);
       return { value: 0 };
+    }
+  }
+
+  // What the last update attempt did.
+  //
+  // The updater stops this API partway through, so progress polling goes dark for
+  // the minutes that matter and the UI reconnects knowing nothing. This record is
+  // written to the state dir — not /tmp — so it survives both that window and a
+  // reboot, and is the only way the UI can say "the update failed and your device
+  // was restored" instead of showing a blackout the user has to interpret.
+  //
+  // Returns null when no update has ever run, or when the file is unreadable or
+  // malformed: a broken outcome record must not turn into an API error on a device
+  // that is otherwise fine.
+  async getLastUpdate() {
+    const filePath = join(getStateDir(), 'last-update.json');
+    let raw;
+    try {
+      raw = await fs.readFile(filePath, 'utf8');
+    } catch (error) {
+      return null; // never updated, or no state dir yet
+    }
+
+    try {
+      const record = JSON.parse(raw);
+      if (!record || typeof record.result !== 'string') return null;
+      return {
+        result: record.result,
+        from: record.from || null,
+        to: record.to || null,
+        reason: record.reason || null,
+        startedAt: record.started_at || null,
+        finishedAt: record.finished_at || null,
+      };
+    } catch (error) {
+      console.log('Malformed last-update record:', error.message);
+      return null;
     }
   }
 

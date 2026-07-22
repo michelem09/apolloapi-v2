@@ -132,6 +132,57 @@ describe('update lifecycle contract', () => {
     expect(gate).toBeGreaterThan(provision);
   });
 
+  it('never reports success before the gates that can still roll back', () => {
+    const script = readBackendScript('update');
+
+    // Two gates come after "Starting services" — the node failing to start, and
+    // the health check timing out — and either triggers a full rollback. Writing
+    // 95 before them told the user the update had worked while the device was
+    // reverting, and the modal treated anything >= 90 as done.
+    // lastIndexOf: cleanup carries a comment mentioning the `health_ok || die`
+    // path, and indexOf found that instead of the gate itself.
+    const startPhase = script.lastIndexOf('log "Starting services"');
+    const healthGate = script.lastIndexOf('health_ok || die');
+    expect(startPhase).toBeGreaterThan(-1);
+    expect(healthGate).toBeGreaterThan(startPhase);
+
+    // The window that matters runs from the stop — the point after which a
+    // rollback is possible — to the health gate. Anything written there that
+    // reads as success is a lie the user acts on. The 100 on the "Already on"
+    // path is outside it and legitimate: nothing is being installed.
+    const pointOfNoReturn = script.lastIndexOf('log "Stopping services"');
+    expect(pointOfNoReturn).toBeGreaterThan(-1);
+    expect(healthGate).toBeGreaterThan(pointOfNoReturn);
+    const beforeGate = script.slice(pointOfNoReturn, healthGate);
+    const written = [...beforeGate.matchAll(/echo "(-?\d+)" > "\$TMPFILE"/g)].map((m) =>
+      parseInt(m[1], 10)
+    );
+    expect(written.length).toBeGreaterThan(0);
+    for (const value of written) {
+      expect(value).toBeLessThan(90);
+    }
+
+    // And 100 is written past the gate.
+    expect(script.slice(healthGate)).toMatch(/echo "100" > "\$TMPFILE"/);
+  });
+
+  it('records the outcome where the UI can read it after reconnecting', () => {
+    const script = readBackendScript('update');
+
+    // Progress is polled through apollo-api, which this script stops — so the UI
+    // is blind for the window that matters and reconnects with no memory. The
+    // record lives in the state dir, not /tmp, so it survives a reboot too.
+    expect(script).toMatch(/LAST_UPDATE_FILE="\$\{STATE_DIR\}\/last-update\.json"/);
+    expect(script).toContain('write_last_update success');
+    expect(script).toMatch(/write_last_update "\$result"/);
+
+    // 'failed' and 'rolled-back' are different things to tell a user: one means
+    // the device was never touched.
+    const cleanup = script.match(/^cleanup\(\) \{[\s\S]*?\n\}/m);
+    expect(cleanup[0]).toContain("result='failed'");
+    expect(cleanup[0]).toContain("result='rolled-back'");
+  });
+
   it('leaves a terminal progress value on every exit path', () => {
     const script = readBackendScript('update');
 

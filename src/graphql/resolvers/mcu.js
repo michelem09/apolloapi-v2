@@ -101,6 +101,15 @@ module.exports = {
       } catch (error) {
         return { result: null, error: { message: error.message } };
       }
+    },
+
+    lastUpdate: async (_, __, { services }) => {
+      try {
+        const result = await services.mcu.getLastUpdate();
+        return { result, error: null };
+      } catch (error) {
+        return { result: null, error: { message: error.message } };
+      }
     }
   }
 };

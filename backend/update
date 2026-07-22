@@ -35,16 +35,55 @@ SYSTEMD_DIR="${APOLLO_SYSTEMD_DIR:-/etc/systemd/system}"
 RC_LOCAL="${APOLLO_RC_LOCAL:-/etc/rc.local}"
 VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$'
 
+# What the last update did, for the UI to report once the API is back. It lives in
+# the state dir and not /tmp because the whole point is surviving the window where
+# apollo-api is stopped — and a reboot with it.
+#
+# Progress alone cannot carry this: it is polled through apollo-api, which the
+# updater stops, so the UI is disconnected for exactly the minutes that matter and
+# reconnects with no memory. A failed update and its rollback were indistinguishable
+# from a random blackout.
+LAST_UPDATE_FILE="${STATE_DIR}/last-update.json"
+STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
 STAGING=''; TARBALL=''
 # MUTATED is armed BEFORE the first destructive step, not after the last one: it
 # answers "might /opt/apolloapi be half-dismantled?", and a flag set afterwards
 # was still 0 during the exact window it exists to cover.
 MUTATED=0; STOPPED=0; UNITS_SAVED=0; COMPLETED=0
 
+# The reason the update stopped, captured so the outcome record can tell the user
+# something better than "it failed". Only `die` sets it: `err` is used for warnings
+# the update survives, and attributing one of those as the cause would be worse
+# than the generic message.
+FAIL_REASON=''
+
 log()  { echo -e "${YELLOW} ---> $*${NC}"; }
 err()  { echo -e "${RED}$*${NC}" >&2; }
-die()  { err "$*"; exit 1; }
+die()  { FAIL_REASON="$*"; err "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Records the outcome for the UI. Written with jq so a version or a reason
+# containing a quote cannot produce invalid JSON that the API then fails to parse
+# — the one file whose job is to explain a failure must not become a second one.
+#
+# result: success | rolled-back | failed
+#   rolled-back means the device was modified and put back; failed means it was
+#   never touched (bad checksum, no disk space, missing dependency). The
+#   difference matters to the user: one is "nothing happened", the other is
+#   "something happened and was undone".
+write_last_update() {  # result from to reason
+  local dir; dir="$(dirname "$LAST_UPDATE_FILE")"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  have jq || return 0
+  jq -n --arg result "$1" --arg from "$2" --arg to "$3" --arg reason "$4" \
+        --arg started "$STARTED_AT" --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     '{result: $result, from: $from, to: $to, reason: $reason,
+       started_at: $started, finished_at: $finished}' \
+     > "$LAST_UPDATE_FILE" 2>/dev/null || return 0
+  chown futurebit:futurebit "$LAST_UPDATE_FILE" 2>/dev/null || true
+  return 0
+}
 
 # Sourced with APOLLO_UPDATE_LIB=1 by tests/ota/rollback.test.sh, which drives the
 # backup and restore functions directly under injected failures. The update itself
@@ -277,6 +316,14 @@ cleanup() {
     start_services
   fi
   restore_solo_intent || true
+
+  # "rolled-back" only if the device was actually modified. Otherwise nothing
+  # happened to it, and saying so is materially different for the user.
+  local result='failed'
+  [ "$MUTATED" -eq 1 ] && result='rolled-back'
+  write_last_update "$result" "${CURRENT:-}" "${VERSION:-}" \
+    "${FAIL_REASON:-The update stopped unexpectedly}"
+
   # -1 means "failed", and the UI needs to be told. Deleting the file instead made
   # Mcu.updateProgress report a plain 0, indistinguishable from "just started", so
   # the modal sat at "Updating... 0%" with its close button hidden until the user
@@ -786,7 +833,12 @@ fi
 
 restore_solo_intent
 
-echo "95" > "$TMPFILE"
+# Deliberately below 90, the threshold the UI used to read as "done". Two gates
+# that can still trigger a full rollback come AFTER this point — the node failing
+# to start, and the health check timing out — so anything here that reads as
+# success tells the user the update worked while the device is reverting. 100 is
+# written once, past both gates, and is the only value that means finished.
+echo "88" > "$TMPFILE"
 log "Starting services"
 # bootstrap first: it owns the migrations, and node/miner Require it, so starting
 # it later would bounce them right after they came up.
@@ -803,6 +855,7 @@ health_ok || die "Health check failed after installing $VERSION"
 
 echo "100" > "$TMPFILE"
 COMPLETED=1
+write_last_update success "$CURRENT" "$VERSION" ''
 
 # The verified download is only useful for retrying a failed install, so it goes
 # once the install has succeeded.
