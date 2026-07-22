@@ -246,66 +246,6 @@ class McuService {
     };
   }
 
-  // Update firmware
-  async update() {
-    try {
-      let scriptName = 'update';
-      if (process.env.NODE_ENV === 'development') scriptName = 'update.fake';
-
-      const updateScript = join(__dirname, '../../backend', scriptName);
-      const cmd = spawn(process.env.NODE_ENV === 'development' ? 'bash' : 'sudo', 
-        process.env.NODE_ENV === 'development' ? [updateScript] : ['bash', updateScript]);
-
-      cmd.stdout.on('data', (data) => {
-        console.log(`stdout: ${data}`);
-      });
-
-      cmd.stderr.on('data', (data) => {
-        console.error(`stderr: ${data}`);
-      });
-
-      cmd.on('close', (code) => {
-        console.log(`child process exited with code ${code}`);
-      });
-    } catch (error) {
-      throw new GraphQLError(`Failed to update firmware: ${error.message}`);
-    }
-  }
-
-  // Get update progress
-  async getUpdateProgress() {
-    try {
-      // Check if the progress file exists
-      const filePath = '/tmp/update_progress';
-      let fileExists = true;
-
-      try {
-        await fs.access(filePath, fs.constants.F_OK);
-      } catch (error) {
-        if (error.code === 'ENOENT') {
-          // File doesn't exist
-          console.log('update_progress file not found. Returning default progress.');
-          fileExists = false;
-        } else {
-          throw error;
-        }
-      }
-
-      if (!fileExists) {
-        return { value: 0 };
-      }
-
-      // Read the progress value from the file
-      const data = await fs.readFile(filePath);
-      const progress = parseInt(data.toString());
-
-      return { value: progress };
-    } catch (error) {
-      console.log('Error getting update progress:', error);
-      return { value: 0 };
-    }
-  }
-
   // What the last update run is doing, or did.
   //
   // Two things together, because either alone lies. The record says what the
@@ -416,55 +356,37 @@ class McuService {
         }
       }
 
-      if (!fileExists) {
-        return { value: 0 };
+      if (fileExists) {
+        const data = await fs.readFile(filePath);
+        const progress = parseInt(data.toString(), 10);
+        if (Number.isFinite(progress)) return { value: progress };
       }
 
-      // Read the progress value from the file
-      const data = await fs.readFile(filePath);
-      const progress = parseInt(data.toString());
+      // The file is gone, so the run is over — but this query exists for one
+      // caller only: the UI bundle that was loaded BEFORE the update, which is
+      // the bundle the update replaces. It completes on `value >= 90` and has no
+      // other way to finish.
+      //
+      // The updater cannot satisfy that with the file alone. It deliberately
+      // stops at 88, because two gates that still roll everything back come
+      // after it, and it deletes the file at the end, because a leftover
+      // terminal value read as a live one is what once left devices unable to
+      // take another update. So the old bundle watched 5 -> 88, lost the API,
+      // reconnected, read 0, and sat on "Updating... 0%" after a SUCCESSFUL
+      // update, with its close button hidden.
+      //
+      // The record can satisfy it: it knows the run finished and how. Only a
+      // success unblocks the old modal — telling it "done" after a rollback
+      // would be a lie it would render as success. A failed update leaves the
+      // device on the version that bundle came from, so a page reload gets the
+      // user out, and the current bundle reports the outcome properly.
+      const record = await this._readUpdateRecord();
+      if (record && record.state === 'succeeded') return { value: 100 };
 
-      return { value: progress };
+      return { value: 0 };
     } catch (error) {
       console.log('Error getting update progress:', error);
       return { value: 0 };
-    }
-  }
-
-  // What the last update attempt did.
-  //
-  // The updater stops this API partway through, so progress polling goes dark for
-  // the minutes that matter and the UI reconnects knowing nothing. This record is
-  // written to the state dir — not /tmp — so it survives both that window and a
-  // reboot, and is the only way the UI can say "the update failed and your device
-  // was restored" instead of showing a blackout the user has to interpret.
-  //
-  // Returns null when no update has ever run, or when the file is unreadable or
-  // malformed: a broken outcome record must not turn into an API error on a device
-  // that is otherwise fine.
-  async getLastUpdate() {
-    const filePath = join(getStateDir(), 'last-update.json');
-    let raw;
-    try {
-      raw = await fs.readFile(filePath, 'utf8');
-    } catch (error) {
-      return null; // never updated, or no state dir yet
-    }
-
-    try {
-      const record = JSON.parse(raw);
-      if (!record || typeof record.result !== 'string') return null;
-      return {
-        result: record.result,
-        from: record.from || null,
-        to: record.to || null,
-        reason: record.reason || null,
-        startedAt: record.started_at || null,
-        finishedAt: record.finished_at || null,
-      };
-    } catch (error) {
-      console.log('Malformed last-update record:', error.message);
-      return null;
     }
   }
 

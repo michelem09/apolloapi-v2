@@ -28,6 +28,29 @@ describe('update state — the contract its consumers share', () => {
     expect(cleanup).not.toMatch(/echo "-1" > "\$TMPFILE"/);
   });
 
+  it('still lets the pre-update UI bundle finish', () => {
+    // The assertion above, alone, certified a break. Deleting the file is right,
+    // but the file's only consumer is the bundle loaded BEFORE the update — the
+    // one this update replaces — and that bundle completes solely on
+    // `value >= 90`. The updater stops at 88 on purpose (two gates that still
+    // roll everything back come after it) and then removes the file, so that
+    // browser watched 5 -> 88, lost the API, reconnected, read 0, and sat on
+    // "Updating... 0%" after a SUCCESSFUL update with its close button hidden.
+    //
+    // The record closes it, because it knows the run ended AND how. Asserted on
+    // the API, since that is where the compatibility now lives.
+    const mcu = read('src', 'services', 'mcu.js');
+    const method = mcu.match(/async getUpdateProgress\(\) \{[\s\S]*?\n {2}\}/)[0];
+    expect(method).toContain('_readUpdateRecord');
+    expect(method).toMatch(/state === 'succeeded'.*\{ value: 100 \}/s);
+    // Only a success. Reporting 100 for a rollback would make that bundle render
+    // "Done!" for an update that was reverted.
+    expect(method).not.toMatch(/state !== 'succeeded'.*\{ value: 100 \}/s);
+    // And exactly one definition of it, in a class body where the last wins.
+    expect(mcu.match(/async getUpdateProgress\(/g)).toHaveLength(1);
+    expect(mcu.match(/async update\(/g)).toHaveLength(1);
+  });
+
   it('records outcomes in the state dir, not in /tmp', () => {
     // The record has to survive both the API restart and a reboot.
     expect(script).toMatch(/LAST_UPDATE_FILE="\$\{STATE_DIR\}\/last-update\.json"/);

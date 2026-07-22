@@ -97,19 +97,47 @@ have() { command -v "$1" >/dev/null 2>&1; }
 #
 # jq, not string interpolation: a version or a reason containing a quote must not
 # turn the one file whose job is to explain a failure into a second failure.
+#
+# jq is the preferred writer, but it CANNOT be a precondition. Devices in the
+# field ship without it — the updater installs it — so gating on it made the
+# record unavailable during exactly the window it exists to explain: a first OTA
+# whose dependency install fails (apt mirror down, sigstore unreachable, apt lock
+# held) changed nothing on the device and reported nothing either, leaving the
+# client with no record, no progress file and no unit to observe.
+json_escape() {  # arbitrary text -> a JSON string body
+  # Backslash first, then quotes, then every control character folded to a space:
+  # `reason` carries die() messages, which quote versions, paths and command
+  # output, and a raw newline or quote in there would produce a file the API
+  # rejects as malformed — which reads to the caller as "no update ever ran".
+  printf '%s' "$1" \
+    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]/ /g'
+}
+
 write_state() {  # state phase progress [reason]
-  local dir tmp
+  local dir tmp progress
   dir="$(dirname "$LAST_UPDATE_FILE")"
   mkdir -p "$dir" 2>/dev/null || return 0
-  have jq || return 0
   tmp="$(mktemp "${LAST_UPDATE_FILE}.XXXXXX" 2>/dev/null)" || return 0
-  if jq -n --arg run_id "$RUN_ID" --arg state "$1" --arg phase "$2" \
-        --argjson progress "${3:-0}" --arg reason "${4:-}" \
-        --arg from "${CURRENT:-}" --arg to "${VERSION:-}" \
-        --arg started "$STARTED_AT" --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-     '{run_id: $run_id, state: $state, phase: $phase, progress: $progress,
-       from: $from, to: $to, reason: $reason,
-       started_at: $started, updated_at: $updated}' > "$tmp" 2>/dev/null; then
+  # Not %d: an unset or non-numeric argument must not make this abort.
+  progress="${3:-0}"; case "$progress" in ''|*[!0-9-]*) progress=0 ;; esac
+
+  if have jq; then
+    jq -n --arg run_id "$RUN_ID" --arg state "$1" --arg phase "$2" \
+          --argjson progress "$progress" --arg reason "${4:-}" \
+          --arg from "${CURRENT:-}" --arg to "${VERSION:-}" \
+          --arg started "$STARTED_AT" --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       '{run_id: $run_id, state: $state, phase: $phase, progress: $progress,
+         from: $from, to: $to, reason: $reason,
+         started_at: $started, updated_at: $updated}' > "$tmp" 2>/dev/null
+  else
+    printf '{"run_id":"%s","state":"%s","phase":"%s","progress":%s,"from":"%s","to":"%s","reason":"%s","started_at":"%s","updated_at":"%s"}\n' \
+      "$(json_escape "$RUN_ID")" "$(json_escape "$1")" "$(json_escape "$2")" \
+      "$progress" "$(json_escape "${CURRENT:-}")" "$(json_escape "${VERSION:-}")" \
+      "$(json_escape "${4:-}")" "$(json_escape "$STARTED_AT")" \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" 2>/dev/null
+  fi
+
+  if [ -s "$tmp" ]; then
     mv -f "$tmp" "$LAST_UPDATE_FILE" 2>/dev/null || rm -f "$tmp"
     chown futurebit:futurebit "$LAST_UPDATE_FILE" 2>/dev/null || true
   else

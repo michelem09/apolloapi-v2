@@ -28,7 +28,7 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=48
+EXPECTED_ASSERTIONS=56
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -476,6 +476,53 @@ EOF
   kill -TERM $vpid 2>/dev/null
   wait $vpid 2>/dev/null
   check "SIGTERM takes the rollback branch" "$(cat "$ROOT/branch" 2>/dev/null)" "ROLLBACK-BRANCH"
+  rm -rf "$ROOT"
+)
+
+# --- the record has to exist even before jq does ------------------------------
+# Every fielded device ships without jq; the updater installs it. Gating
+# write_state on `have jq` therefore made the record unavailable during exactly
+# the window it exists to explain — a first OTA whose dependency install fails
+# changed nothing and reported nothing, leaving the client with no record, no
+# progress file and no unit left to look at.
+(
+  make_device
+  # A PATH built from nothing but the commands write_state actually needs.
+  #
+  # Subtracting jq's directory instead was tried twice and does not work: jq is
+  # in /usr/bin here, and removing that takes dirname, mktemp and sed with it —
+  # the fallback then failed for want of `dirname` while the assertions blamed
+  # the JSON. Adding a shadowing directory does not work either: `command -v`
+  # skips a non-executable entry and finds the next real jq further along.
+  # Whitelisting is the only construction where "jq is not installed" is true.
+  MINBIN="$ROOT/minbin"; mkdir -p "$MINBIN"
+  for t in dirname mkdir mktemp date sed mv rm cat; do
+    ln -sf "$(command -v "$t")" "$MINBIN/$t"
+  done
+  cp "$STUBS/chown" "$MINBIN/chown"
+  # Resolved while it is still reachable: node is this test's JSON parser, and it
+  # must not depend on the PATH the scenario is about to replace.
+  NODE_BIN="$(command -v node)"
+  # `hash -r` because bash caches resolved command paths: without it the shell
+  # keeps calling the jq it already found, whatever PATH now says.
+  export PATH="$MINBIN"
+  hash -r
+  check "jq really is unavailable" "$(have jq && echo yes || echo no)" "no"
+  check "the tools write_state needs still are" "$(have dirname && have mktemp && have sed && echo yes || echo no)" "yes"
+
+  REASON='deps: "apt" failed, with a \ backslash'
+  CURRENT=2.2.0 VERSION=2.2.1 write_state aborted failed 0 "$REASON"
+  REC="$APOLLO_STATE_DIR/last-update.json"
+  check "a record is written without jq" "$([ -s "$REC" ] && echo yes || echo no)" "yes"
+
+  # Parsed with the same JSON parser the API uses, not with grep: the claim is
+  # that the file is VALID, and a hand-built one is precisely where that breaks.
+  field() { "$NODE_BIN" -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const v=r[process.argv[2]];console.log(process.argv[3]==="type"?typeof v:v)' "$REC" "$1" "${2:-}" 2>/dev/null || echo PARSE-ERROR; }
+  check "it is valid JSON" "$(field state)" "aborted"
+  check "it carries the run id" "$(field run_id)" "$RUN_ID"
+  check "it carries the version it was moving to" "$(field to)" "2.2.1"
+  check "progress is a number, not a string" "$(field progress type)" "number"
+  check "quotes and backslashes in the reason survive" "$(field reason)" "$REASON"
   rm -rf "$ROOT"
 )
 
