@@ -46,7 +46,17 @@ RC_LOCAL="${APOLLO_RC_LOCAL:-/etc/rc.local}"
 # on that device dies here before it can say why.
 VERSION_LIB="$(dirname "${BASH_SOURCE[0]}")/lib/version.sh"
 if [ ! -r "$VERSION_LIB" ]; then
-  echo "FATAL: $VERSION_LIB is missing — this install is incomplete" >&2
+  msg="FATAL: $VERSION_LIB is missing — this install is incomplete"
+  echo "$msg" >&2
+  # Also to the log the detach machinery exists to produce: this runs before
+  # stdout is redirected there, so stderr alone would put the only explanation in
+  # the transient unit's journal, where nobody looks.
+  { mkdir -p "${APOLLO_STATE_DIR:-/var/lib/apollo}" 2>/dev/null \
+    && echo "$msg" >> "${APOLLO_STATE_DIR:-/var/lib/apollo}/update.log"; } 2>/dev/null || true
+  # `return` when sourced: this check runs before the APOLLO_UPDATE_LIB guard, so
+  # `exit` here would kill the test harness that sources this file as a library
+  # rather than letting it report.
+  [ "${BASH_SOURCE[0]}" != "$0" ] && return 1
   exit 1
 fi
 # shellcheck disable=SC1091
@@ -275,7 +285,15 @@ if [ -z "${APOLLO_UPDATE_DETACHED:-}" ] && [ -d /run/systemd/system ] && have sy
   # APOLLO_UPDATE_DETACHED and APOLLO_UPDATE_LOG are set above; APOLLO_UPDATE_LIB
   # is excluded on purpose, since it makes this script define and return without
   # doing anything.
-  for override in $(compgen -v APOLLO_ || true); do
+  # `-e`, not `-v`: exported variables only. An override arrives in the
+  # ENVIRONMENT (`APOLLO_ROOT_DIR=… sudo bash backend/update`), while values this
+  # script derives for itself — APOLLO_DIR among them — are plain shell
+  # variables. Enumerating all of them swept the script's own state into the
+  # child's environment, harmless only because the child re-derives it anyway,
+  # and it made the exclusion list read as "inputs, minus what we set, minus
+  # whatever we happen to compute". This asks the question that was actually
+  # meant: what did the operator put in the environment.
+  for override in $(compgen -e APOLLO_ || true); do
     case "$override" in
       APOLLO_UPDATE_DETACHED|APOLLO_UPDATE_LOG|APOLLO_UPDATE_LIB) continue ;;
     esac

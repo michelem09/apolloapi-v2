@@ -9,15 +9,6 @@ const { getStateDir } = require('../paths');
 // Convert exec to use promises
 const execPromise = util.promisify(exec);
 
-// How long after this process first sees a finished update the compatibility
-// value stays available.
-//
-// Only a browser that watched THIS update can legitimately be waiting for it,
-// and that browser polls every three seconds. Ten minutes is generous for a
-// reconnect and short enough that nothing latches: a device that has simply
-// updated at some point in the past must not keep answering 100.
-const COMPAT_PROGRESS_WINDOW_MS = 10 * 60 * 1000;
-
 class McuService {
   constructor(knex, utils) {
     this.knex = knex;
@@ -391,117 +382,40 @@ class McuService {
   }
 
   // Get update progress
+  // The live progress value, or 0. Nothing else.
+  //
+  // Its only consumer is the UI bundle loaded BEFORE an update — the bundle the
+  // update replaces — which polls this and completes on `value >= 90`. The
+  // updater deliberately stops at 88, because two gates that still roll
+  // everything back come after it, so on the first tarball update that browser
+  // reaches 88, loses the API, reconnects, reads 0, and sits there until the
+  // page is reloaded. Once per device, ever, and a reload fixes it.
+  //
+  // Four rounds were spent trying to close that gap from here, and each shape
+  // traded one failure for another: a permanent 100 latched "Reload App" for
+  // good; a wall-clock window was defeated by the clock steps these RTC-less
+  // boards make right after an update; a monotonic window anchored on first
+  // observation reopened on every unrelated API restart; a liveness flag was
+  // unreachable by the one client that needed it, because that bundle does not
+  // know `updateStatus` exists.
+  //
+  // They failed for one reason: this reconstructs, from device state, a signal
+  // about a browser that never touches that state. The honest answer is that a
+  // pre-update bundle cannot be released from here, so it is not attempted. A
+  // reload is the recovery, it is needed once, and it costs nothing to explain.
   async getUpdateProgress() {
     try {
-      // Read it, rather than testing for it first and then reading it: two
-      // syscalls where one does, and one of them depended on `fs.constants`,
-      // which the promises API does not expose everywhere it is assumed to. A
-      // missing file is the ordinary case here, not an error.
-      const filePath = '/tmp/update_progress';
-      let raw = null;
-      try {
-        raw = await fs.readFile(filePath, 'utf8');
-      } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-      }
-
-      if (raw !== null) {
-        const progress = parseInt(raw, 10);
-        if (Number.isFinite(progress)) {
-          // This process watched the update happen. Remembered HERE, in the
-          // method the old bundle actually calls, because that is the only
-          // observation available to it — see the gate below.
-          this._sawProgressFile = process.hrtime.bigint();
-          return { value: progress };
-        }
-      }
-
-      // The file is gone, so the run is over — but this query exists for one
-      // caller only: the UI bundle that was loaded BEFORE the update, which is
-      // the bundle the update replaces. It completes on `value >= 90` and has no
-      // other way to finish.
-      //
-      // The updater cannot satisfy that with the file alone. It deliberately
-      // stops at 88, because two gates that still roll everything back come
-      // after it, and it deletes the file at the end, because a leftover
-      // terminal value read as a live one is what once left devices unable to
-      // take another update. So the old bundle watched 5 -> 88, lost the API,
-      // reconnected, read 0, and sat on "Updating... 0%" after a SUCCESSFUL
-      // update, with its close button hidden.
-      //
-      // The record can satisfy it: it knows the run finished and how. Only a
-      // success unblocks the old modal — telling it "done" after a rollback
-      // would be a lie it would render as success. A failed update leaves the
-      // device on the version that bundle came from, so a page reload gets the
-      // user out, and the current bundle reports the outcome properly.
-      // Bounded on both sides, because this value LATCHES in the bundle it
-      // serves. That bundle polls at mount with no `skip`, and its `>= 90` check
-      // sits outside its own `if (updateInProgress)` — so a permanent 100 makes
-      // it declare "Done!" five seconds after every mount, for the rest of the
-      // device's life, hiding the Update button behind "Reload App" that
-      // re-serves the same bundle. That is the exact state the record mechanism
-      // was built to end, moved out of the progress file and into the API.
-      //
-      // The record is never cleared, so "succeeded" alone cannot bound it:
-      //  - from !== to, or nothing was installed. The "Already on <version>"
-      //    path records succeeded WITHOUT replacing the UI, so a device that is
-      //    up to date would latch on every poll forever.
-      //  - and recent, because the only legitimate reader is a browser that
-      //    watched this very update and is waiting to be released.
-      //
-      // "Recent" measured MONOTONICALLY, from when this process first saw the
-      // record — not as `Date.now() - record.updatedAt`. That difference spans
-      // two readings of a clock these boards do not keep: they have no RTC, ship
-      // wrong, and the minutes right after an update are exactly when NTP
-      // converges and steps them. A forward step made the record look hours old
-      // and withheld the value from the browser waiting for it; a backward step
-      // made the age negative and did the same. It is the same trap the run_id
-      // exists to avoid, walked into again one layer down.
-      //
-      // The API is restarted BY the update, so the process serving the
-      // pre-update bundle afterwards is a fresh one that meets the record for
-      // the first time right when the browser needs it.
-      const record = await this._readUpdateRecord();
-      if (
-        record &&
-        record.state === 'succeeded' &&
-        record.from &&
-        record.to &&
-        record.from !== record.to
-      ) {
-        // Anchored on having watched this update happen, and anchored on
-        // something THIS method can observe.
-        //
-        // Two wrong anchors preceded it. `Date.now() - record.updatedAt` spans
-        // two readings of a clock these boards do not keep. Then
-        // `_sawUpdateRunning`, set by getUpdateStatus — which closed the window
-        // completely, because the only client this value exists for is the
-        // bundle loaded BEFORE the update, and that bundle knows nothing about
-        // updateStatus: it polls updateProgress and nothing else. The gate could
-        // never be satisfied in the single-tab case, which is the entire point,
-        // so a successful update left that browser on "Updating... 0%" with its
-        // close button hidden — the exact failure this value exists to prevent,
-        // reintroduced by the fix for it being reopenable.
-        //
-        // The progress file is the right anchor: the updater starts apollo-api
-        // at 88 and only removes the file after the health check, so a process
-        // that served this value during that window necessarily watched the run.
-        // An unrelated restart days later never sees the file, so the window
-        // cannot reopen.
-        if (this._sawProgressFile) {
-          const elapsedMs = Number(
-            (process.hrtime.bigint() - this._sawProgressFile) / 1000000n
-          );
-          if (elapsedMs < COMPAT_PROGRESS_WINDOW_MS) return { value: 100 };
-        }
-      }
-
-      return { value: 0 };
+      const raw = await fs.readFile('/tmp/update_progress', 'utf8');
+      const progress = parseInt(raw, 10);
+      return { value: Number.isFinite(progress) ? progress : 0 };
     } catch (error) {
-      console.log('Error getting update progress:', error);
+      if (error.code !== 'ENOENT') {
+        console.log('Error getting update progress:', error.message);
+      }
       return { value: 0 };
     }
   }
+
 
   // Helper method to get OS stats
   async _getOsStats() {

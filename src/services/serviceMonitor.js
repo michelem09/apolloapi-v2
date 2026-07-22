@@ -245,7 +245,20 @@ class ServiceMonitor {
   // This method now respects manual actions (CLI starts/stops) by detecting
   // discrepancies between actual status and requested_status, and updating
   // requested_status to reflect reality instead of fighting user actions.
-  async checkServiceStatus(serviceName) {
+  // `updateInProgress` is passed in, not asked for here.
+  //
+  // This runs once per monitored service — five on a miner, six with solo — and
+  // the answer is identical for all of them within a cycle. Asking per service
+  // meant one `/bin/sh -c` plus one `systemctl` each, every 10 seconds: about
+  // 86,000 process creations a day on an aarch64 SBC, replacing what used to be
+  // a single existsSync. The caller asks once and hands the answer down.
+  // Defaults to false — "as far as the caller knows, no update is running" —
+  // and not to null. null means "could not ask", which correctly SKIPS the whole
+  // manual-action block, and that block also holds the grace-period handling
+  // that keeps a starting service pending and stops ckpool's intent being
+  // poisoned while the node comes up. Defaulting to null therefore disabled
+  // those for every direct caller, which is how an existing test caught it.
+  async checkServiceStatus(serviceName, updateInProgress = false) {
     try {
       // Get database service name
       const dbServiceName = this.getDatabaseServiceName(serviceName);
@@ -348,7 +361,6 @@ class ServiceMonitor {
       // There was briefly a second, module-level copy of this two-liner, and the
       // tests exercised THAT one while production ran this line — four green
       // assertions against code no device executes.
-      const updateInProgress = await this._isSystemdActive(UPDATE_UNIT);
       // `=== false`, not `!updateInProgress`: null means systemd could not be
       // asked, and that must not be read as "no update is running". The updater
       // deliberately stops node and the miner for MINUTES — far outside the 90 s
@@ -631,8 +643,10 @@ class ServiceMonitor {
   // Check all services
   async checkAllServices() {
     try {
+      // Once per cycle, for every service in it.
+      const updateInProgress = await this._isSystemdActive(UPDATE_UNIT);
       const promises = this.systemdServices.map((service) =>
-        this.checkServiceStatus(service)
+        this.checkServiceStatus(service, updateInProgress)
       );
       const results = await Promise.all(promises);
 
@@ -779,8 +793,9 @@ class ServiceMonitor {
   // Get current status of all services
   async getCurrentStatuses() {
     try {
+      const updateInProgress = await this._isSystemdActive(UPDATE_UNIT);
       const promises = this.systemdServices.map((service) =>
-        this.checkServiceStatus(service)
+        this.checkServiceStatus(service, updateInProgress)
       );
       return await Promise.all(promises);
     } catch (error) {

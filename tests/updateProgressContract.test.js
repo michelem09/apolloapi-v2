@@ -28,30 +28,20 @@ describe('update state — the contract its consumers share', () => {
     expect(cleanup).not.toMatch(/echo "-1" > "\$TMPFILE"/);
   });
 
-  it('still lets the pre-update UI bundle finish', () => {
-    // The assertion above, alone, certified a break. Deleting the file is right,
-    // but the file's only consumer is the bundle loaded BEFORE the update — the
-    // one this update replaces — and that bundle completes solely on
-    // `value >= 90`. The updater stops at 88 on purpose (two gates that still
-    // roll everything back come after it) and then removes the file, so that
-    // browser watched 5 -> 88, lost the API, reconnected, read 0, and sat on
-    // "Updating... 0%" after a SUCCESSFUL update with its close button hidden.
+  it('does not try to release the pre-update bundle from the API', () => {
+    // That bundle completes on `value >= 90`; the updater stops at 88 because
+    // two gates that still roll everything back come after it. Four rounds were
+    // spent closing that gap inside getUpdateProgress and every shape traded one
+    // failure for another — the last gated the value on a flag only the NEW
+    // protocol sets, which the old bundle does not know exists, so the path was
+    // closed entirely while two assertions here pinned it by name and passed.
     //
-    // The record closes it, because it knows the run ended AND how. Asserted on
-    // the API, since that is where the compatibility now lives.
+    // It reports live progress and nothing else now. A pre-update browser needs
+    // one reload after the first tarball update, once per device.
     const mcu = read('src', 'services', 'mcu.js');
     const method = mcu.match(/async getUpdateProgress\(\) \{[\s\S]*?\n {2}\}/)[0];
-    expect(method).toContain('_readUpdateRecord');
-    // The behaviour is covered by tests/mcu.updateProgress.test.js, which drives
-    // the method instead of reading it. Two source-text assertions used to live
-    // here pinning the gate by name; when that gate was changed to one the old
-    // bundle can never satisfy — it polls updateProgress and knows nothing about
-    // updateStatus — they kept passing, so CI certified the break.
-    expect(method).toMatch(/state === 'succeeded'.*\{ value: 100 \}/s);
-    // Only a success. Reporting 100 for a rollback would make that bundle render
-    // "Done!" for an update that was reverted.
-    expect(method).not.toMatch(/state !== 'succeeded'.*\{ value: 100 \}/s);
-    // And exactly one definition of it, in a class body where the last wins.
+    expect(method).not.toContain('_readUpdateRecord');
+    // Exactly one definition, in a class body where the last one wins.
     expect(mcu.match(/async getUpdateProgress\(/g)).toHaveLength(1);
     expect(mcu.match(/async update\(/g)).toHaveLength(1);
   });

@@ -112,8 +112,32 @@ describe('serviceMonitor update-in-progress detection', () => {
     expect(src).not.toContain("_isSystemdActive('node')");
     expect(src).toContain("const nodeStatus = await this._systemctlStatus('node');");
     expect(src).toContain("nodeStatus !== 'active'");
-    // One caller left, and it is the one the broadening was for.
-    expect(src.match(/_isSystemdActive\(/g)).toHaveLength(2); // definition + call
+    // The only remaining callers are the two cycle entry points, which is what
+    // the broadening was for.
+    expect(src.match(/_isSystemdActive\(UPDATE_UNIT\)/g)).toHaveLength(2);
+  });
+
+  it('asks systemd once per cycle, not once per service', () => {
+    // checkServiceStatus runs per monitored service — five on a miner — and the
+    // answer is identical for all of them within a cycle. Asking inside it meant
+    // a /bin/sh plus a systemctl each, every 10 seconds: ~86,000 process
+    // creations a day on an SBC, in place of a single existsSync.
+    // eslint-disable-next-line global-require
+    const src = require('fs').readFileSync(
+      require('path').join(__dirname, '..', 'src', 'services', 'serviceMonitor.js'),
+      'utf8'
+    );
+    const perService = src.match(/async checkServiceStatus\(serviceName, updateInProgress = false\)/);
+    expect(perService).not.toBeNull();
+    // The value is handed down, never re-derived inside the per-service path.
+    const body = src.slice(
+      src.indexOf('async checkServiceStatus(serviceName'),
+      src.indexOf('async checkServiceStatusDevelopment')
+    );
+    expect(body).not.toContain('_isSystemdActive(UPDATE_UNIT)');
+    // And the default is the conservative one: unknown must not be read as
+    // "no update is running".
+    expect(body).toContain('if (existing && updateInProgress === false) {');
   });
 
   it('does not keep a second, untested copy of the check', () => {
