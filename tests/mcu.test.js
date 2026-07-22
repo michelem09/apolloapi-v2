@@ -200,9 +200,15 @@ describe('MCU API', () => {
 
   describe('Mcu.version resolver', () => {
     it('should return application version', async () => {
-      // Mock MCU service
+      // getVersion now reports both sides: what the device runs, and what the
+      // signed update channel offers. Comparing the two is what decides whether
+      // an update is announced, so they have to travel together.
       const mockMcuService = {
-        getVersion: jest.fn().mockResolvedValue('2.1.0')
+        getVersion: jest.fn().mockResolvedValue({
+          result: '2.2.1',
+          installed: '2.2.0',
+          available: '2.2.1',
+        })
       };
 
       // Test resolver directly
@@ -212,7 +218,9 @@ describe('MCU API', () => {
         { services: { mcu: mockMcuService }, isAuthenticated: true }
       );
 
-      expect(result.result).toBe('2.1.0');
+      expect(result.result).toBe('2.2.1');
+      expect(result.installed).toBe('2.2.0');
+      expect(result.available).toBe('2.2.1');
       expect(result.error).toBeNull();
     });
 

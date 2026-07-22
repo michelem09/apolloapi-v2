@@ -153,29 +153,86 @@ class McuService {
     }
   }
 
-  // Get application version
-  async getVersion() {
-    try {
-      // First try to get remote version
-      const gitAppVersion = await axios.get(
-        `https://raw.githubusercontent.com/jstefanop/apolloui-v2/${process.env.NODE_ENV === 'development' ? 'dev' : 'main'
-        }/package.json`
-      );
+  // What this device is running.
+  //
+  // version.json is written by the updater from the release it installed, so it is
+  // the only file that reflects what actually happened. package.json is the
+  // fallback for a device that has never taken a tarball update.
+  _installedVersion() {
+    const root = join(__dirname, '..', '..');
+    for (const file of ['version.json', 'package.json']) {
+      try {
+        // eslint-disable-next-line global-require, import/no-dynamic-require
+        const parsed = require(join(root, file));
+        if (parsed && parsed.version) return parsed.version;
+      } catch (error) {
+        // try the next one
+      }
+    }
+    return null;
+  }
 
-      if (gitAppVersion && gitAppVersion.data) {
-        return gitAppVersion.data.version;
+  // Where the updater fetches from, read exactly as backend/update reads it so the
+  // two can never disagree about which channel this device is on.
+  async _channelUrl() {
+    const defaults = { base: 'https://github.com/jstefanop', repo: 'apolloapi-v2', channel: 'stable' };
+    let conf = {};
+    try {
+      const raw = await fs.readFile(join(getStateDir(), 'source.conf'), 'utf8');
+      for (const line of raw.split('\n')) {
+        const match = line.match(/^\s*(APOLLO_[A-Z_]+)=(.*)$/);
+        if (match) conf[match[1]] = match[2].trim().replace(/^["']|["']$/g, '');
       }
     } catch (error) {
-      console.log('Failed to get remote version, falling back to local version:', error.message);
+      // No source.conf: this device has not been switched yet, use the defaults.
     }
+    const base = conf.APOLLO_GIT_BASE || defaults.base;
+    const repo = conf.APOLLO_API_REPO || defaults.repo;
+    const channel = conf.APOLLO_CHANNEL || defaults.channel;
+    return `${base}/${repo}/releases/download/channel-${channel}/${channel}.json`;
+  }
 
-    // If remote version fails, return local version
-    try {
-      const localPackageJson = require('../../package.json');
-      return localPackageJson.version;
-    } catch (error) {
-      throw new GraphQLError(`Failed to get application version: ${error.message}`);
+  // The version this device could install, taken from the signed update channel —
+  // the same manifest backend/update gates on.
+  //
+  // It used to come from jstefanop/apolloui-v2@main/package.json over plain HTTP:
+  // a different source from the one the updater installs against, unsigned, and
+  // unrelated to the release. The banner and the OTA channel could never agree,
+  // and on a device pointed at a fork the comparison never converged at all, so
+  // the update button was either permanently offered or never shown.
+  //
+  // Null when the channel cannot be reached: offering an update we cannot name is
+  // worse than staying quiet.
+  async _availableVersion() {
+    const now = Date.now();
+    if (this._versionCache && now - this._versionCache.at < 5 * 60 * 1000) {
+      return this._versionCache.value;
     }
+    let value = null;
+    try {
+      const url = await this._channelUrl();
+      const response = await axios.get(url, { timeout: 15000 });
+      if (response && response.data && typeof response.data.version === 'string') {
+        value = response.data.version;
+      }
+    } catch (error) {
+      console.log('Could not read the update channel:', error.message);
+    }
+    this._versionCache = { at: now, value };
+    return value;
+  }
+
+  // Get application version
+  async getVersion() {
+    const installed = this._installedVersion();
+    const available = await this._availableVersion();
+    return {
+      // `result` keeps its old meaning — the version out there — so a browser
+      // still running an older UI bundle keeps working during the swap.
+      result: available || installed,
+      installed,
+      available,
+    };
   }
 
   // Update firmware

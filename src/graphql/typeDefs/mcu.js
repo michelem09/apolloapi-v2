@@ -126,7 +126,16 @@ module.exports = gql`
   }
 
   type McuAppVersionOutput {
+    """
+    The version available to install, from the signed update channel. Keeps the
+    name 'result' so a browser still running an older UI bundle goes on working
+    while the two halves are swapped.
+    """
     result: String
+    "What this device is actually running, from the release it installed."
+    installed: String
+    "What the update channel offers, or null when it cannot be reached."
+    available: String
     error: Error
   }
 
