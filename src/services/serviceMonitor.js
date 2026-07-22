@@ -414,8 +414,18 @@ class ServiceMonitor {
           // its requested_status to offline — that would poison the ExecCondition
           // and keep ckpool from ever starting again. Node startup can exceed
           // the start grace period, so this is checked independently of it.
-          const blockedOnNode =
-            dbServiceName === 'solo' && !(await this._isSystemdActive('node'));
+          // Strictly `active`, deliberately not via _isSystemdActive.
+          //
+          // That helper was broadened to count `activating` as running, which is
+          // right for the update unit and wrong here: node.service's
+          // ExecCondition window is exactly when it is activating, and reading
+          // that as "the node is up" removes the protection this branch exists
+          // for — flipping ckpool's requested_status to offline, which poisons
+          // its own ExecCondition and keeps it from ever starting again. `null`
+          // (systemd unreachable) also lands here as "not active", which is the
+          // conservative direction: do not touch the user's intent.
+          const nodeStatus = await this._systemctlStatus('node');
+          const blockedOnNode = dbServiceName === 'solo' && nodeStatus !== 'active';
 
           if ((isWithinStartGracePeriod && wasStarting) || blockedOnNode) {
             // Still starting, or waiting on the node - don't interfere.

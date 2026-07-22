@@ -98,6 +98,24 @@ describe('serviceMonitor update-in-progress detection', () => {
     expect(src).not.toContain('if (existing && !updateInProgress) {');
   });
 
+  it('is the only caller that treats activating as running', () => {
+    // Broadening _isSystemdActive was right for the update unit and changed two
+    // other call sites in silence. node.service's ExecCondition window IS its
+    // activating window, and reading that as "the node is up" removes the guard
+    // that stops ckpool's requested_status being flipped to offline — which
+    // poisons its own ExecCondition and keeps it from ever starting again.
+    // eslint-disable-next-line global-require
+    const src = require('fs').readFileSync(
+      require('path').join(__dirname, '..', 'src', 'services', 'serviceMonitor.js'),
+      'utf8'
+    );
+    expect(src).not.toContain("_isSystemdActive('node')");
+    expect(src).toContain("const nodeStatus = await this._systemctlStatus('node');");
+    expect(src).toContain("nodeStatus !== 'active'");
+    // One caller left, and it is the one the broadening was for.
+    expect(src.match(/_isSystemdActive\(/g)).toHaveLength(2); // definition + call
+  });
+
   it('does not keep a second, untested copy of the check', () => {
     // The defect this file was rewritten against: the shipped path and the tested
     // path were different functions.

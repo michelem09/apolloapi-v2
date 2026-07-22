@@ -285,13 +285,6 @@ class McuService {
     const active = await this._updateUnitActive();
     const record = await this._readUpdateRecord();
 
-    // Remember that THIS process watched this run be alive. It is what lets the
-    // compatibility progress value be offered only to a browser that was here
-    // for the update, instead of to anyone who happens to poll after a restart.
-    if (active === true && record && record.runId) {
-      this._sawUpdateRunning = record.runId;
-    }
-
     // Only a definite "the unit is gone" may contradict a record that says the
     // run is alive. `null` means systemd could not be asked, and rewriting a live
     // run to a terminal state on the strength of a failed fork is how a healthy
@@ -400,26 +393,27 @@ class McuService {
   // Get update progress
   async getUpdateProgress() {
     try {
-      // Check if the progress file exists
+      // Read it, rather than testing for it first and then reading it: two
+      // syscalls where one does, and one of them depended on `fs.constants`,
+      // which the promises API does not expose everywhere it is assumed to. A
+      // missing file is the ordinary case here, not an error.
       const filePath = '/tmp/update_progress';
-      let fileExists = true;
-
+      let raw = null;
       try {
-        await fs.access(filePath, fs.constants.F_OK);
+        raw = await fs.readFile(filePath, 'utf8');
       } catch (error) {
-        if (error.code === 'ENOENT') {
-          // File doesn't exist
-          console.log('update_progress file not found. Returning default progress.');
-          fileExists = false;
-        } else {
-          throw error;
-        }
+        if (error.code !== 'ENOENT') throw error;
       }
 
-      if (fileExists) {
-        const data = await fs.readFile(filePath);
-        const progress = parseInt(data.toString(), 10);
-        if (Number.isFinite(progress)) return { value: progress };
+      if (raw !== null) {
+        const progress = parseInt(raw, 10);
+        if (Number.isFinite(progress)) {
+          // This process watched the update happen. Remembered HERE, in the
+          // method the old bundle actually calls, because that is the only
+          // observation available to it — see the gate below.
+          this._sawProgressFile = process.hrtime.bigint();
+          return { value: progress };
+        }
       }
 
       // The file is gone, so the run is over — but this query exists for one
@@ -475,23 +469,28 @@ class McuService {
         record.to &&
         record.from !== record.to
       ) {
-        // Anchored on having seen the run LIVE, not on first noticing its
-        // record. `_compatSeen` lives on this singleton, so anchoring on first
-        // observation reopened the window on every unrelated apollo-api restart
-        // — a crash, a manual restart, a reboot, days later — and served 100
-        // again for ten minutes each time.
+        // Anchored on having watched this update happen, and anchored on
+        // something THIS method can observe.
         //
-        // `_sawUpdateRunning` is set by getUpdateStatus while the unit is up, so
-        // the value is only ever offered to a process that actually watched this
-        // update happen. That is exactly the process serving the pre-update
-        // bundle, because the updater restarts the API before the browser
-        // reconnects.
-        if (this._sawUpdateRunning === record.runId) {
-          if (!this._compatSeen || this._compatSeen.runId !== record.runId) {
-            this._compatSeen = { runId: record.runId, at: process.hrtime.bigint() };
-          }
+        // Two wrong anchors preceded it. `Date.now() - record.updatedAt` spans
+        // two readings of a clock these boards do not keep. Then
+        // `_sawUpdateRunning`, set by getUpdateStatus — which closed the window
+        // completely, because the only client this value exists for is the
+        // bundle loaded BEFORE the update, and that bundle knows nothing about
+        // updateStatus: it polls updateProgress and nothing else. The gate could
+        // never be satisfied in the single-tab case, which is the entire point,
+        // so a successful update left that browser on "Updating... 0%" with its
+        // close button hidden — the exact failure this value exists to prevent,
+        // reintroduced by the fix for it being reopenable.
+        //
+        // The progress file is the right anchor: the updater starts apollo-api
+        // at 88 and only removes the file after the health check, so a process
+        // that served this value during that window necessarily watched the run.
+        // An unrelated restart days later never sees the file, so the window
+        // cannot reopen.
+        if (this._sawProgressFile) {
           const elapsedMs = Number(
-            (process.hrtime.bigint() - this._compatSeen.at) / 1000000n
+            (process.hrtime.bigint() - this._sawProgressFile) / 1000000n
           );
           if (elapsedMs < COMPAT_PROGRESS_WINDOW_MS) return { value: 100 };
         }

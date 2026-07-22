@@ -42,11 +42,11 @@ describe('update state — the contract its consumers share', () => {
     const mcu = read('src', 'services', 'mcu.js');
     const method = mcu.match(/async getUpdateProgress\(\) \{[\s\S]*?\n {2}\}/)[0];
     expect(method).toContain('_readUpdateRecord');
-    // Offered only to a process that watched this run be alive. Anchoring the
-    // window on first noticing the record reopened it on every unrelated
-    // apollo-api restart, days later, indefinitely.
-    expect(method).toContain('this._sawUpdateRunning === record.runId');
-    expect(mcu).toContain('this._sawUpdateRunning = record.runId;');
+    // The behaviour is covered by tests/mcu.updateProgress.test.js, which drives
+    // the method instead of reading it. Two source-text assertions used to live
+    // here pinning the gate by name; when that gate was changed to one the old
+    // bundle can never satisfy — it polls updateProgress and knows nothing about
+    // updateStatus — they kept passing, so CI certified the break.
     expect(method).toMatch(/state === 'succeeded'.*\{ value: 100 \}/s);
     // Only a success. Reporting 100 for a rollback would make that bundle render
     // "Done!" for an update that was reverted.
