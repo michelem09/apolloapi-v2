@@ -28,7 +28,7 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=78
+EXPECTED_ASSERTIONS=82
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -747,6 +747,47 @@ lines, a "quote", a backslash \ and a tab	here'
     "$([ -f "$(saved_marker "$BACKUP_CODE" src)" ] && echo yes || echo no)" "yes"
   check "and the backup copy is complete" \
     "$(cat "$BACKUP_CODE/src/marker" 2>/dev/null)" "OLD"
+  rm -rf "$ROOT"
+)
+
+
+# --- an atomic rename interrupted before its marker ---------------------------
+# On ONE filesystem — which is the device's real configuration, /opt/apolloapi
+# and /var/lib/apollo on the same root partition — `mv` is a rename: it either
+# happened or it did not. Interrupted between the rename and the marker, the tree
+# is complete in the backup, unmarked, and gone from the device. The first
+# marker-based version deleted the backup on the no-marker path, destroying the
+# only copy from both places — a regression against the `[ -e ]` test it
+# replaced, on the main path rather than an edge case.
+(
+  make_device
+  claim_backup
+  echo 'ONLY-COPY' > "$APOLLO_ROOT_DIR/src/precious"
+  mv "$APOLLO_ROOT_DIR/src" "$BACKUP_CODE/src"     # the rename, then the crash
+  check "the backup is the only copy" \
+    "$([ -e "$BACKUP_CODE/src" ] && [ ! -e "$APOLLO_ROOT_DIR/src" ] && echo yes || echo no)" "yes"
+  check "and it carries no marker" \
+    "$([ -f "$(saved_marker "$BACKUP_CODE" src)" ] && echo yes || echo no)" "no"
+
+  restore_code >/dev/null 2>&1
+  check "an unverified backup is used when nothing else is left" \
+    "$(cat "$APOLLO_ROOT_DIR/src/precious" 2>/dev/null)" "ONLY-COPY"
+  rm -rf "$ROOT"
+)
+
+# --- restore_entry does not depend on its caller's frame ----------------------
+# It was nested inside restore_code, leaking into the shell afterwards while
+# reading `b` and `complete` through dynamic scope. This suite is precisely the
+# caller that reaches it without that frame.
+(
+  make_device
+  claim_backup
+  save_entry src
+  : > "$BACKUP_CODE/.complete"
+  rm -rf "$APOLLO_ROOT_DIR/src"
+  restore_entry "$BACKUP_CODE" 1 src
+  check "restore_entry works standalone, from its arguments" \
+    "$(cat "$APOLLO_ROOT_DIR/src/marker" 2>/dev/null)" "OLD"
   rm -rf "$ROOT"
 )
 

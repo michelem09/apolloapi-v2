@@ -385,8 +385,20 @@ jobs:
           # the channel: workflow green, artifact signed, pointer never moved, no
           # device ever offered it. Sourcing the updater makes agreement
           # structural instead of aspirational.
+          # The comparison and nothing else. Sourcing backend/update itself also
+          # applied `set -Eeuo pipefail` to the rest of this step and ran that
+          # script's top-level code — /dev/urandom, /etc/apollo/update.conf, a
+          # state dir the runner does not have — so any future addition to it
+          # would have silently changed how releases are published.
           # shellcheck disable=SC1091
-          APOLLO_UPDATE_LIB=1 source backend/update
+          source backend/lib/version.sh
+
+          # stderr, and never called from inside a command substitution: `$( )`
+          # captures stdout, so an `::error::` written there landed in the
+          # variable instead of the log and the step failed with nothing said
+          # about why — on a transient 5xx during a release, which is precisely
+          # when the maintainer needs to be told.
+          die_step() { echo "::error::$*" >&2; exit 1; }
 
           read_pointer() {
             # Absent is not the same as unreadable. A first release legitimately
@@ -398,12 +410,14 @@ jobs:
               return 0
             fi
             rm -f current-channel.json
+            # An unreadable pointer is not an absent one: swallowing the failure
+            # disabled the guard on exactly the runs where two releases are in
+            # flight. Reported through the exit status, because the caller reads
+            # this function's stdout.
             gh release download "$POINTER" --pattern "${CHANNEL}.json" \
-              --output current-channel.json \
-              || die_step "could not read the current ${CHANNEL} pointer"
+              --output current-channel.json || return 1
             jq -r '.version // empty' current-channel.json
           }
-          die_step() { echo "::error::$*"; exit 1; }
 
           # Compare-and-set, retried, because releases are only serialised per
           # tag: two tags pushed a minute apart — the working pattern this branch
@@ -413,7 +427,8 @@ jobs:
           # whoever is newest keeps re-uploading until it sticks, and whoever is
           # older stops as soon as it sees something newer.
           for attempt in 1 2 3; do
-            CURRENT_POINTER="$(read_pointer)"
+            CURRENT_POINTER="$(read_pointer)" \
+              || die_step "could not read the current ${CHANNEL} pointer"
             if [ -n "$CURRENT_POINTER" ] && [ "$CURRENT_POINTER" != "$VERSION" ] \
                && ! version_gt "$VERSION" "$CURRENT_POINTER"; then
               echo "::notice::channel ${CHANNEL} points at ${CURRENT_POINTER}, which is not older than ${VERSION} — leaving it alone"
@@ -423,7 +438,8 @@ jobs:
             gh release upload "$POINTER" "${CHANNEL}.json" --clobber
             sleep 5
 
-            SETTLED="$(read_pointer)"
+            SETTLED="$(read_pointer)" \
+              || die_step "could not re-read the ${CHANNEL} pointer after writing"
             if [ "$SETTLED" = "$VERSION" ]; then
               echo "channel manifest now points at ${VERSION}"
               exit 0

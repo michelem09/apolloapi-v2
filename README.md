@@ -96,12 +96,21 @@ sudo bash backend/utils/image_update_solo-node
 
 Notes:
 
-- `backend/update` preserves device settings and runtime credentials, then reboots.
+- `backend/update` downloads a signed release, verifies its checksum and cosign
+  signature, swaps the code in place and restarts the services. It preserves
+  device settings and runtime credentials, and it does **not** reboot — an
+  operator waiting for one, or pulling power because "it should have rebooted by
+  now", would interrupt the swap.
+- A failed update rolls itself back and records the outcome in
+  `/var/lib/apollo/last-update.json`, which the UI reports. `recovery-failed` is
+  the only outcome that needs someone to log in.
 - The `image_update*` scripts are intentionally destructive factory tools. They
   erase the database and runtime credentials, leave services stopped, and must
   never be run on a deployed customer device.
-- All update paths assume the install lives at `/opt/apolloapi` and may use
-  `git reset --hard`.
+- All update paths assume the install lives at `/opt/apolloapi`. The legacy
+  `install-v2` / `image_update` scripts still use `git reset --hard`;
+  `backend/update` does not — it replaces the directories the release owns and
+  keeps a backup under `/var/lib/apollo/backups` to roll back to.
 
 ## Production Services
 

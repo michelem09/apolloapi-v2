@@ -296,49 +296,11 @@ sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
 
 # Semver-aware. `sort -V` is not: it orders 2.2.0-rc1 ABOVE 2.2.0, which would
 # leave every beta device thinking it is already up to date.
-version_gt() {  # $1 > $2 ?
-  local a="$1" b="$2" ac bc ap bp i x y
-  ac="${a%%-*}"; bc="${b%%-*}"
-  [ "$a" = "$ac" ] && ap='' || ap="${a#*-}"
-  [ "$b" = "$bc" ] && bp='' || bp="${b#*-}"
-  local -a A B; IFS=. read -ra A <<<"$ac"; IFS=. read -ra B <<<"$bc"
-  for i in 0 1 2; do
-    x=$((10#${A[i]:-0})); y=$((10#${B[i]:-0}))
-    [ "$x" -gt "$y" ] && return 0
-    [ "$x" -lt "$y" ] && return 1
-  done
-  # Cores equal: a release outranks any prerelease of the same core.
-  [ -z "$ap" ] && [ -n "$bp" ] && return 0
-  [ -n "$ap" ] && [ -z "$bp" ] && return 1
-  [ "$ap" = "$bp" ] && return 1
-
-  local na nb
-  na="$(normalize_prerelease "$ap")"
-  nb="$(normalize_prerelease "$bp")"
-  [ "$na" = "$nb" ] && return 1
-  # LC_ALL=C, because collation is locale-dependent: without it two devices in
-  # different locales could reach opposite conclusions about the same pair.
-  local LC_ALL=C
-  [[ "$na" > "$nb" ]]
-}
-
-# Zero-pads every run of digits so a plain lexical compare orders them naturally:
-# rc9 -> rc0000000009, rc10 -> rc0000000010.
-#
-# This is a DELIBERATE deviation from semver §11, which compares alphanumeric
-# identifiers lexically and therefore ranks rc10 BELOW rc9 — formally correct and
-# certainly not what anyone means. Strict semver only gets this right when the
-# number is its own dot-separated field (rc.10), which is not how these tags are
-# written. Comparing lexically without the padding left every beta device stuck
-# at rc9 and, in the other direction, accepting rc2 over rc10 as an "upgrade".
-normalize_prerelease() {
-  local s="$1" out=''
-  while [[ "$s" =~ ^([^0-9]*)([0-9]+)(.*)$ ]]; do
-    out="$out${BASH_REMATCH[1]}$(printf '%010d' "$((10#${BASH_REMATCH[2]}))")"
-    s="${BASH_REMATCH[3]}"
-  done
-  printf '%s%s' "$out" "$s"
-}
+# Version ordering lives in backend/lib/version.sh, shared verbatim with the
+# release workflow so the thing that decides what may be OFFERED and the thing
+# that decides what may be INSTALLED cannot drift apart.
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/lib/version.sh"
 
 # grep tests each LINE, so a multi-line value passes as long as ONE of its lines
 # matches — which defeated the numeric check on the manifest's size field: a value
@@ -753,14 +715,74 @@ start_services() {
   systemctl start apollo-api.service apollo-ui-v2.service || true
   systemctl start node.service apollo-miner.service || true
   # The API is the one that decides whether this device can be reached at all —
-  # including to retry the update. Give it a moment: a start is asynchronous.
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  # including to retry the update. But it cannot become active until
+  # apollo-bootstrap has, because it declares Requires= on it, and bootstrap is a
+  # oneshot that runs the knex migrations. On the rollback path the database has
+  # just been restored and those migrations re-run against it; on a device with
+  # thirty days of time-series on eMMC that is comfortably more than the twenty
+  # seconds this first waited — which turned a device that was fine a moment
+  # later into "SERVICES DID NOT COME BACK, this needs manual recovery over SSH".
+  #
+  # Same budget as the health check, for the same reason.
+  local waited=0 limit="${APOLLO_RESTART_TIMEOUT:-$HEALTH_TIMEOUT}"
+  while [ "$waited" -lt "$limit" ]; do
     systemctl is-active --quiet apollo-api.service && return 0
-    sleep 2
+    # A bootstrap still running is progress, not a stall: say so rather than
+    # letting the log look like nothing is happening.
+    if [ $(( waited % 20 )) -eq 0 ] && systemctl is-active --quiet apollo-bootstrap.service; then
+      err "Waiting for apollo-bootstrap (migrations) before the API can start"
+    fi
+    sleep 2; waited=$(( waited + 2 ))
   done
-  err "apollo-api did not come back after restarting services"
+  err "apollo-api did not come back within ${limit}s after restarting services"
   return 1
+}
+
+# Put one entry back, deciding from the marker rather than from the mere presence
+# of a directory — and never deleting the only copy that exists.
+#
+# Taking b and complete as parameters, not reading them from an enclosing frame:
+# this used to be nested inside restore_code, so it leaked into the shell after
+# that returned while its two most important inputs resolved through bash's
+# dynamic scope. The test suite sources this file and drives these functions
+# directly, which is exactly the caller that reaches it without the frame — with
+# `b` empty, `rm -rf "${b:?}/$rel"` is the only thing between that and disaster.
+restore_entry() {  # backup_dir complete relative_path
+  local b="$1" complete="$2" rel="$3" live mark
+  live="$APOLLO_DIR/$rel"
+  mark="$(saved_marker "$b" "$rel")"
+
+  if [ -e "$b/$rel" ]; then
+    # Marked, or the last copy standing. The second case is what the marker alone
+    # got wrong: on ONE filesystem `mv` is an atomic rename, so an interruption
+    # between the rename and the marker leaves the tree complete in the backup,
+    # unmarked, and gone from the device — and the previous version's first act
+    # on the no-marker path was to delete the backup, destroying it from both
+    # places. That is the device's real configuration, not an edge case, and it
+    # was a regression against the `[ -e ]` test it replaced.
+    if [ -f "$mark" ] || [ ! -e "$live" ]; then
+      [ -f "$mark" ] || err "Backup of $rel is unverified, but it is the only copy left"
+      rm -rf "$live" || return 1
+      mkdir -p "$(dirname "$live")" || return 1
+      mv "$b/$rel" "$live" || return 1
+      return 0
+    fi
+    # Unmarked with the live copy still present: across filesystems `mv` is
+    # copy-then-delete, so this is a half-written copy made while the original
+    # stayed intact. The live one is already the previous version.
+    err "No complete backup of $rel; keeping the live copy"
+    rm -rf "${b:?}/$rel" 2>/dev/null || true
+    return 0
+  fi
+
+  # Nothing in the backup. With a COMPLETE backup that means the entry did not
+  # exist before the update, so whatever is there now came from the release and
+  # goes — the same rule ROOT_FILES and the units already used. With an
+  # incomplete one it means the save never reached it, so the live copy stands.
+  if [ "$complete" -eq 1 ]; then
+    rm -rf "$live" 2>/dev/null || true
+  fi
+  return 0
 }
 
 restore_code() {
@@ -787,47 +809,8 @@ restore_code() {
   local rc=0 d f
   restore_database || rc=1
 
-  # The marker, not the presence of a directory, decides.
-  #
-  # `[ -e "$b/$d" ]` cannot tell a finished copy from a half-written one, and the
-  # heuristic that replaced it — "the live copy still being there proves the
-  # backup is partial" — reasons only about the COPY half of a cross-filesystem
-  # mv. During the DELETE half the backup is already complete while the live tree
-  # is being truncated, and that heuristic then keeps the truncated tree and
-  # deletes the only good copy, returning 0 so the run records a clean
-  # "rolled-back". save_entry writes the marker between the two halves precisely
-  # so nothing here has to guess.
-  restore_entry() {  # relative path
-    local rel="$1" live="$APOLLO_DIR/$1" mark
-    mark="$(saved_marker "$b" "$rel")"
-    if [ -f "$mark" ]; then
-      rm -rf "$live" || return 1
-      mkdir -p "$(dirname "$live")" || return 1
-      mv "$b/$rel" "$live" || return 1
-      return 0
-    fi
-    # No marker: this entry is not in the backup in a usable state. Which of the
-    # two reasons decides what to do, and only `.complete` can tell them apart —
-    # the same rule ROOT_FILES and the units already used.
-    rm -rf "${b:?}/$rel" 2>/dev/null || true
-    if [ "$complete" -eq 1 ]; then
-      # The backup finished and never saved this: it did not exist before the
-      # update. Anything here now was put there by the release, so it goes —
-      # otherwise a rollback leaves the NEW UI bundle serving against the
-      # RESTORED backend. Absent from both is simply nothing to do; the old code
-      # called that a lost tree and raised recovery-failed, telling the user to
-      # find someone with SSH over a directory that had never been there.
-      rm -rf "$live" 2>/dev/null || true
-    elif [ -e "$live" ]; then
-      # The backup was interrupted before reaching this entry, so the live copy
-      # was never moved and is already the previous version.
-      err "No complete backup of $rel; keeping the live copy"
-    fi
-    return 0
-  }
-
-  for d in $OWNED; do restore_entry "$d" || rc=1; done
-  restore_entry "apolloui-v2/.next" || rc=1
+  for d in $OWNED; do restore_entry "$b" "$complete" "$d" || rc=1; done
+  restore_entry "$b" "$complete" "apolloui-v2/.next" || rc=1
 
   for f in $ROOT_FILES; do
     if [ -e "$b/$f" ]; then

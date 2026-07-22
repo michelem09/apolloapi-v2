@@ -9,7 +9,8 @@ const { getStateDir } = require('../paths');
 // Convert exec to use promises
 const execPromise = util.promisify(exec);
 
-// How long after an update finished the compatibility value stays available.
+// How long after this process first sees a finished update the compatibility
+// value stays available.
 //
 // Only a browser that watched THIS update can legitimately be waiting for it,
 // and that browser polls every three seconds. Ten minutes is generous for a
@@ -312,12 +313,19 @@ class McuService {
   async _updateUnitActive() {
     try {
       const { stdout } = await execPromise('systemctl is-active apollo-update.service');
-      return stdout.trim() === 'active';
+      const state = stdout.trim();
+      return state === 'active' || state === 'activating';
     } catch (error) {
-      if (error && (error.code === 3 || error.code === 4)) return false;
+      // What systemd SAID first, then the exit code. The other order made the
+      // `activating` case unreachable — is-active exits 3 for it, so the code
+      // check always fired first — while the success path above classified
+      // `activating` as not running. Two opposite intentions for one state, and
+      // neither exercised. A transient unit is `activating` only momentarily,
+      // but during that moment the run is very much alive.
       const said = (error && error.stdout ? String(error.stdout) : '').trim();
-      if (said === 'inactive' || said === 'failed' || said === 'unknown') return false;
-      if (said === 'active' || said === 'activating') return true;
+      if (said === 'active' || said === 'activating' || said === 'reloading') return true;
+      if (said === 'inactive' || said === 'failed' || said === 'deactivating') return false;
+      if (error && (error.code === 3 || error.code === 4)) return false;
       return null;
     }
   }
@@ -436,6 +444,19 @@ class McuService {
       //    up to date would latch on every poll forever.
       //  - and recent, because the only legitimate reader is a browser that
       //    watched this very update and is waiting to be released.
+      //
+      // "Recent" measured MONOTONICALLY, from when this process first saw the
+      // record — not as `Date.now() - record.updatedAt`. That difference spans
+      // two readings of a clock these boards do not keep: they have no RTC, ship
+      // wrong, and the minutes right after an update are exactly when NTP
+      // converges and steps them. A forward step made the record look hours old
+      // and withheld the value from the browser waiting for it; a backward step
+      // made the age negative and did the same. It is the same trap the run_id
+      // exists to avoid, walked into again one layer down.
+      //
+      // The API is restarted BY the update, so the process serving the
+      // pre-update bundle afterwards is a fresh one that meets the record for
+      // the first time right when the browser needs it.
       const record = await this._readUpdateRecord();
       if (
         record &&
@@ -444,9 +465,12 @@ class McuService {
         record.to &&
         record.from !== record.to
       ) {
-        const finishedAt = Date.parse(record.updatedAt || '');
-        const age = Number.isNaN(finishedAt) ? Infinity : Date.now() - finishedAt;
-        if (age >= 0 && age < COMPAT_PROGRESS_WINDOW_MS) return { value: 100 };
+        const now = process.hrtime.bigint();
+        if (!this._compatSeen || this._compatSeen.runId !== record.runId) {
+          this._compatSeen = { runId: record.runId, at: now };
+        }
+        const elapsedMs = Number((now - this._compatSeen.at) / 1000000n);
+        if (elapsedMs < COMPAT_PROGRESS_WINDOW_MS) return { value: 100 };
       }
 
       return { value: 0 };

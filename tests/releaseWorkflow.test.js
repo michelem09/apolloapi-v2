@@ -44,7 +44,10 @@ describe('release workflow', () => {
       // using `sort -V`, which ranks a prerelease ABOVE its release, under a
       // comment asserting parity — so the first rc→final sequence would have
       // frozen the channel silently.
-      expect(step).toContain('APOLLO_UPDATE_LIB=1 source backend/update');
+      expect(step).toContain('source backend/lib/version.sh');
+      // NOT backend/update: sourcing that applied its `set -Eeuo pipefail` to the
+      // rest of the CI step and executed its top-level code on the runner.
+      expect(step).not.toContain('source backend/update');
       expect(step).toContain('version_gt "$VERSION" "$CURRENT_POINTER"');
       expect(step).not.toMatch(/sort -V[^\n]*tail/);
     });
@@ -55,7 +58,7 @@ describe('release workflow', () => {
       const ask = (a, b) =>
         execFileSync(
           'bash',
-          ['-c', `APOLLO_UPDATE_LIB=1 source backend/update; version_gt "${a}" "${b}" && echo yes || echo no`],
+          ['-c', `source backend/lib/version.sh; version_gt "${a}" "${b}" && echo yes || echo no`],
           { cwd: repo, encoding: 'utf8' }
         ).trim();
 
