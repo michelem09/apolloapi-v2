@@ -28,7 +28,7 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=47
+EXPECTED_ASSERTIONS=51
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -225,11 +225,11 @@ EOF
 # even backend/update remained to retry with.
 (
   make_device
+  # The real flow: the run claims its backup, then backup_code moves the owned
+  # directories one at a time. Simulate it aborting after src/ and config/ — the
+  # .complete marker is never written.
+  claim_backup
   preserve_binaries
-  # Simulate backup_code aborting after src/ and config/: no .complete marker.
-  BACKUP_CODE="$APOLLO_STATE_DIR/backups/code-pre-partial"
-  mkdir -p "$BACKUP_CODE"
-  printf '%s\n' "$BACKUP_CODE" > "$APOLLO_STATE_DIR/backups/.last-code-backup"
   mv "$APOLLO_ROOT_DIR/src" "$BACKUP_CODE/src"
   mv "$APOLLO_ROOT_DIR/config" "$BACKUP_CODE/config"
   echo 'LIVE' > "$APOLLO_ROOT_DIR/backend/marker"
@@ -244,6 +244,31 @@ EOF
   # An incomplete backup must not let an absence mean "did not exist before".
   if [ -f "$APOLLO_ROOT_DIR/package.json" ]; then ok "root files are kept when the backup is partial"
   else bad "root files are kept when the backup is partial" "package.json was removed"; fi
+)
+
+# --- a backup from a PREVIOUS run must never be restored -----------------------
+# If a run dies between arming MUTATED and recording its own backup, the pointer
+# on disk is the previous run's — and prune_backups deliberately keeps that tree
+# valid and complete. Restoring it would take the device back two releases and
+# overwrite its database with a snapshot that old, while recording an ordinary
+# rollback.
+(
+  make_device
+  # A complete backup left by an earlier, different run.
+  old_backup="$APOLLO_STATE_DIR/backups/code-pre-20260101T000000Z"
+  mkdir -p "$old_backup/src"
+  echo 'TWO-RELEASES-AGO' > "$old_backup/src/marker"
+  printf '%s\n' 'some-other-run-id' > "$old_backup/.run-id"
+  : > "$old_backup/.complete"
+  printf '%s\n' "$old_backup" > "$APOLLO_STATE_DIR/backups/.last-code-backup"
+
+  # This run has not claimed a backup yet — the window the guard exists for.
+  BACKUP_CODE=''
+  if restore_code >/dev/null 2>&1; then
+    bad "a backup from another run is refused" "restore_code accepted it"
+  else ok "a backup from another run is refused"; fi
+  check "the live tree is left alone" \
+    "$(cat "$APOLLO_ROOT_DIR/src/marker" 2>/dev/null)" "OLD"
 )
 
 # --- an orphaned bitcoind from a crashed run is adopted, not deleted ----------
@@ -299,6 +324,60 @@ EOF
   if [ -e "$db-wal" ] || [ -e "$db-shm" ]; then
     bad "WAL sidecars of the forward database are removed" "they survived the restore"
   else ok "WAL sidecars of the forward database are removed"; fi
+)
+
+# --- a failed restore must be REPORTED, not reported as success ---------------
+# The outcome vocabulary has one state that means "SSH required", and it is only
+# reachable if the restore functions tell the truth. restore_database used to end
+# in an unconditional `return 0`, so a cp that failed on a full or dying eMMC left
+# the database migrated forward while migrations/ was rolled back — the unbootable
+# state it exists to prevent — and the run still recorded a normal rollback.
+(
+  make_device
+  db="$APOLLO_STATE_DIR/db/futurebit.sqlite"
+  mkdir -p "$(dirname "$db")"
+  sqlite3 "$db" "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('old');"
+  printf 'DATABASE_URL=%s\n' "$db" > "$APOLLO_ROOT_DIR/.env"
+  claim_backup
+  preserve_binaries; backup_code 2>/dev/null
+
+  # The restore of the database now fails, as it would on a full disk.
+  cat > "$STUBS/cp" <<'EOF'
+#!/bin/bash
+for a in "$@"; do case "$a" in *futurebit.sqlite) exit 1;; esac; done
+exec /bin/cp "$@"
+EOF
+  chmod +x "$STUBS/cp"
+  hash -r   # bash caches command paths; backup_code already resolved /bin/cp
+
+  if restore_code >/dev/null 2>&1; then
+    bad "a failed database restore is reported" "restore_code returned success"
+  else ok "a failed database restore is reported"; fi
+  rm -f "$STUBS/cp"; hash -r
+)
+
+# --- losing bitcoind during a rollback must be reported too -------------------
+# place_binaries removes the live directory and THEN moves the preserved copy in.
+# The artifact ships no bitcoind and the code backup does not contain it, so a
+# failing mv loses the only copy — which used to be a warning in a log nobody
+# reads, on a run that reported success.
+(
+  make_device
+  claim_backup
+  preserve_binaries        # bitcoind now lives only at $PRESERVED_BIN
+  backup_code 2>/dev/null
+  cat > "$STUBS/mv" <<'EOF'
+#!/bin/bash
+for a in "$@"; do case "$a" in *node/bin) exit 1;; esac; done
+exec /bin/mv "$@"
+EOF
+  chmod +x "$STUBS/mv"
+  hash -r   # same: preserve_binaries already resolved /bin/mv
+
+  if restore_code >/dev/null 2>&1; then
+    bad "losing bitcoind is reported as a failed rollback" "restore_code returned success"
+  else ok "losing bitcoind is reported as a failed rollback"; fi
+  rm -f "$STUBS/mv"; hash -r
 )
 
 # --- manifest fields are validated as whole values ----------------------------

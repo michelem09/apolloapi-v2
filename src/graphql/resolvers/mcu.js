@@ -103,9 +103,9 @@ module.exports = {
       }
     },
 
-    lastUpdate: async (_, __, { services }) => {
+    updateStatus: async (_, __, { services }) => {
       try {
-        const result = await services.mcu.getLastUpdate();
+        const result = await services.mcu.getUpdateStatus();
         return { result, error: null };
       } catch (error) {
         return { result: null, error: { message: error.message } };

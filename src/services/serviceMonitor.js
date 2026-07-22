@@ -9,23 +9,33 @@ const TOPICS = require('../graphql/topics');
 
 const execAsync = promisify(exec);
 
-const UPDATE_PROGRESS_FILE = '/tmp/update_progress';
+const UPDATE_UNIT = 'apollo-update.service';
 
-// True only while backend/update is actually working. The file holds a percentage
-// while the update runs and a terminal value afterwards — -1 for failed, 100 for
-// succeeded — which it leaves in place so the UI can report the outcome once the
-// API is back. Anything unreadable or unparseable counts as "not running": the
-// cost of getting that wrong is suppressing service recovery indefinitely.
-function isUpdateRunning() {
-  let raw;
+// Whether an update is running, asked of systemd rather than inferred from a file.
+//
+// This used to read /tmp/update_progress: first its existence, then its value.
+// Both latch. Nothing clears that file except the NEXT run of backend/update, and
+// devices do not reboot on their own — so an updater killed during the health
+// check (an up-to-90-second window in which everything is already running and the
+// box stays online) left a mid-range value behind forever. From then on this
+// returned true on every poll, and the block it guards — manual start/stop
+// reconciliation AND the auto-restart of a crashed bitcoind or miner — was
+// skipped for good, on a device that had just been through a failed update and
+// needed that recovery most.
+//
+// The updater runs as a named transient unit, so systemd is authoritative and
+// self-clearing however the process dies. Anything unexpected counts as "not
+// running": the cost of a false positive is suppressing service recovery
+// indefinitely, the cost of a false negative is one poll misreading a deliberate
+// stop as a manual action.
+async function isUpdateRunning() {
   try {
-    raw = fs.readFileSync(UPDATE_PROGRESS_FILE, 'utf8');
+    const { stdout } = await execAsync(`systemctl is-active ${UPDATE_UNIT}`);
+    return stdout.trim() === 'active';
   } catch (err) {
-    return false; // absent, or unreadable
+    // is-active exits non-zero for inactive/failed/unknown — all "not running".
+    return false;
   }
-  const value = parseInt(raw.trim(), 10);
-  if (Number.isNaN(value)) return false;
-  return value >= 0 && value < 100;
 }
 
 class ServiceMonitor {
@@ -332,7 +342,10 @@ class ServiceMonitor {
       // presence as "in progress" meant one failed update disabled this whole
       // block for good — including the auto-restart of a crashed bitcoind or
       // miner — since nothing clears it until the next update runs.
-      const updateInProgress = isUpdateRunning();
+      // Through the class's own systemd helper, so it goes the same route as
+      // every other unit query — and so tests that stub systemd states cover it
+      // too, instead of it slipping past them to the real exec.
+      const updateInProgress = await this._isSystemdActive(UPDATE_UNIT);
       if (existing && !updateInProgress) {
         // Get time since last request (if any)
         const currentTime = Date.now();
@@ -804,4 +817,4 @@ module.exports = (knex, services) => new ServiceMonitor(knex, services);
 // Exported for the tests: the difference between "an update is running" and "an
 // update finished a while ago" decides whether service recovery stays disabled.
 module.exports.isUpdateRunning = isUpdateRunning;
-module.exports.UPDATE_PROGRESS_FILE = UPDATE_PROGRESS_FILE;
+module.exports.UPDATE_UNIT = UPDATE_UNIT;

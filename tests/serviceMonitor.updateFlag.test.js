@@ -1,72 +1,55 @@
-const fs = jest.requireActual('fs');
-const os = require('os');
-const path = require('path');
+const { promisify } = require('util');
 
-const { isUpdateRunning } = require('../src/services/serviceMonitor');
-
-// The updater leaves a terminal value in the progress file on purpose — -1 when
-// it failed, 100 when it succeeded — so the UI can report the outcome once the
-// API is back up. serviceMonitor used to treat the file's mere EXISTENCE as "an
-// update is in progress", which meant one failed update permanently suppressed
-// manual-action detection AND the auto-restart of a crashed service: nothing
-// clears that file until the next update runs, and devices do not reboot.
+// Whether an update is running is asked of systemd, not inferred from a file.
+//
+// Both earlier versions latched. Keyed on the progress file's EXISTENCE, one
+// failed update suppressed service recovery forever; keyed on its VALUE, an
+// updater killed during the health check left a mid-range number behind and did
+// the same. Nothing clears that file except the next update, and these devices do
+// not reboot on their own — so the block it guards, which includes the auto
+// restart of a crashed bitcoind or miner, stayed off on exactly the device that
+// had just been through a failed update.
 describe('serviceMonitor update-in-progress detection', () => {
-  const file = path.join(os.tmpdir(), 'update_progress_test');
-  let spy;
+  let isUpdateRunning;
+  let execMock;
 
-  const setProgress = (contents) => {
-    if (contents === null) {
-      try {
-        fs.unlinkSync(file);
-      } catch (err) {
-        /* already absent */
-      }
-    } else {
-      fs.writeFileSync(file, contents);
-    }
+  const withSystemctl = (impl) => {
+    jest.resetModules();
+    execMock = jest.fn(impl);
+    jest.doMock('child_process', () => ({
+      ...jest.requireActual('child_process'),
+      exec: (cmd, cb) => execMock(cmd, cb),
+    }));
+    // eslint-disable-next-line global-require
+    ({ isUpdateRunning } = require('../src/services/serviceMonitor'));
   };
 
-  beforeEach(() => {
-    // isUpdateRunning reads a fixed path; point its reader at the fixture.
-    spy = jest.spyOn(require('fs'), 'readFileSync').mockImplementation((p, enc) => {
-      if (String(p).endsWith('update_progress')) return fs.readFileSync(file, enc);
-      return jest.requireActual('fs').readFileSync(p, enc);
-    });
-  });
-
   afterEach(() => {
-    spy.mockRestore();
-    setProgress(null);
+    jest.dontMock('child_process');
   });
 
-  it.each([
-    ['5', true],
-    ['60', true],
-    ['95', true],
-  ])('reports an update in progress at %s%%', (value, expected) => {
-    setProgress(value);
-    expect(isUpdateRunning()).toBe(expected);
+  it('reports an update running while the transient unit is active', async () => {
+    withSystemctl((cmd, cb) => cb(null, { stdout: 'active\n', stderr: '' }));
+    await expect(isUpdateRunning()).resolves.toBe(true);
+    expect(execMock.mock.calls[0][0]).toContain('is-active apollo-update.service');
   });
 
-  it('does not report an update in progress after a successful one', () => {
-    setProgress('100');
-    expect(isUpdateRunning()).toBe(false);
+  it('reports no update once the unit is gone', async () => {
+    // systemd clears this by itself however the updater died — which is the whole
+    // point of asking it instead of reading a file nothing ever cleans up.
+    withSystemctl((cmd, cb) => cb(Object.assign(new Error('inactive'), { code: 3 })));
+    await expect(isUpdateRunning()).resolves.toBe(false);
   });
 
-  it('does not report an update in progress after a failed one', () => {
-    // The regression: -1 lingers forever, and treating it as "in progress" left
-    // a crashed bitcoind or miner never restarted.
-    setProgress('-1');
-    expect(isUpdateRunning()).toBe(false);
+  it('reports no update when the unit failed', async () => {
+    withSystemctl((cmd, cb) => cb(Object.assign(new Error('failed'), { code: 4 })));
+    await expect(isUpdateRunning()).resolves.toBe(false);
   });
 
-  it('treats an unreadable or unparseable file as no update', () => {
-    setProgress('not a number');
-    expect(isUpdateRunning()).toBe(false);
-  });
-
-  it('treats an absent file as no update', () => {
-    setProgress(null);
-    expect(isUpdateRunning()).toBe(false);
+  it('treats an unusable systemctl as no update', async () => {
+    // A false positive suppresses service recovery indefinitely; a false negative
+    // costs one poll misreading a deliberate stop. Fail towards recovery.
+    withSystemctl((cmd, cb) => cb(new Error('systemctl: command not found')));
+    await expect(isUpdateRunning()).resolves.toBe(false);
   });
 });

@@ -4,71 +4,70 @@ const path = require('path');
 const read = (...parts) =>
   fs.readFileSync(path.join(__dirname, '..', ...parts), 'utf8');
 
-// /tmp/update_progress has four consumers and they must agree on what a value
-// means. It changed from a transient file (deleted at the end) to one that keeps
-// its terminal value — 100 after a success, -1 after a failure — so the outcome
-// survives the window where the updater stops the API.
+// Two files, two lifetimes, on purpose.
 //
-// That change was shipped without auditing the readers, twice:
+// They were one for a while, and every consumer inferred something different
+// from the same number. Making /tmp/update_progress keep a terminal value — so
+// an outcome would survive the window where the updater stops the API — is what
+// made a leftover 100 read as a fresh success: serviceMonitor stopped restarting
+// crashed services, and the modal replaced the Update button with "Reload App",
+// leaving the device unable to take another update through the only path a user
+// has.
 //
-//   - serviceMonitor keyed off the file's EXISTENCE, so a leftover -1 disabled
-//     manual-action detection and the auto-restart of crashed services forever.
-//   - NavbarUpdateModal read progress on every mount, so a leftover 100 made
-//     every later page load conclude an update had just finished. Five seconds
-//     after opening, the Update button was replaced by "Reload App": the device
-//     was no longer updatable from the UI at all, after exactly one successful
-//     update, with nothing in any log to explain it.
-//
-// Neither was caught by a test. This one pins the contract in the repo that owns
-// the writer.
-describe('/tmp/update_progress — the contract its consumers share', () => {
-  it('the updater keeps a terminal value instead of deleting the file', () => {
-    const script = read('backend', 'update');
-    // Success leaves 100 behind; the failure path leaves -1.
-    expect(script).toMatch(/echo "100" > "\$TMPFILE"/);
-    expect(script).toMatch(/echo "-1" > "\$TMPFILE"/);
-    // And the next run truncates it before starting, so a stale value never
-    // reads as progress of the run that is beginning.
-    expect(script).toMatch(/rm -f "\$TMPFILE"; echo "5" > "\$TMPFILE"/);
+//   /tmp/update_progress   live progress, transient, for older UI bundles only
+//   last-update.json       what a run is doing and how it ended, in the state dir
+describe('update state — the contract its consumers share', () => {
+  const script = read('backend', 'update');
+
+  it('keeps progress transient', () => {
+    // Deleted on both terminal paths, so nothing can read a leftover as current.
+    const success = script.slice(script.indexOf('write_state succeeded "done"'));
+    expect(success).toMatch(/rm -f "\$TMPFILE"/);
+    const cleanup = script.match(/^cleanup\(\) \{[\s\S]*?\n\}/m)[0];
+    expect(cleanup).toMatch(/rm -f "\$TMPFILE"/);
+    expect(cleanup).not.toMatch(/echo "-1" > "\$TMPFILE"/);
   });
 
-  it('serviceMonitor treats a terminal value as "no update running"', () => {
-    const source = read('src', 'services', 'serviceMonitor.js');
-    // Existence is not the signal — the value is. Keyed on existence, one failed
-    // update suppressed service recovery until someone deleted the file by hand.
-    expect(source).not.toMatch(/existsSync\(['"]\/tmp\/update_progress/);
-    expect(source).toMatch(/value >= 0 && value < 100/);
-  });
-
-  it('the modal only interprets progress while following its own update', () => {
-    const modal = read(
-      'apolloui-v2',
-      'src',
-      'components',
-      'navbar',
-      'NavbarUpdateModal.js'
-    );
-
-    // The early return has to come before either terminal branch, or a leftover
-    // value is read as live progress on a cold mount.
-    const gate = modal.indexOf('if (!updateInProgress) return;');
-    const failureBranch = modal.indexOf('if (remoteProgress < 0)');
-    const doneBranch = modal.indexOf('if (remoteProgress >= 100)');
-
-    expect(gate).toBeGreaterThan(-1);
-    expect(failureBranch).toBeGreaterThan(gate);
-    expect(doneBranch).toBeGreaterThan(gate);
-
-    // 100 exactly, not >= 90: the updater writes 88 while starting services and
-    // two gates that can still roll everything back come after it.
-    expect(modal).not.toMatch(/remoteProgress >= 90/);
-  });
-
-  it('past outcomes are reported from a different file with a different lifetime', () => {
-    const script = read('backend', 'update');
-    // Keeping the two separate is what stops "an update is running" and "an
-    // update finished" from being the same signal again.
+  it('records outcomes in the state dir, not in /tmp', () => {
+    // The record has to survive both the API restart and a reboot.
     expect(script).toMatch(/LAST_UPDATE_FILE="\$\{STATE_DIR\}\/last-update\.json"/);
     expect(script).not.toMatch(/LAST_UPDATE_FILE=.*\/tmp\//);
+  });
+
+  it('writes the record atomically', () => {
+    // A reader polling every few seconds must never see half a file.
+    const writer = script.match(/write_state\(\) \{[\s\S]*?\n\}/)[0];
+    expect(writer).toMatch(/mktemp/);
+    expect(writer).toMatch(/mv -f "\$tmp" "\$LAST_UPDATE_FILE"/);
+  });
+
+  it('gives every run an identity', () => {
+    // What lets a client recognise its own update without comparing its clock to
+    // the device's — these boards have no RTC.
+    expect(script).toMatch(/^RUN_ID=/m);
+    const writer = script.match(/write_state\(\) \{[\s\S]*?\n\}/)[0];
+    expect(writer).toContain('--arg run_id "$RUN_ID"');
+  });
+
+  it('has a state for a rollback that failed', () => {
+    // The one outcome that means SSH is required. Without it, a half-failed
+    // rollback was recorded as "rolled-back" and the banner said the device had
+    // been restored.
+    const cleanup = script.match(/^cleanup\(\) \{[\s\S]*?\n\}/m)[0];
+    expect(cleanup).toContain("result='recovery-failed'");
+    expect(cleanup).toContain("result='rolled-back'");
+    expect(cleanup).toContain("result='aborted'");
+    // And it is chosen from whether the restore worked, not from MUTATED alone.
+    expect(cleanup).toMatch(/if restore_code; then restored=1; else restored=0; fi/);
+  });
+
+  it('asks systemd whether an update is running', () => {
+    const monitor = read('src', 'services', 'serviceMonitor.js');
+    // Never from a file: both file-based versions latched, and nothing clears
+    // that file except the next update. Asserted on the code, not on the prose —
+    // the comment explaining why is worth keeping.
+    expect(monitor).not.toMatch(/(readFileSync|existsSync)\([^)]*update_progress/);
+    expect(monitor).toContain('is-active');
+    expect(monitor).toContain('apollo-update.service');
   });
 });

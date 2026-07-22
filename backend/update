@@ -46,6 +46,14 @@ VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$'
 LAST_UPDATE_FILE="${STATE_DIR}/last-update.json"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# Identity for this run. It is what lets a client say "this record is about the
+# update I started" — the question the system previously could not express, and
+# which was answered instead by comparing the browser's clock against the
+# device's. These boards have no RTC and their clock is known to ship wrong, so
+# that comparison rejected genuine records and accepted stale ones. A client now
+# remembers the run_id it saw when it pressed, and waits for a different one.
+RUN_ID="${STARTED_AT}-$(tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c 6 || echo $$)"
+
 STAGING=''; TARBALL=''
 # MUTATED is armed BEFORE the first destructive step, not after the last one: it
 # answers "might /opt/apolloapi be half-dismantled?", and a flag set afterwards
@@ -63,26 +71,54 @@ err()  { echo -e "${RED}$*${NC}" >&2; }
 die()  { FAIL_REASON="$*"; err "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Records the outcome for the UI. Written with jq so a version or a reason
-# containing a quote cannot produce invalid JSON that the API then fails to parse
-# — the one file whose job is to explain a failure must not become a second one.
+# The single record of what this run is doing and what it did. Written on every
+# transition, atomically (temp + mv) so a reader never sees half a file.
 #
-# result: success | rolled-back | failed
-#   rolled-back means the device was modified and put back; failed means it was
-#   never touched (bad checksum, no disk space, missing dependency). The
-#   difference matters to the user: one is "nothing happened", the other is
-#   "something happened and was undone".
-write_last_update() {  # result from to reason
-  local dir; dir="$(dirname "$LAST_UPDATE_FILE")"
+# It replaces a split where /tmp/update_progress carried both "how far along" and
+# "how it ended", and four consumers each inferred something different from the
+# same number. Keeping a terminal value in that file so the outcome would survive
+# the API restart is what made a leftover 100 look like a fresh success — the
+# modal replaced the Update button with "Reload App" and the device could never be
+# updated from the UI again. Progress stays transient; the outcome lives here.
+#
+# state:
+#   running          — this run is in flight
+#   succeeded        — installed and healthy
+#   rolled-back      — the device was modified and PUT BACK; it is fine
+#   recovery-failed  — modified and NOT put back. The only state that means SSH,
+#                      and the one the previous vocabulary could not express, so a
+#                      half-failed rollback told the user they had been restored
+#   aborted          — nothing was modified (bad checksum, no space, no deps)
+#
+# jq, not string interpolation: a version or a reason containing a quote must not
+# turn the one file whose job is to explain a failure into a second failure.
+write_state() {  # state phase progress [reason]
+  local dir tmp
+  dir="$(dirname "$LAST_UPDATE_FILE")"
   mkdir -p "$dir" 2>/dev/null || return 0
   have jq || return 0
-  jq -n --arg result "$1" --arg from "$2" --arg to "$3" --arg reason "$4" \
-        --arg started "$STARTED_AT" --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-     '{result: $result, from: $from, to: $to, reason: $reason,
-       started_at: $started, finished_at: $finished}' \
-     > "$LAST_UPDATE_FILE" 2>/dev/null || return 0
-  chown futurebit:futurebit "$LAST_UPDATE_FILE" 2>/dev/null || true
+  tmp="$(mktemp "${LAST_UPDATE_FILE}.XXXXXX" 2>/dev/null)" || return 0
+  if jq -n --arg run_id "$RUN_ID" --arg state "$1" --arg phase "$2" \
+        --argjson progress "${3:-0}" --arg reason "${4:-}" \
+        --arg from "${CURRENT:-}" --arg to "${VERSION:-}" \
+        --arg started "$STARTED_AT" --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     '{run_id: $run_id, state: $state, phase: $phase, progress: $progress,
+       from: $from, to: $to, reason: $reason,
+       started_at: $started, updated_at: $updated}' > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$LAST_UPDATE_FILE" 2>/dev/null || rm -f "$tmp"
+    chown futurebit:futurebit "$LAST_UPDATE_FILE" 2>/dev/null || true
+  else
+    rm -f "$tmp"
+  fi
   return 0
+}
+
+# Progress is still written for clients running an older UI bundle, which poll
+# Mcu.updateProgress and know nothing about the record. It is transient again —
+# deleted when the run ends — because nothing new depends on it.
+progress() {  # phase percent
+  echo "$2" > "$TMPFILE"
+  write_state running "$1" "$2"
 }
 
 # Sourced with APOLLO_UPDATE_LIB=1 by tests/ota/rollback.test.sh, which drives the
@@ -139,7 +175,15 @@ if [ -z "${APOLLO_UPDATE_DETACHED:-}" ] && [ -d /run/systemd/system ] && have sy
                   APOLLO_RC_LOCAL; do
     [ -n "${!override:-}" ] && setenv_args+=(--setenv="$override=${!override}")
   done
+  # TimeoutStopSec=infinity, because ignoring SIGTERM is not enough. systemd's
+  # default is 90 s, and the rollback's first act is stop_services, whose
+  # node.service declares TimeoutStopSec=700 for bitcoind's dbcache flush. On a
+  # reboot mid-update the ignored SIGTERM would be followed by a SIGKILL of the
+  # whole cgroup before restore_code had touched a single file, leaving the
+  # half-installed release, the new units enabled and the database migrated
+  # forward — with an intact backup nothing would ever read.
   exec systemd-run --quiet --collect --unit=apollo-update \
+    --property=TimeoutStopSec=infinity \
     "${setenv_args[@]}" -- "$0" "$@"
 fi
 if [ -n "${APOLLO_UPDATE_DETACHED:-}" ]; then
@@ -299,13 +343,19 @@ cleanup() {
   [ "$status" -eq 0 ] && status=1
 
   if [ -n "$TARBALL" ]; then rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem" || true; fi
+  # Nothing was modified unless MUTATED says so, and if it was, the outcome
+  # depends on whether putting it back actually worked. That status used to be
+  # discarded — `restore_code || err …` throws it away — so a rollback that half
+  # failed still recorded "rolled-back", and the banner told the user their
+  # device had been restored when it needed SSH.
+  local restored=1
   if [ "$MUTATED" -eq 1 ]; then
     # Stop first. On the `health_ok || die` path everything has already been
     # started again against the half-installed release, and apollo-api holds the
     # database open — restoring it underneath a live writer would corrupt exactly
     # the file the rollback exists to save.
     stop_services
-    restore_code || err "ROLLBACK FAILED — this device needs manual recovery over SSH"
+    if restore_code; then restored=1; else restored=0; fi
     STOPPED=1
   fi
   # Restarting is unconditional once anything has been stopped: an explicit `die`
@@ -317,18 +367,22 @@ cleanup() {
   fi
   restore_solo_intent || true
 
-  # "rolled-back" only if the device was actually modified. Otherwise nothing
-  # happened to it, and saying so is materially different for the user.
-  local result='failed'
-  [ "$MUTATED" -eq 1 ] && result='rolled-back'
-  write_last_update "$result" "${CURRENT:-}" "${VERSION:-}" \
-    "${FAIL_REASON:-The update stopped unexpectedly}"
+  local result reason
+  reason="${FAIL_REASON:-The update stopped unexpectedly}"
+  if [ "$MUTATED" -eq 0 ]; then
+    result='aborted'
+  elif [ "$restored" -eq 1 ]; then
+    result='rolled-back'
+  else
+    result='recovery-failed'
+    reason="$reason — and the previous version could not be restored"
+    err "ROLLBACK FAILED — this device needs manual recovery over SSH"
+  fi
+  write_state "$result" "failed" 0 "$reason"
 
-  # -1 means "failed", and the UI needs to be told. Deleting the file instead made
-  # Mcu.updateProgress report a plain 0, indistinguishable from "just started", so
-  # the modal sat at "Updating... 0%" with its close button hidden until the user
-  # reloaded the page. The next run truncates this file before it starts.
-  echo "-1" > "$TMPFILE"
+  # Transient again: the outcome lives in the record, so nothing needs a value
+  # left behind here. Keeping one is what made a leftover read as a fresh result.
+  rm -f "$TMPFILE"
   err "Update failed; the previous version is still installed"
   exit "$status"
 }
@@ -398,21 +452,40 @@ rescue_binaries() {
 
 place_binaries() {
   if [ ! -d "$PRESERVED_BIN" ]; then
-    [ -d "$APOLLO_DIR/backend/node/bin" ] \
-      || err "WARNING: no bitcoind found on this device — the node cannot start"
-    return 0
+    if [ -d "$APOLLO_DIR/backend/node/bin" ]; then return 0; fi
+    err "No bitcoind on this device — the node cannot start"
+    return 1
   fi
   mkdir -p "$APOLLO_DIR/backend/node"
+  # rm THEN mv, so a failing mv loses the only copy: the artifact ships no
+  # bitcoind and the code backup does not contain it either. Reported so a
+  # rollback that lost it is recorded as recovery-failed rather than success.
   rm -rf "$APOLLO_DIR/backend/node/bin"
-  mv "$PRESERVED_BIN" "$APOLLO_DIR/backend/node/bin"
+  if ! mv "$PRESERVED_BIN" "$APOLLO_DIR/backend/node/bin"; then
+    err "Could not put bitcoind back — the node cannot start"
+    return 1
+  fi
+  return 0
+}
+
+# Claims the backup directory for this run. Called BEFORE any mutation, because
+# the window between "we started changing things" and "we know where the old copy
+# went" is the one the rollback cannot survive.
+#
+# The pointer carries the run id. Without it, a failure in that window left
+# BACKUP_CODE empty and the rollback fell back to the pointer from the PREVIOUS
+# run — which prune_backups deliberately keeps valid — restoring a tree two
+# releases old, and its database with it, while recording a normal rollback.
+claim_backup() {
+  BACKUP_CODE="$BACKUP_DIR/code-pre-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$BACKUP_CODE"
+  printf '%s\n' "$RUN_ID" > "$BACKUP_CODE/.run-id"
+  printf '%s\n' "$BACKUP_CODE" > "$BACKUP_DIR/.last-code-backup"
+  return 0
 }
 
 backup_code() {
-  BACKUP_CODE="$BACKUP_DIR/code-pre-$(date -u +%Y%m%dT%H%M%SZ)"
-  mkdir -p "$BACKUP_CODE"
-  # Written before anything moves. Written afterwards, a failure partway through
-  # the move loop left the tree dismantled and no pointer to what held it.
-  printf '%s\n' "$BACKUP_CODE" > "$BACKUP_DIR/.last-code-backup"
+  [ -n "${BACKUP_CODE:-}" ] || claim_backup
   local d f
   for d in $OWNED; do [ -e "$APOLLO_DIR/$d" ] && mv "$APOLLO_DIR/$d" "$BACKUP_CODE/$d"; done
   [ -e "$UI_DIR/.next" ] && { mkdir -p "$BACKUP_CODE/apolloui-v2"; mv "$UI_DIR/.next" "$BACKUP_CODE/apolloui-v2/.next"; }
@@ -467,7 +540,14 @@ restore_database() {
   # a restored file would reintroduce exactly what is being rolled back. Callers
   # must have stopped everything first.
   rm -f "$db-wal" "$db-shm"
-  cp -p "$b/futurebit.sqlite" "$db"
+  # Reported, not swallowed. This used to end in an unconditional `return 0`, so a
+  # cp that failed on a full or dying eMMC left the database migrated FORWARD while
+  # migrations/ was rolled back — the exact unbootable state this function exists
+  # to prevent — and the run still recorded a successful rollback.
+  if ! cp -p "$b/futurebit.sqlite" "$db"; then
+    err "Could not restore the database from $b"
+    return 1
+  fi
   chown futurebit:futurebit "$db" 2>/dev/null || true
   return 0
 }
@@ -586,6 +666,14 @@ start_services() {
 restore_code() {
   local b; b="${BACKUP_CODE:-$(cat "$BACKUP_DIR/.last-code-backup" 2>/dev/null || true)}"
   [ -n "$b" ] && [ -d "$b" ] || { err "No code backup to restore from"; return 1; }
+  # Only this run's backup. A pointer left by an earlier run resolves to a real,
+  # complete tree — prune_backups keeps one — so without this check a failure
+  # before backup_code ran would restore a release two versions old and overwrite
+  # the database with its snapshot, while reporting an ordinary rollback.
+  if [ "$(cat "$b/.run-id" 2>/dev/null || true)" != "$RUN_ID" ]; then
+    err "Refusing to restore $b: it belongs to a different update run"
+    return 1
+  fi
   err "Restoring the previous code from $b"
 
   # Did backup_code finish? If it aborted partway — ENOSPC, EIO, a signal — then
@@ -598,7 +686,7 @@ restore_code() {
 
   local rc=0 d f
   restore_database || rc=1
-  rescue_binaries
+  rescue_binaries || rc=1
 
   for d in $OWNED; do
     if [ -e "$b/$d" ]; then
@@ -616,7 +704,7 @@ restore_code() {
     rm -rf "$UI_DIR/.next" || rc=1
     mv "$b/apolloui-v2/.next" "$UI_DIR/.next" || rc=1
   fi
-  place_binaries
+  place_binaries || rc=1
 
   for f in $ROOT_FILES; do
     if [ -e "$b/$f" ]; then
@@ -649,7 +737,8 @@ health_ok() {
 # Everything above is definitions; the tests source the file to here and stop.
 [ -n "${APOLLO_UPDATE_LIB:-}" ] && return 0
 
-rm -f "$TMPFILE"; echo "5" > "$TMPFILE"
+rm -f "$TMPFILE"
+progress "starting" 5
 
 # Self-provision rather than refuse. Devices already in the field have none of
 # jq, zstd or cosign — nothing ever installed them — so a hard gate here left the
@@ -698,7 +787,10 @@ if [ -n "$CURRENT" ] && valid_version "$CURRENT"; then
   if [ "$CURRENT" = "$VERSION" ]; then
     log "Already on $VERSION"
     COMPLETED=1
-    echo "100" > "$TMPFILE"
+    # A terminal outcome for the run the user started, so a client waiting on it
+    # stops waiting instead of timing out on an update that was never needed.
+    write_state succeeded "already up to date" 100 "Already on $VERSION"
+    rm -f "$TMPFILE"
     exit 0
   fi
   version_gt "$VERSION" "$CURRENT" || die "Refusing to move from $CURRENT to older/equal $VERSION"
@@ -722,7 +814,7 @@ done
 rm -rf "$APOLLO_DIR"/.staging.* 2>/dev/null || true
 
 log "Downloading $VERSION"
-echo "15" > "$TMPFILE"
+progress "downloading" 15
 mkdir -p "$DL_DIR" "$BACKUP_DIR"
 TARBALL="$DL_DIR/apollo-${VERSION}-aarch64.tar.zst"
 # Never resume onto a complete-but-wrong file: verify a cached copy, else refetch.
@@ -735,7 +827,7 @@ fi
 curl -fsSL --max-time 120 -o "$TARBALL.sig"  --url "$SIG_URL"
 curl -fsSL --max-time 120 -o "$TARBALL.pem"  --url "$CERT_URL"
 
-echo "35" > "$TMPFILE"
+progress "verifying" 35
 log "Verifying"
 GOT="$(sha256_of "$TARBALL")"
 [ "$GOT" = "$SHA" ] || die "Checksum mismatch (expected $SHA, got $GOT)"
@@ -744,7 +836,7 @@ cosign verify-blob --certificate "$TARBALL.pem" --signature "$TARBALL.sig" \
   --certificate-oidc-issuer "$TRUST_ISSUER" "$TARBALL" >/dev/null 2>&1 \
   || die "Signature verification failed — refusing to install"
 
-echo "45" > "$TMPFILE"
+progress "unpacking" 45
 log "Unpacking"
 STAGING="$(mktemp -d "${APOLLO_DIR}/.staging.XXXXXX")"
 tar -C "$STAGING" --zstd --no-same-owner -xf "$TARBALL"
@@ -761,6 +853,14 @@ STAGED_VERSION="$(jq -r '.version // empty' "$STAGING/version.json" 2>/dev/null 
 for d in $OWNED; do
   [ -e "$STAGING/$d" ] || die "Artifact is missing $d — refusing to install"
 done
+# The same guard for the units. Installed "if present", a release that lost
+# node.service would install cleanly, leave the PREVIOUS unit definition in place
+# pointing at an ExecStart the new backend/ no longer contains, and still pass the
+# health check — which only probes the API and the UI.
+for unit in $UNITS; do
+  [ -e "$STAGING/backend/systemd/$unit.service" ] \
+    || die "Artifact is missing the $unit unit — refusing to install"
+done
 for f in $ROOT_FILES; do
   [ -e "$STAGING/$f" ] || die "Artifact is missing $f — refusing to install"
 done
@@ -771,7 +871,7 @@ if [ ! -e "$SOLO_REQUEST_FILE" ] && db="$(resolve_database_url)"; then
   (umask 077; printf '%s\n' "$requested" > "$SOLO_REQUEST_FILE")
 fi
 
-echo "60" > "$TMPFILE"
+progress "stopping services" 60
 log "Stopping services"
 # Armed before the stop, so a failure during it still restarts what went down.
 STOPPED=1
@@ -792,8 +892,11 @@ stop_services
 # wrapper. What actually matters is verified here instead — nothing still running.
 verify_all_stopped
 
-echo "70" > "$TMPFILE"
+progress "installing" 70
 log "Installing $VERSION"
+# Claimed before MUTATED, so the pointer this run will be restored from exists
+# before anything can go wrong.
+claim_backup
 MUTATED=1
 preserve_binaries
 backup_code
@@ -808,7 +911,7 @@ done
 # apolloui-v2/.env, and everything under the state dir.
 chown -R futurebit:futurebit "$APOLLO_DIR"
 
-echo "85" > "$TMPFILE"
+progress "applying units" 85
 log "Applying units and configuration"
 # Snapshot the live units first: they are overwritten and enabled below, and a
 # rollback that restores only the code leaves the device booting old code under
@@ -820,8 +923,20 @@ for unit in $UNITS; do
 done
 [ -f "$APOLLO_DIR/backend/rc.local" ] && install -m 755 "$APOLLO_DIR/backend/rc.local" "$RC_LOCAL"
 systemctl daemon-reload
-systemctl enable apollo-bootstrap.service apollo-api.service apollo-ui-v2.service \
-  apollo-miner.service node.service rc-local.service >/dev/null 2>&1 || true
+# Every installed unit, and failures are reported. The old updater enabled seven
+# unconditionally; this had dropped swap.service — silently removing swap at the
+# next boot on a 4 GB board — and swallowed every error with `|| true`, so an
+# enable that failed still recorded a successful update and the device came back
+# from its next power cycle with no API, no UI and no mining.
+#
+# ckpool is deliberately absent: its enablement is the user's solo-mining choice,
+# held in the database and acted on by serviceMonitor.
+for unit in $UNITS; do
+  [ "$unit" = ckpool ] && continue
+  [ -f "$SYSTEMD_DIR/$unit.service" ] || continue
+  systemctl enable "$unit.service" >/dev/null 2>&1 \
+    || err "WARNING: could not enable $unit.service — it will not start at boot"
+done
 
 # The firewall is applied directly rather than by restarting rc-local.service:
 # rc.local also runs backend/first_run, which partitions, mounts and resizes
@@ -833,12 +948,11 @@ fi
 
 restore_solo_intent
 
-# Deliberately below 90, the threshold the UI used to read as "done". Two gates
-# that can still trigger a full rollback come AFTER this point — the node failing
-# to start, and the health check timing out — so anything here that reads as
-# success tells the user the update worked while the device is reverting. 100 is
-# written once, past both gates, and is the only value that means finished.
-echo "88" > "$TMPFILE"
+# Below 90, the threshold an older UI bundle reads as "done". Two gates that can
+# still trigger a full rollback come AFTER this point — the node failing to start,
+# and the health check timing out — so anything here that reads as success tells
+# the user the update worked while the device is reverting.
+progress "starting services" 88
 log "Starting services"
 # bootstrap first: it owns the migrations, and node/miner Require it, so starting
 # it later would bounce them right after they came up.
@@ -853,21 +967,16 @@ systemctl start node.service || die "Bitcoin node did not start after installing
 systemctl start apollo-miner.service || err "The miner did not start cleanly"
 health_ok || die "Health check failed after installing $VERSION"
 
-echo "100" > "$TMPFILE"
 COMPLETED=1
-write_last_update success "$CURRENT" "$VERSION" ''
+write_state succeeded "done" 100
 
 # The verified download is only useful for retrying a failed install, so it goes
 # once the install has succeeded.
 rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"
 prune_backups
 
-# The 100 stays. Deleting it made a SUCCESSFUL update indistinguishable from one
-# that never started — Mcu.updateProgress reports a missing file as plain 0, and
-# the modal renders "Updating... 0%" with its close button hidden and keeps
-# polling forever. The browser polls on its own 3 s grid, and the window between
-# writing 100 and this point covers an rm of the tarball plus prune_backups
-# deleting a ~198 MB tree on eMMC, so a fair share of successful updates landed
-# a poll after the delete. The next run truncates the file before it starts, and
-# serviceMonitor keys off the value rather than the file's existence.
+# Progress is transient again. Keeping a terminal value here so the outcome would
+# survive the API restart is what let a leftover read as a fresh result; the
+# outcome now lives in the record, which is where a client looks for it.
+rm -f "$TMPFILE"
 log "Updated to $VERSION"

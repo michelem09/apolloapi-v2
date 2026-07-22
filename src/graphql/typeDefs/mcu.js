@@ -15,7 +15,7 @@ module.exports = gql`
     version: McuAppVersionOutput! @auth
     update: EmptyOutput! @auth
     updateProgress: McuUpdateProgressOutput! @auth
-    lastUpdate: McuLastUpdateOutput! @auth
+    updateStatus: McuUpdateStatusOutput! @auth
     timezone: McuTimezoneOutput! @auth
     setTimezone(input: McuSetTimezoneInput!): McuTimezoneOutput! @auth
   }
@@ -148,27 +148,47 @@ module.exports = gql`
     value: Int
   }
 
-  type McuLastUpdateOutput {
-    result: McuLastUpdateResult
+  type McuUpdateStatusOutput {
+    result: McuUpdateStatusResult
     error: Error
   }
 
   """
-  What the last update attempt did. The updater writes this to the state dir
-  before it finishes, because progress is polled through this API and the updater
-  stops this API — so the UI is disconnected for exactly the window that matters
-  and reconnects with no memory of it. Null when no update has ever run.
+  What the last update run is doing, or did. Two facts together, because either
+  alone lies: the record says what the updater believes, and running says whether
+  it is still there to believe it.
   """
-  type McuLastUpdateResult {
-    "success | rolled-back | failed. 'failed' means the device was never modified."
-    result: String!
-    "Version installed before the attempt."
+  type McuUpdateStatusResult {
+    "True while the updater's transient unit is active. Asked of systemd, so it clears however the process dies."
+    running: Boolean!
+    "Null when no update has ever run on this device."
+    record: McuUpdateRecord
+  }
+
+  type McuUpdateRecord {
+    """
+    Identifies one update run. A client remembers the id it saw when it pressed
+    Update and waits for a different one — which is how it recognises its own
+    outcome without comparing its clock to the device's.
+    """
+    runId: String
+    """
+    running | succeeded | rolled-back | recovery-failed | aborted | interrupted
+
+    rolled-back means the device was modified and PUT BACK, and is fine.
+    recovery-failed means modified and NOT put back — the only state that means
+    SSH is required. aborted means nothing was touched. interrupted means the
+    updater died without recording an outcome.
+    """
+    state: String!
+    "What it was doing, e.g. 'downloading', 'stopping services'."
+    phase: String
+    progress: Int
     from: String
-    "Version the attempt was installing."
     to: String
     "Why it stopped, empty on success."
     reason: String
     startedAt: String
-    finishedAt: String
+    updatedAt: String
   }
 `;

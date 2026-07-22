@@ -154,7 +154,7 @@ describe('update lifecycle contract', () => {
     expect(pointOfNoReturn).toBeGreaterThan(-1);
     expect(healthGate).toBeGreaterThan(pointOfNoReturn);
     const beforeGate = script.slice(pointOfNoReturn, healthGate);
-    const written = [...beforeGate.matchAll(/echo "(-?\d+)" > "\$TMPFILE"/g)].map((m) =>
+    const written = [...beforeGate.matchAll(/progress "[^"]+" (-?\d+)/g)].map((m) =>
       parseInt(m[1], 10)
     );
     expect(written.length).toBeGreaterThan(0);
@@ -162,8 +162,8 @@ describe('update lifecycle contract', () => {
       expect(value).toBeLessThan(90);
     }
 
-    // And 100 is written past the gate.
-    expect(script.slice(healthGate)).toMatch(/echo "100" > "\$TMPFILE"/);
+    // And the terminal state is recorded past the gate.
+    expect(script.slice(healthGate)).toMatch(/write_state succeeded "done" 100/);
   });
 
   it('records the outcome where the UI can read it after reconnecting', () => {
@@ -173,45 +173,44 @@ describe('update lifecycle contract', () => {
     // is blind for the window that matters and reconnects with no memory. The
     // record lives in the state dir, not /tmp, so it survives a reboot too.
     expect(script).toMatch(/LAST_UPDATE_FILE="\$\{STATE_DIR\}\/last-update\.json"/);
-    expect(script).toContain('write_last_update success');
-    expect(script).toMatch(/write_last_update "\$result"/);
+    expect(script).toMatch(/write_state succeeded "done" 100/);
 
-    // 'failed' and 'rolled-back' are different things to tell a user: one means
-    // the device was never touched.
-    const cleanup = script.match(/^cleanup\(\) \{[\s\S]*?\n\}/m);
-    expect(cleanup[0]).toContain("result='failed'");
-    expect(cleanup[0]).toContain("result='rolled-back'");
+    // Four terminal states, because "modified and put back" and "modified and
+    // NOT put back" are different things to tell a user — the second means SSH.
+    const cleanup = script.match(/^cleanup\(\) \{[\s\S]*?\n\}/m)[0];
+    for (const state of ['aborted', 'rolled-back', 'recovery-failed']) {
+      expect(cleanup).toContain(`result='${state}'`);
+    }
   });
 
-  it('leaves a terminal progress value on every exit path', () => {
+  it('reaches a terminal state on every exit path, including the no-op', () => {
     const script = readBackendScript('update');
 
-    // Deleting the file on success made a completed update look identical to one
-    // that never started: Mcu.updateProgress reports a missing file as 0, and the
-    // modal renders "Updating... 0%" with no close button, forever.
-    const success = script.slice(script.indexOf('COMPLETED=1\n\n# The verified'));
-    expect(success).not.toMatch(/rm -f "\$TMPFILE"/);
-
     // "Already on <version>" is the most easily reached path in the script, and
-    // it used to exit through cleanup's FAILURE branch: the flag was still 0, so
-    // an up-to-date device wrote -1, printed "Update failed" and exited 1.
+    // it used to exit through cleanup's FAILURE branch: COMPLETED was still 0
+    // when its `exit 0` fired the EXIT trap, so an up-to-date device recorded a
+    // failure and exited 1. It has to record a terminal state of its own, or a
+    // client waiting for an outcome waits for one that never comes.
     const alreadyOn = script.match(/if \[ "\$CURRENT" = "\$VERSION" \]; then[\s\S]*?\n  fi/);
     expect(alreadyOn).not.toBeNull();
     expect(alreadyOn[0]).toContain('COMPLETED=1');
+    expect(alreadyOn[0]).toContain('write_state succeeded');
     expect(alreadyOn[0].indexOf('COMPLETED=1')).toBeLessThan(alreadyOn[0].indexOf('exit 0'));
+
+    // And cleanup always records one, so no exit leaves the record on "running".
+    const cleanup = script.match(/^cleanup\(\) \{[\s\S]*?\n\}/m)[0];
+    expect(cleanup).toMatch(/write_state "\$result"/);
   });
 
-  it('reports failure to the UI rather than deleting the progress file', () => {
+  it('does not leave a terminal value in the progress file', () => {
     const script = readBackendScript('update');
 
-    // A missing file reads as progress 0 through Mcu.updateProgress, which the
-    // modal cannot tell apart from a fresh start — it hid its own close button
-    // and sat at "Updating... 0%" until the page was reloaded.
-    expect(script).toMatch(/echo "-1" > "\$TMPFILE"/);
-    const failureWrite = script.indexOf('echo "-1" > "$TMPFILE"');
-    const failureMsg = script.indexOf('Update failed; the previous version');
-    expect(failureWrite).toBeGreaterThan(-1);
-    expect(failureMsg).toBeGreaterThan(failureWrite);
+    // A leftover terminal value is what made a finished run read as a live one:
+    // serviceMonitor stopped restarting crashed services, and the modal offered
+    // "Reload App" instead of the update, so the device could never take another.
+    const cleanup = script.match(/^cleanup\(\) \{[\s\S]*?\n\}/m)[0];
+    expect(cleanup).toMatch(/rm -f "\$TMPFILE"/);
+    expect(cleanup).not.toMatch(/echo "-?\d+" > "\$TMPFILE"/);
   });
 
   it('validates every manifest field it consumes, before it consumes it', () => {

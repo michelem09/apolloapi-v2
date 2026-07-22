@@ -295,6 +295,213 @@ class McuService {
     }
   }
 
+  // What the last update run is doing, or did.
+  //
+  // Two things together, because either alone lies. The record says what the
+  // updater believes; systemd says whether it is still there to believe it. A
+  // record stuck on "running" with no unit alive means the updater was killed —
+  // a state the previous design could not express at all, and which silently
+  // latched service recovery off.
+  //
+  // The run_id is what lets a client recognise ITS update. Before it, the client
+  // compared the browser's clock against the device's to decide whether a record
+  // was its own — on boards with no RTC, whose clock is known to ship wrong, and
+  // in the minutes right after a restart when NTP has not converged.
+  async getUpdateStatus() {
+    const [running, record] = await Promise.all([
+      this._updateUnitActive(),
+      this._readUpdateRecord(),
+    ]);
+
+    // An update the client is waiting on that is neither running nor finished.
+    if (record && record.state === 'running' && !running) {
+      return { running: false, record: { ...record, state: 'interrupted' } };
+    }
+    return { running, record };
+  }
+
+  async _updateUnitActive() {
+    try {
+      const { stdout } = await execPromise('systemctl is-active apollo-update.service');
+      return stdout.trim() === 'active';
+    } catch (error) {
+      return false; // inactive, failed, unknown — all "not running"
+    }
+  }
+
+  // Null when no update has ever run, or when the file is unreadable or
+  // malformed: the one file whose job is to explain a failure must not become a
+  // second one on a device that is otherwise fine.
+  async _readUpdateRecord() {
+    const filePath = join(getStateDir(), 'last-update.json');
+    let raw;
+    try {
+      raw = await fs.readFile(filePath, 'utf8');
+    } catch (error) {
+      return null;
+    }
+    try {
+      const record = JSON.parse(raw);
+      if (!record || typeof record.state !== 'string') return null;
+      return {
+        runId: record.run_id || null,
+        state: record.state,
+        phase: record.phase || null,
+        progress: typeof record.progress === 'number' ? record.progress : null,
+        from: record.from || null,
+        to: record.to || null,
+        reason: record.reason || null,
+        startedAt: record.started_at || null,
+        updatedAt: record.updated_at || null,
+      };
+    } catch (error) {
+      console.log('Malformed update record:', error.message);
+      return null;
+    }
+  }
+
+  // What this device is running.
+  //
+  // version.json is written by the updater from the release it installed, so it is
+  // the only file that reflects what actually happened. package.json is the
+  // fallback for a device that has never taken a tarball update.
+  _installedVersion() {
+    const root = join(__dirname, '..', '..');
+    for (const file of ['version.json', 'package.json']) {
+      try {
+        // eslint-disable-next-line global-require, import/no-dynamic-require
+        const parsed = require(join(root, file));
+        if (parsed && parsed.version) return parsed.version;
+      } catch (error) {
+        // try the next one
+      }
+    }
+    return null;
+  }
+
+  // Where the updater fetches from, read exactly as backend/update reads it so the
+  // two can never disagree about which channel this device is on.
+  async _channelUrl() {
+    const defaults = { base: 'https://github.com/jstefanop', repo: 'apolloapi-v2', channel: 'stable' };
+    let conf = {};
+    try {
+      const raw = await fs.readFile(join(getStateDir(), 'source.conf'), 'utf8');
+      for (const line of raw.split('\n')) {
+        const match = line.match(/^\s*(APOLLO_[A-Z_]+)=(.*)$/);
+        if (match) conf[match[1]] = match[2].trim().replace(/^["']|["']$/g, '');
+      }
+    } catch (error) {
+      // No source.conf: this device has not been switched yet, use the defaults.
+    }
+    const base = conf.APOLLO_GIT_BASE || defaults.base;
+    const repo = conf.APOLLO_API_REPO || defaults.repo;
+    const channel = conf.APOLLO_CHANNEL || defaults.channel;
+    return `${base}/${repo}/releases/download/channel-${channel}/${channel}.json`;
+  }
+
+  // The version this device could install, taken from the signed update channel —
+  // the same manifest backend/update gates on.
+  //
+  // It used to come from jstefanop/apolloui-v2@main/package.json over plain HTTP:
+  // a different source from the one the updater installs against, unsigned, and
+  // unrelated to the release. The banner and the OTA channel could never agree,
+  // and on a device pointed at a fork the comparison never converged at all, so
+  // the update button was either permanently offered or never shown.
+  //
+  // Null when the channel cannot be reached: offering an update we cannot name is
+  // worse than staying quiet.
+  async _availableVersion() {
+    const now = Date.now();
+    if (this._versionCache && now - this._versionCache.at < 5 * 60 * 1000) {
+      return this._versionCache.value;
+    }
+    let value = null;
+    try {
+      const url = await this._channelUrl();
+      const response = await axios.get(url, { timeout: 15000 });
+      if (response && response.data && typeof response.data.version === 'string') {
+        value = response.data.version;
+      }
+    } catch (error) {
+      console.log('Could not read the update channel:', error.message);
+    }
+    this._versionCache = { at: now, value };
+    return value;
+  }
+
+  // Get application version
+  async getVersion() {
+    const installed = this._installedVersion();
+    const available = await this._availableVersion();
+    return {
+      // `result` keeps its old meaning — the version out there — so a browser
+      // still running an older UI bundle keeps working during the swap.
+      result: available || installed,
+      installed,
+      available,
+    };
+  }
+
+  // Update firmware
+  async update() {
+    try {
+      let scriptName = 'update';
+      if (process.env.NODE_ENV === 'development') scriptName = 'update.fake';
+
+      const updateScript = join(__dirname, '../../backend', scriptName);
+      const cmd = spawn(process.env.NODE_ENV === 'development' ? 'bash' : 'sudo', 
+        process.env.NODE_ENV === 'development' ? [updateScript] : ['bash', updateScript]);
+
+      cmd.stdout.on('data', (data) => {
+        console.log(`stdout: ${data}`);
+      });
+
+      cmd.stderr.on('data', (data) => {
+        console.error(`stderr: ${data}`);
+      });
+
+      cmd.on('close', (code) => {
+        console.log(`child process exited with code ${code}`);
+      });
+    } catch (error) {
+      throw new GraphQLError(`Failed to update firmware: ${error.message}`);
+    }
+  }
+
+  // Get update progress
+  async getUpdateProgress() {
+    try {
+      // Check if the progress file exists
+      const filePath = '/tmp/update_progress';
+      let fileExists = true;
+
+      try {
+        await fs.access(filePath, fs.constants.F_OK);
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          // File doesn't exist
+          console.log('update_progress file not found. Returning default progress.');
+          fileExists = false;
+        } else {
+          throw error;
+        }
+      }
+
+      if (!fileExists) {
+        return { value: 0 };
+      }
+
+      // Read the progress value from the file
+      const data = await fs.readFile(filePath);
+      const progress = parseInt(data.toString());
+
+      return { value: progress };
+    } catch (error) {
+      console.log('Error getting update progress:', error);
+      return { value: 0 };
+    }
+  }
+
   // What the last update attempt did.
   //
   // The updater stops this API partway through, so progress polling goes dark for
