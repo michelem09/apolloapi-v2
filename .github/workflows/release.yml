@@ -161,12 +161,23 @@ jobs:
           # copying them again would nest them a second time.
           cp -r apolloui-v2/.next/standalone "$STAGE/apolloui-v2/.next/standalone"
 
-          # backend/ carries the launch scripts, systemd units and the small
-          # miner/ckpool binaries. bitcoind (backend/node/bin, ~214 MB across four
-          # flavours) is deliberately excluded: it ships as its own package, which
-          # is the whole reason the tarball can stay small.
+          # backend/ carries the launch scripts, systemd units, the small
+          # miner/ckpool binaries — and bitcoind.
+          #
+          # bitcoind used to be excluded to keep the tarball small, and carried
+          # across the swap from whatever the device already had. But the LIST of
+          # selectable flavours travels in the release (the GraphQL enum, the UI
+          # picker, node_start.sh), so a device imaged before core-31.0 existed
+          # would take an update, be offered Core 31.0 in Settings, and get a
+          # node.service that crash-loops on "executable not found" with no way
+          # out from the UI. Only step 6 — bitcoind as its own on-demand package —
+          # makes excluding it safe, and shipping the updater before that would
+          # leave customers exactly there.
+          #
+          # x86_64 is dropped: devices are aarch64, and it is more than half the
+          # weight (111 MB of 214 MB).
           mkdir -p "$STAGE/backend"
-          tar -C backend --exclude='node/bin' -cf - . | tar -C "$STAGE/backend" -xf -
+          tar -C backend --exclude='node/bin/*/x86_64' -cf - . | tar -C "$STAGE/backend" -xf -
 
           # Materialize the miner/ckpool runtime binaries the launch scripts call.
           # They are install-time artifacts copied from bin/<arch>/, not tracked

@@ -115,6 +115,12 @@ describe('update lifecycle contract', () => {
     expect(script).toMatch(/Artifact is missing \$d/);
     expect(script).toMatch(/Artifact is missing \$f/);
 
+    // bitcoind travels in the release now, so its absence is a broken artifact,
+    // not a device that never had it. Without this the wholesale replacement of
+    // backend/ would leave the device with no node at all.
+    expect(script).toMatch(/Artifact is missing bitcoind for \$flavour/);
+    expect(script).toMatch(/Artifact is missing the \$unit unit/);
+
     const assertion = script.indexOf('Artifact is missing $d');
     const backup = script.indexOf('backup_code\n');
     expect(assertion).toBeGreaterThan(-1);

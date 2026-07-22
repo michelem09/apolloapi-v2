@@ -400,13 +400,6 @@ fi
 # a deletion silently ineffective, including one that IS the security fix.
 OWNED='src config migrations node_modules backend'
 
-# The single exception: bitcoind (~103 MB across flavours) is deliberately not in
-# the artifact, so it is carried across the swap instead of being deleted with
-# the rest of backend/. Keeping it to ONE explicit path is the point — a forgotten
-# entry here fails loudly at startup, which is far safer than the silent staleness
-# a merge would leave behind. Step 6 (bitcoind as its own package) removes even this.
-PRESERVED_BIN="$BACKUP_DIR/.preserved-node-bin"
-
 # Root-level files the release owns. version.json matters most: it is what the
 # device believes it is running, so a rollback that leaves the new one behind
 # makes every later update exit "Already on <version>" against old code — an OTA
@@ -417,56 +410,15 @@ ROOT_FILES='knexfile.js package.json version.json'
 # cannot drift apart and leave a unit un-revertable.
 UNITS='apollo-bootstrap apollo-api apollo-ui-v2 apollo-miner node ckpool rc-local swap'
 
-preserve_binaries() {
-  # An existing $PRESERVED_BIN is an orphan left by a run that died between here
-  # and place_binaries without its traps firing — SIGKILL, OOM, power cut. Since
-  # the artifact ships no bitcoind and the code backup does not contain it either
-  # (this runs before backup_code moves backend/), that orphan can be the device's
-  # ONLY copy. Deleting it unconditionally, as this used to, destroyed ~214 MB of
-  # bitcoind permanently, and the run then reported success.
-  if [ -d "$PRESERVED_BIN" ]; then
-    if [ -d "$APOLLO_DIR/backend/node/bin" ]; then
-      # The tree has its own copy, so the orphan is stale and safe to drop.
-      rm -rf "$PRESERVED_BIN"
-    else
-      # The orphan is all there is. Keep it; place_binaries will put it back.
-      err "Recovered bitcoind preserved by an interrupted update"
-      return 0
-    fi
-  fi
-  [ -d "$APOLLO_DIR/backend/node/bin" ] && mv "$APOLLO_DIR/backend/node/bin" "$PRESERVED_BIN"
-  return 0
-}
-
-# Rollback-safe counterpart. It must never delete $PRESERVED_BIN: between
-# preserve_binaries and place_binaries that directory holds the device's ONLY
-# copy of bitcoind, because the artifact ships none. Calling preserve_binaries
-# here — whose first act is `rm -rf "$PRESERVED_BIN"` — destroyed it, and the
-# rollback then "succeeded" with zero bitcoind on the device and no release able
-# to put it back.
-rescue_binaries() {
-  [ -d "$PRESERVED_BIN" ] && return 0
-  [ -d "$APOLLO_DIR/backend/node/bin" ] && mv "$APOLLO_DIR/backend/node/bin" "$PRESERVED_BIN"
-  return 0
-}
-
-place_binaries() {
-  if [ ! -d "$PRESERVED_BIN" ]; then
-    if [ -d "$APOLLO_DIR/backend/node/bin" ]; then return 0; fi
-    err "No bitcoind on this device — the node cannot start"
-    return 1
-  fi
-  mkdir -p "$APOLLO_DIR/backend/node"
-  # rm THEN mv, so a failing mv loses the only copy: the artifact ships no
-  # bitcoind and the code backup does not contain it either. Reported so a
-  # rollback that lost it is recorded as recovery-failed rather than success.
-  rm -rf "$APOLLO_DIR/backend/node/bin"
-  if ! mv "$PRESERVED_BIN" "$APOLLO_DIR/backend/node/bin"; then
-    err "Could not put bitcoind back — the node cannot start"
-    return 1
-  fi
-  return 0
-}
+# backend/ is replaced wholesale, bitcoind included. It used to be the single
+# carried-across exception — excluded from the artifact to keep it small, and
+# moved aside and back around the swap. That machinery is gone: the release now
+# ships the six aarch64 flavours, so the binaries and the code that lists them
+# travel together, and a device can never be offered a flavour it does not have.
+#
+# It also removes the window the exception created, in which the device's ONLY
+# copy of bitcoind lived in a temporary directory that a crash could orphan and
+# the next run could delete.
 
 # Claims the backup directory for this run. Called BEFORE any mutation, because
 # the window between "we started changing things" and "we know where the old copy
@@ -686,7 +638,6 @@ restore_code() {
 
   local rc=0 d f
   restore_database || rc=1
-  rescue_binaries || rc=1
 
   for d in $OWNED; do
     if [ -e "$b/$d" ]; then
@@ -704,7 +655,6 @@ restore_code() {
     rm -rf "$UI_DIR/.next" || rc=1
     mv "$b/apolloui-v2/.next" "$UI_DIR/.next" || rc=1
   fi
-  place_binaries || rc=1
 
   for f in $ROOT_FILES; do
     if [ -e "$b/$f" ]; then
@@ -861,6 +811,14 @@ for unit in $UNITS; do
   [ -e "$STAGING/backend/systemd/$unit.service" ] \
     || die "Artifact is missing the $unit unit — refusing to install"
 done
+# bitcoind now travels in the release, so its absence is a broken artifact and
+# not a device that simply never had it. Checked BEFORE the swap, because
+# backend/ is replaced wholesale: installing an artifact without these would
+# leave the device with no node at all.
+for flavour in $(ls "$APOLLO_DIR/backend/node/bin" 2>/dev/null | grep -v '^bitcoin.conf$' || true); do
+  [ -x "$STAGING/backend/node/bin/$flavour/aarch64/bitcoind" ] \
+    || die "Artifact is missing bitcoind for $flavour — refusing to install"
+done
 for f in $ROOT_FILES; do
   [ -e "$STAGING/$f" ] || die "Artifact is missing $f — refusing to install"
 done
@@ -898,12 +856,10 @@ log "Installing $VERSION"
 # before anything can go wrong.
 claim_backup
 MUTATED=1
-preserve_binaries
 backup_code
 for d in $OWNED; do [ -e "$STAGING/$d" ] && mv "$STAGING/$d" "$APOLLO_DIR/$d"; done
 mkdir -p "$UI_DIR/.next"
 mv "$STAGING/apolloui-v2/.next/standalone" "$UI_DIR/.next/standalone"
-place_binaries
 for f in $ROOT_FILES; do
   [ -e "$STAGING/$f" ] && cp "$STAGING/$f" "$APOLLO_DIR/$f"
 done

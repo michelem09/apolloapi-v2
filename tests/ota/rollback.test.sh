@@ -28,7 +28,7 @@ export RESULTS
 # killed that subshell silently. Re-introducing a real rollback regression
 # dropped the suite from 27 assertions to 21 and it still exited 0.
 # Update this number when adding or removing an assertion — deliberately.
-EXPECTED_ASSERTIONS=51
+EXPECTED_ASSERTIONS=48
 
 ok()   { echo p >> "$RESULTS/pass"; printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad()  { echo f >> "$RESULTS/fail"; printf '  \033[0;31m✗\033[0m %s\n     %s\n' "$1" "${2:-}"; }
@@ -77,28 +77,27 @@ flavours() { ls "$APOLLO_ROOT_DIR/backend/node/bin" 2>/dev/null | wc -l | tr -d 
 
 echo "rollback contract"
 
-# --- bitcoind survives a rollback --------------------------------------------
-# The regression that made this file necessary: restore_code called
-# preserve_binaries, whose first statement deletes $PRESERVED_BIN — the only copy
-# of bitcoind in the window between preserve and place.
+# --- bitcoind travels with backend/, like everything else ---------------------
+# It used to be excluded from the artifact and carried across the swap by hand,
+# which created a window where the device's only copy lived in a temporary
+# directory. The release now ships the six aarch64 flavours, so the binaries and
+# the code that lists them move together and the exception is gone.
 (
   make_device
-  preserve_binaries          # bitcoind now lives ONLY at $PRESERVED_BIN
+  claim_backup
   backup_code 2>/dev/null
-  check "bitcoind is out of the tree mid-update" "$(flavours)" "0"
+  check "backend/ is moved aside whole, bitcoind included" "$(flavours)" "0"
   restore_code >/dev/null 2>&1
-  check "rollback puts all six flavours back" "$(flavours)" "6"
+  check "rollback brings all six flavours back with it" "$(flavours)" "6"
   check "rollback restores the old code" "$(cat "$APOLLO_ROOT_DIR/src/marker" 2>/dev/null)" "OLD"
 )
 
-# --- a crashed run followed by a clean one ------------------------------------
-# Run 1 dies after preserve; run 2 must not delete the orphaned copy.
+# --- two consecutive failed runs -----------------------------------------------
 (
   make_device
-  preserve_binaries
-  backup_code 2>/dev/null
+  claim_backup; backup_code 2>/dev/null
   restore_code >/dev/null 2>&1          # run 1 rolls back
-  preserve_binaries                     # run 2 starts
+  claim_backup; backup_code 2>/dev/null # run 2 starts
   restore_code >/dev/null 2>&1          # run 2 also rolls back
   check "bitcoind survives two consecutive failed runs" "$(flavours)" "6"
 )
@@ -125,7 +124,7 @@ echo "rollback contract"
 (
   make_device
   echo '{"version":"2.2.0"}' > "$APOLLO_ROOT_DIR/version.json"
-  preserve_binaries; backup_code 2>/dev/null
+  claim_backup; backup_code 2>/dev/null
   echo '{"version":"2.3.0"}' > "$APOLLO_ROOT_DIR/version.json"   # the new release
   restore_code >/dev/null 2>&1
   check "version.json reverted to the old release" \
@@ -138,7 +137,7 @@ echo "rollback contract"
 (
   make_device
   rm -f "$APOLLO_ROOT_DIR/version.json"
-  preserve_binaries; backup_code 2>/dev/null
+  claim_backup; backup_code 2>/dev/null
   echo '{"version":"2.3.0"}' > "$APOLLO_ROOT_DIR/version.json"
   restore_code >/dev/null 2>&1
   if [ -e "$APOLLO_ROOT_DIR/version.json" ]; then
@@ -229,7 +228,6 @@ EOF
   # directories one at a time. Simulate it aborting after src/ and config/ — the
   # .complete marker is never written.
   claim_backup
-  preserve_binaries
   mv "$APOLLO_ROOT_DIR/src" "$BACKUP_CODE/src"
   mv "$APOLLO_ROOT_DIR/config" "$BACKUP_CODE/config"
   echo 'LIVE' > "$APOLLO_ROOT_DIR/backend/marker"
@@ -271,20 +269,6 @@ EOF
     "$(cat "$APOLLO_ROOT_DIR/src/marker" 2>/dev/null)" "OLD"
 )
 
-# --- an orphaned bitcoind from a crashed run is adopted, not deleted ----------
-# A run killed between preserve_binaries and place_binaries leaves bitcoind only
-# at $PRESERVED_BIN — it is not in the code backup either. The next run used to
-# `rm -rf` it and then complete successfully with no bitcoind on the device.
-(
-  make_device
-  preserve_binaries                      # run 1 moves it aside
-  check "the tree has no bitcoind mid-update" "$(flavours)" "0"
-  # run 1 is SIGKILLed here: no trap, nothing restores it.
-  preserve_binaries                      # run 2 starts
-  place_binaries
-  check "run 2 adopts the orphan instead of deleting it" "$(flavours)" "6"
-)
-
 # --- restore_code reports failure instead of claiming success -----------------
 (
   make_device
@@ -308,7 +292,7 @@ EOF
   sqlite3 "$db" "CREATE TABLE knex_migrations (name TEXT); INSERT INTO knex_migrations VALUES ('001_old.js');"
   printf 'DATABASE_URL=%s\n' "$db" > "$APOLLO_ROOT_DIR/.env"
 
-  preserve_binaries; backup_code
+  claim_backup; backup_code
   if [ -f "$BACKUP_CODE/futurebit.sqlite" ]; then ok "the database is backed up with the code"
   else bad "the database is backed up with the code" "no snapshot in $BACKUP_CODE"; fi
 
@@ -339,7 +323,7 @@ EOF
   sqlite3 "$db" "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('old');"
   printf 'DATABASE_URL=%s\n' "$db" > "$APOLLO_ROOT_DIR/.env"
   claim_backup
-  preserve_binaries; backup_code 2>/dev/null
+  claim_backup; backup_code 2>/dev/null
 
   # The restore of the database now fails, as it would on a full disk.
   cat > "$STUBS/cp" <<'EOF'
@@ -354,30 +338,6 @@ EOF
     bad "a failed database restore is reported" "restore_code returned success"
   else ok "a failed database restore is reported"; fi
   rm -f "$STUBS/cp"; hash -r
-)
-
-# --- losing bitcoind during a rollback must be reported too -------------------
-# place_binaries removes the live directory and THEN moves the preserved copy in.
-# The artifact ships no bitcoind and the code backup does not contain it, so a
-# failing mv loses the only copy — which used to be a warning in a log nobody
-# reads, on a run that reported success.
-(
-  make_device
-  claim_backup
-  preserve_binaries        # bitcoind now lives only at $PRESERVED_BIN
-  backup_code 2>/dev/null
-  cat > "$STUBS/mv" <<'EOF'
-#!/bin/bash
-for a in "$@"; do case "$a" in *node/bin) exit 1;; esac; done
-exec /bin/mv "$@"
-EOF
-  chmod +x "$STUBS/mv"
-  hash -r   # same: preserve_binaries already resolved /bin/mv
-
-  if restore_code >/dev/null 2>&1; then
-    bad "losing bitcoind is reported as a failed rollback" "restore_code returned success"
-  else ok "losing bitcoind is reported as a failed rollback"; fi
-  rm -f "$STUBS/mv"; hash -r
 )
 
 # --- manifest fields are validated as whole values ----------------------------
