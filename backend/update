@@ -5,9 +5,14 @@
 # 10–20 minutes and peaked enough RAM to take the box down. The release is built
 # and signed by CI; the device only verifies and unpacks it.
 #
-# Deliberately NOT the release-layout OTA (releases/<v> + current symlink): the
-# update mechanism itself never changes, so a bad release is corrected by the
-# next one through the same still-working path. See OTA_UPDATE_REDESIGN.md §5.1.
+# Not yet the release-layout OTA (releases/<v> + current symlink), and first on
+# purpose: the update mechanism itself never changes here, so a bad release is
+# corrected by the next one through the same still-working path. That property is
+# also what makes the layout crossing safe to attempt later — it arrives as an
+# ordinary signed release, verified and health-gated, instead of being pushed to
+# the fleet blind. Download, verification and rollback carry over unchanged; only
+# what happens to the verified staging directory differs.
+# See OTA_UPDATE_REDESIGN.md §5.2.
 #
 # The directories the release owns are replaced wholesale, so a file deleted
 # upstream really disappears. bitcoind under backend/node/bin is the single
