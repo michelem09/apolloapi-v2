@@ -1,147 +1,178 @@
 #!/bin/bash
+# Minimal crossing from the git-pull updater to the signed-tarball updater.
+#
+# The old backend/update git-pulls this file and runs it. Rather than
+# re-implementing download/stop/swap/health — every guard of which the tarball
+# updater already carries, and a weaker copy of which would have to re-earn each
+# one on the single run that matters — this does only the work unique to the
+# crossing and HANDS OFF to the backend/update it lays down:
+#
+#   1. install the verification tools (they ride in this same commit)
+#   2. write the fork's channel and trust identity where backend/update reads them
+#   3. verify a signed release and lay down its backend/update (+ lib, utils)
+#   4. exec that backend/update
+#
+# From there the delegated updater does everything that could leave a device
+# stopped or half-swapped, with the guards it already has: it detaches from
+# apollo-api's cgroup (so stopping the API cannot SIGTERM the run itself),
+# validates every URL, verifies the signature again, backs up the old tree,
+# stops and verifies the stop, swaps, installs units, health-checks, and rolls
+# back on failure. So the crossing INHERITS that backup and rollback — a failed
+# migration returns the device to working 2.1.2 rather than bricking it.
+#
+# apollo-bootstrap then relocates the DB and configs out of the checkout on the
+# next service start. No reboot: the delegated updater restarts services in order.
+set -Eeuo pipefail
 
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
-TMPFILE='/tmp/update_progress'
+YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+log() { echo -e "${YELLOW} ---> $*${NC}"; }
+die() { echo -e "${RED}BRIDGE FAILED: $*${NC}" >&2; exit 1; }
+
 APOLLO_DIR=/opt/apolloapi
+STATE_DIR=/var/lib/apollo
+DL_DIR="$STATE_DIR/cache/dl"
 
-### SYSTEM commands ###
+# The fork's dev channel and keyless signing identity. Written to disk below so
+# the delegated run AND every later update read them the same way; the constants
+# here are only for this script's own download.
+GIT_BASE='https://github.com/michelem09'
+API_REPO='apolloapi-v2'
+CHANNEL='dev'
+OWNER="${GIT_BASE##*/}"
+CHANNEL_URL="$GIT_BASE/$API_REPO/releases/download/channel-$CHANNEL/$CHANNEL.json"
+# Built from the parts above, so the owner and repo appear once. Hand-writing the
+# regex duplicated `michelem09/apolloapi-v2` inside it, where a fork rename would
+# not be caught by a grep for GIT_BASE. The dots are the only regex-escaped bits.
+TRUST_IDENTITY="^https://github\\.com/${OWNER}/${API_REPO}/\\.github/workflows/release\\.yml@refs/tags/v"
+TRUST_ISSUER='https://token.actions.githubusercontent.com'
 
+have() { command -v "$1" >/dev/null 2>&1; }
+sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+# https only, no embedded newline; and every URL is passed after --url so a value
+# beginning with '-' is never read by curl as an option (-K reads a config file).
+valid_url() { case "$1" in https://*) [[ "$1" != *$'\n'* ]] ;; *) return 1 ;; esac; }
+fetch() { curl -fsSL --retry 3 --connect-timeout 15 --url "$1"; }
 
-. /usr/local/nvm/nvm.sh
+[ "$EUID" -eq 0 ] || die "must run as root"
+[ "$(uname -m)" = aarch64 ] || die "the release is aarch64 only; this is $(uname -m)"
 
-nvm use 21
+# 1. Verification tools (jq/zstd/cosign). The installer travels in this same
+#    bridge commit, so it is already on disk after the git pull, and the
+#    chicken-and-egg (cosign lives inside the release it must verify) is solved
+#    before any download.
+log "Installing verification tools"
+DEPS="$APOLLO_DIR/backend/utils/install-update-deps.sh"
+[ -x "$DEPS" ] || die "dependency installer missing from the bridge commit"
+bash "$DEPS" || die "dependency install failed"
+# sqlite3 too: the delegated backend/update hard-requires it, so naming it here
+# fails the crossing with a clear message instead of one layer down in the
+# delegate. install-update-deps.sh provisions it.
+for t in jq zstd cosign sha256sum tar curl sqlite3; do have "$t" || die "missing $t after install"; done
 
-echo "30" > $TMPFILE
+# 2. Manifest.
+log "Reading the dev channel"
+valid_url "$CHANNEL_URL" || die "channel URL is not plain https"
+MANIFEST="$(fetch "$CHANNEL_URL")" || die "cannot reach the update channel"
+VERSION="$(jq -r '.version // empty' <<<"$MANIFEST")"
+SHA="$(jq -r '.sha256 // empty' <<<"$MANIFEST")"
+URL="$(jq -r '.url // empty' <<<"$MANIFEST")"
+SIG_URL="$(jq -r '.signature_url // empty' <<<"$MANIFEST")"
+CERT_URL="$(jq -r '.certificate_url // empty' <<<"$MANIFEST")"
+# Validated before it reaches a file path below. The manifest is TLS-fetched but
+# NOT signature-verified, so a crafted version like ../../etc/cron.d/x would make
+# the download write attacker bytes outside DL_DIR as root, before the sha and
+# cosign checks — and the attacker controls the sha in the same manifest. Same
+# guard the delegate applies before it builds its own path.
+printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$' \
+  || die "manifest version is malformed"
+printf '%s' "$SHA" | grep -qE '^[0-9a-f]{64}$' || die "manifest sha256 is malformed"
+for u in "$URL" "$SIG_URL" "$CERT_URL"; do valid_url "$u" || die "a manifest URL is not plain https"; done
 
-### API ###
-echo -e "${YELLOW} ---> Updating API modules${NC}"
-
-cd $APOLLO_DIR
-
-yarn
-
-echo "40" > $TMPFILE
-
-### UI ###
-echo -e "${YELLOW} ---> Updating UI modules${NC}"
-
-cd $APOLLO_DIR/apolloui-v2
-
-yarn --ignore-engines
-
-echo "50" > $TMPFILE
-
-echo -e "${YELLOW} ---> Building UI (could take few minutes)${NC}"
-
-rm -rf .next
-
-yarn build
-
-yarn cache clean
-
-echo "70" > $TMPFILE
-
-### Update Miner/Node Binaries ###
-
-echo -e "${YELLOW} ---> Updating System binaries${NC}"
-
-arch=$(uname -m)
-
-cp $APOLLO_DIR/backend/apollo-miner/bin/$arch/apollo-miner $APOLLO_DIR/backend/apollo-miner/futurebit-miner
-cp $APOLLO_DIR/backend/apollo-miner/bin/$arch/apollo-miner-v2 $APOLLO_DIR/backend/apollo-miner/futurebit-miner-v2
-cp $APOLLO_DIR/backend/apollo-miner/bin/$arch/apollo-helper $APOLLO_DIR/backend/apollo-miner/
-
-### Bitcoind ###
-#########################
-echo -e "${YELLOW} ---> Updating Bitcoin node${NC}"
-
-
-# Stop node service if running
-if systemctl is-active --quiet node.service; then
-    echo -e "${YELLOW} ---> Stopping node service${NC}"
-    systemctl stop node.service
-fi
-
-#Create new api/user config files
-touch $APOLLO_DIR/backend/node/api.conf
-touch $APOLLO_DIR/backend/node/user.conf
-
-# Get node_software from database
-NODE_SOFTWARE=$(sqlite3 "$APOLLO_DIR/futurebit.sqlite" "SELECT node_software FROM settings ORDER BY created_at DESC, id DESC LIMIT 1")
-if [ -z "$NODE_SOFTWARE" ]; then
-  NODE_SOFTWARE="core-28.1"
-fi
-
-# Validate and set default if invalid
-if [[ "$NODE_SOFTWARE" != "core-25.1" && "$NODE_SOFTWARE" != "core-28.1" && "$NODE_SOFTWARE" != "core-29.2" && "$NODE_SOFTWARE" != "knots-29.2" ]]; then
-  echo -e "${YELLOW} ---> Invalid node_software value: $NODE_SOFTWARE, defaulting to core-28.1${NC}"
-  NODE_SOFTWARE="core-28.1"
-fi
-
-# Copy the correct bitcoind binary based on node_software
-cp $APOLLO_DIR/backend/node/bin/$NODE_SOFTWARE/$arch/bitcoind $APOLLO_DIR/backend/node/bitcoind
-echo -e "${YELLOW} ---> Updated to $NODE_SOFTWARE bitcoind binary${NC}"
-
-cp $APOLLO_DIR/backend/default-configs/bitcoin.conf $APOLLO_DIR/backend/node/
-
-
-
-### ckpool ###
-#########################
-cp $APOLLO_DIR/backend/ckpool/bin/$arch/ckpool $APOLLO_DIR/backend/ckpool/
-cp $APOLLO_DIR/backend/default-configs/ckpool.conf $APOLLO_DIR/backend/ckpool/
-
-### Write back the Bitcoin RPC password on conf file
-PASS=$(sqlite3 "$APOLLO_DIR/futurebit.sqlite" "SELECT node_rpc_password FROM settings ORDER BY id DESC LIMIT 1;")
-
-if [ -z "$PASS" ]
-then
-	echo "Bitcoin password is empty will be generated by the app"
+# 3. Download into the cache the delegated updater reads — same directory, same
+#    name — so it reuses the tarball instead of downloading again. On disk, not
+#    /tmp: these images back /tmp with tmpfs, and ~86 MB in RAM on a 4 GB board is
+#    the memory pressure the tarball updater exists to remove.
+#
+#    Verified here because the NEXT step runs backend/update straight out of this
+#    tarball — the delegate's own verify happens after that code is already
+#    executing, so it cannot be the thing that vouches for it. The delegate then
+#    re-verifies before it extracts over the device; two checks, and the earlier
+#    one is the one that gates code execution.
+log "Downloading and verifying $VERSION"
+mkdir -p "$DL_DIR"
+TB="$DL_DIR/apollo-${VERSION}-aarch64.tar.zst"
+# Reuse a cached tarball whose checksum already matches — a retry after a failure
+# later in the crossing should not re-pull ~86 MB over a slow link. Same check
+# the delegated updater does.
+if [ -f "$TB" ] && [ "$(sha256_of "$TB")" = "$SHA" ]; then
+  log "Reusing the verified tarball already in cache"
 else
-	sed -i "s/rpcpassword=.*/rpcpassword=${PASS}/" "$APOLLO_DIR/backend/node/api.conf"
+  curl -fL --retry 3 --connect-timeout 15 --max-time 1800 -o "$TB" --url "$URL" || die "tarball download failed"
 fi
+curl -fsSL --max-time 120 -o "$TB.sig" --url "$SIG_URL"  || die "signature download failed"
+curl -fsSL --max-time 120 -o "$TB.pem" --url "$CERT_URL" || die "certificate download failed"
+[ "$(sha256_of "$TB")" = "$SHA" ] || die "sha256 mismatch"
+cosign verify-blob --certificate "$TB.pem" --signature "$TB.sig" \
+  --certificate-identity-regexp "$TRUST_IDENTITY" \
+  --certificate-oidc-issuer "$TRUST_ISSUER" "$TB" >/dev/null 2>&1 \
+  || die "cosign signature verification failed"
 
-### Set Bitcoin max connections to 64 by default if set to 32
-MAXCONNECTIONS=`sqlite3 $APOLLO_DIR/futurebit.sqlite "SELECT node_max_connections FROM settings ORDER BY id DESC LIMIT 1;"`
+# 4. Persist BOTH halves of the redirection, and only now — after the release is
+#    verified. Written earlier, a crossing that failed at download or verify would
+#    leave a device that never crossed permanently repointed at one developer's
+#    fork channel and signing identity. Both are needed together: writing only the
+#    trust half would make the next UI update default the channel to the official
+#    stable one and then verify it against the fork identity — which can never
+#    agree, so every later OTA would die at the signature check. The delegated run
+#    below and every later update read exactly these two files.
+log "Establishing the update channel and trust identity"
+mkdir -p "$STATE_DIR" /etc/apollo
+( umask 022; cat > "$STATE_DIR/source.conf" <<EOF
+# Written by the tarball crossing. The fork's dev channel.
+APOLLO_GIT_BASE=$GIT_BASE
+APOLLO_API_REPO=$API_REPO
+APOLLO_CHANNEL=$CHANNEL
+EOF
+)
+chown futurebit:futurebit "$STATE_DIR/source.conf" 2>/dev/null || true
+# Trust is a root-only decision, so this file is root-owned, not app-writable.
+( umask 022; cat > /etc/apollo/update.conf <<EOF
+# Written by the tarball crossing. Trust the fork's keyless signing identity.
+APOLLO_TRUST_IDENTITY=$TRUST_IDENTITY
+APOLLO_TRUST_ISSUER=$TRUST_ISSUER
+EOF
+)
 
-# Function to set Bitcoin max connections to 64
-set_max_connections() {
-    echo "Bitcoin max connections set to 64"
-    sed -i 's/maxconnections=32/maxconnections=64/' "$APOLLO_DIR/backend/node/api.conf"
-    sqlite3 "$APOLLO_DIR/futurebit.sqlite" "UPDATE settings SET node_max_connections = 64 WHERE ID = (SELECT MAX(ID) FROM settings);"
-}
+# 5. Lay down ONLY what runs the delegated updater: its script, the library it
+#    sources, and the dependency installer it may call. It re-swaps backend/
+#    wholesale itself, so this is the minimum to reach it — a few MB unpacked
+#    from the ~86 MB tarball, selectively.
+#
+#    The `./` prefix matters: release.yml packs the tree with `tar -C <stage> .`,
+#    so members are stored as `./backend/update`, and GNU tar only extracts a
+#    named member when the name matches the stored one exactly. Asking for
+#    `backend/update` silently matched nothing and produced an empty stage — found
+#    on hardware, the first crossing. The check below fails loudly if it recurs.
+log "Installing the tarball updater"
+STAGE="$DL_DIR/.bridge-backend"
+rm -rf "$STAGE"; mkdir -p "$STAGE"
+tar -C "$STAGE" --zstd --no-same-owner -xf "$TB" \
+  ./backend/update ./backend/lib ./backend/utils || die "selective extract failed"
+[ -x "$STAGE/backend/update" ]         || die "artifact has no backend/update"
+[ -e "$STAGE/backend/lib/version.sh" ] || die "artifact has no backend/lib/version.sh"
+mkdir -p "$APOLLO_DIR/backend/lib" "$APOLLO_DIR/backend/utils"
+cp -f  "$STAGE/backend/update"  "$APOLLO_DIR/backend/update"
+cp -rf "$STAGE/backend/lib/."   "$APOLLO_DIR/backend/lib/"
+cp -rf "$STAGE/backend/utils/." "$APOLLO_DIR/backend/utils/"
+chmod +x "$APOLLO_DIR/backend/update"
+chown -R futurebit:futurebit "$APOLLO_DIR/backend/update" "$APOLLO_DIR/backend/lib" "$APOLLO_DIR/backend/utils"
+rm -rf "$STAGE"
 
-# Check if MAXCONNECTIONS is empty or set to 32, and apply changes if needed
-if [ -z "$MAXCONNECTIONS" ]; then
-    echo "Bitcoin max connections is empty; setting to 64"
-    set_max_connections
-elif [ "$MAXCONNECTIONS" -eq 32 ]; then
-    echo "Bitcoin max connections is set to 32; updating to 64"
-    set_max_connections
-fi
-
-# Don't touch below this line
-echo "90" > $TMPFILE
-
-### SYSTEMD ###
-echo -e "${YELLOW} ---> Updating systemd files${NC}"
-
-cp $APOLLO_DIR/backend/systemd/apollo-api.service /etc/systemd/system/
-cp $APOLLO_DIR/backend/systemd/apollo-ui-v2.service /etc/systemd/system/
-cp $APOLLO_DIR/backend/systemd/apollo-miner.service /etc/systemd/system/
-cp $APOLLO_DIR/backend/systemd/node.service /etc/systemd/system/
-cp $APOLLO_DIR/backend/systemd/ckpool.service /etc/systemd/system/
-cp $APOLLO_DIR/backend/systemd/rc-local.service /etc/systemd/system/
-
-echo -e "${YELLOW} ---> Reloading systemd${NC}"
-systemctl daemon-reload
-
-echo -e "${YELLOW} ---> Rebooting${NC}"
-
-echo "100" > $TMPFILE
-
-rm $TMPFILE
-
-reboot
+# 6. Hand off. The delegated updater finds the TARBALL already in DL_DIR (the sha
+#    matches, so no second download of the big file — it re-fetches the small
+#    .sig/.pem and re-verifies, which is cheap and keeps its own path self-
+#    contained), reads the channel from the source.conf just written, detaches,
+#    and does the rest with its own guards. No env override: the persisted config
+#    is what this run and every later one use.
+log "Handing off to the tarball updater"
+exec bash "$APOLLO_DIR/backend/update"
