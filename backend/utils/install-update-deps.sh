@@ -25,7 +25,13 @@ have() { command -v "$1" >/dev/null 2>&1; }
 [ "$(id -u)" -eq 0 ] || { echo "[update-deps] must run as root" >&2; exit 1; }
 
 missing=''
-for p in jq zstd; do have "$p" || missing="$missing $p"; done
+# sqlite3 too: backend/update hard-requires the CLI (it reads settings and
+# service_status through it) and self-provisions by running THIS script, so
+# leaving it out means the updater can die at its own dependency gate on an
+# image that happens not to ship it, with nothing left to install it. Fielded
+# 2.1.x images carry it because the old update_system used it directly, but that
+# is an accident of history, not a guarantee.
+for p in jq zstd sqlite3; do have "$p" || missing="$missing $p"; done
 if [ -n "$missing" ]; then
   log "installing from apt:$missing"
   apt-get update -qq

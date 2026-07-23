@@ -158,6 +158,26 @@ describe('update lifecycle contract', () => {
     const provision = script.indexOf('install-update-deps.sh');
     const gate = script.indexOf('Missing dependency');
     expect(gate).toBeGreaterThan(provision);
+
+    // Every hard dependency the gate checks must be one the installer provisions,
+    // or a device without it dies at the gate with nothing left to install it —
+    // the installer IS the self-provision step. sqlite3 was the gap: required by
+    // the gate, absent from the apt list.
+    const gateLine = script.match(/for t in ([a-z0-9 ]+); do\s*\n\s*have "\$t" \|\| die "Missing dependency/);
+    expect(gateLine).not.toBeNull();
+    const required = gateLine[1].trim().split(/\s+/);
+    const deps = fs.readFileSync(
+      path.join(__dirname, '..', 'backend', 'utils', 'install-update-deps.sh'),
+      'utf8'
+    );
+    const aptList = deps.match(/for p in ([a-z0-9 ]+); do have/)[1].trim().split(/\s+/);
+    // cosign is fetched separately (pinned sha), not from apt; everything else
+    // the gate needs must be in the apt list or already a coreutil.
+    const coreutils = ['curl', 'sha256sum', 'tar'];
+    for (const dep of required) {
+      if (dep === 'cosign' || coreutils.includes(dep)) continue;
+      expect(aptList).toContain(dep);
+    }
   });
 
   it('never reports success before the gates that can still roll back', () => {
