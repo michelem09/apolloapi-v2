@@ -5,6 +5,7 @@ const _ = require('lodash');
 const moment = require('moment');
 const { GraphQLError } = require('graphql');
 const { getMinerRuntimeDir, getCkpoolLogsDir } = require('../paths');
+const log = require('../logger')('miner');
 
 // Import the dev miner service for development mode
 const devMinerService =
@@ -44,7 +45,7 @@ class MinerService {
     } catch (error) {
       // Never let this block a miner command (e.g. a device that has not run the
       // automation migration yet).
-      console.log('Could not pause automation:', error.message);
+      log.debug({ err: error }, 'could not pause automation');
     }
   }
 
@@ -80,7 +81,7 @@ class MinerService {
 
       // Start the miner based on environment
       if (process.env.NODE_ENV === 'development') {
-        console.log('Starting dev miner...');
+        log.debug('starting dev miner');
         await devMinerService.startDevMiner();
         
         // In development, update status to online after devMiner starts
@@ -91,7 +92,7 @@ class MinerService {
             status: 'online',
             last_checked: new Date(),
           });
-        console.log('Dev miner started - status updated to online');
+        log.debug('dev miner started - status updated to online');
       } else {
         await this._execCommand('sudo systemctl start apollo-miner');
       }
@@ -118,7 +119,7 @@ class MinerService {
 
       // Stop the miner based on environment
       if (process.env.NODE_ENV === 'development') {
-        console.log('Stopping dev miner...');
+        log.debug('stopping dev miner');
         await devMinerService.stopDevMiner();
         
         // In development, update status to offline after devMiner stops
@@ -129,7 +130,7 @@ class MinerService {
             status: 'offline',
             last_checked: new Date(),
           });
-        console.log('Dev miner stopped - status updated to offline');
+        log.debug('dev miner stopped - status updated to offline');
       } else {
         await this._execCommand('sudo systemctl stop apollo-miner');
       }
@@ -156,7 +157,7 @@ class MinerService {
 
       // Restart the miner based on environment
       if (process.env.NODE_ENV === 'development') {
-        console.log('Restarting dev miner...');
+        log.debug('restarting dev miner');
         await devMinerService.restartDevMiner();
         
         // In development, update status to online after devMiner restarts
@@ -167,7 +168,7 @@ class MinerService {
             status: 'online',
             last_checked: new Date(),
           });
-        console.log('Dev miner restarted - status updated to online');
+        log.debug('dev miner restarted - status updated to online');
       } else {
         await this._execCommand('sudo systemctl restart apollo-miner');
       }
@@ -194,20 +195,20 @@ class MinerService {
       try {
         stats = await this._getMinerStats(settings, pools.pools);
       } catch (statsError) {
-        console.error('Error getting miner stats:', statsError);
+        log.error({ err: statsError }, 'error getting miner stats');
         // Continue with empty stats array instead of failing completely
       }
 
       try {
         ckpool = await this._getCkpoolStats(settings, pools.pools);
       } catch (ckpoolError) {
-        console.error('Error getting ckpool stats:', ckpoolError);
+        log.error({ err: ckpoolError }, 'error getting ckpool stats');
         // Continue with null ckpool data instead of failing completely
       }
 
       return { stats, ckpool };
     } catch (error) {
-      console.error('Error in getStats:', error);
+      log.error({ err: error }, 'error in getStats');
       // Return empty data instead of throwing error
       return { stats: [], ckpool: null };
     }
@@ -254,7 +255,7 @@ class MinerService {
         // Check if file exists before attempting to delete it
         await fs.access(blockFoundFlagFile, fs.constants.F_OK);
         await fs.unlink(blockFoundFlagFile);
-        console.log('Block found flag reset successfully');
+        log.info('block found flag reset successfully');
       } catch (err) {
         if (err.code !== 'ENOENT') {
           // Only throw if error is not "file not found"
@@ -371,7 +372,7 @@ class MinerService {
 
       return { status: 'error' };
     } catch (error) {
-      console.error('Error checking miner status:', error.message);
+      log.error({ err: error }, 'error checking miner status');
       return { status: 'error' };
     }
   }
@@ -385,7 +386,7 @@ class MinerService {
       let received = data.toString('utf8').trim();
 
       if (!received) {
-        console.log(`Skipping empty file: ${filePath}`);
+        log.debug({ filePath }, 'skipping empty stat file');
         return null;
       }
 
@@ -397,14 +398,14 @@ class MinerService {
         .replace(/[^\}]+$/, '');
 
       if (!received.startsWith('{') || !received.endsWith('}')) {
-        console.log(`Invalid JSON format in file ${filePath}, skipping...`);
+        log.debug({ filePath }, 'invalid JSON format in stat file, skipping');
         return null;
       }
 
       try {
         received = JSON.parse(received);
       } catch (parseError) {
-        console.log(`Failed to parse JSON in file ${filePath}: ${parseError.message}`);
+        log.debug({ filePath, err: parseError }, 'failed to parse JSON in stat file');
         return null;
       }
 
@@ -430,7 +431,7 @@ class MinerService {
 
       return received;
     } catch (fileError) {
-      console.log(`Error processing file ${filePath}: ${fileError.message}`);
+      log.debug({ filePath, err: fileError }, 'error processing stat file');
       return null;
     }
   }
@@ -463,7 +464,7 @@ class MinerService {
         statsFiles.map(async (file) => {
           const details = findFileDetails(file);
           if (!details) {
-            console.log(`Could not extract details from filename ${file}, skipping...`);
+            log.debug({ file }, 'could not extract details from filename, skipping');
             return;
           }
           const parsed = await this._parseStatFileEntry(
@@ -494,7 +495,7 @@ class MinerService {
       if (parsed) stats.push(parsed);
     } catch (err) {
       if (err.code !== 'ENOENT') {
-        console.log(`Apollo III stats scan failed: ${err.message}`);
+        log.debug({ err }, 'apollo III stats scan failed');
       }
     }
 
@@ -540,7 +541,7 @@ class MinerService {
                     blockFound = true;
                   }
                 } catch (logErr) {
-                  console.error('Error reading ckpool log:', logErr.message);
+                  log.warn({ err: logErr }, 'error reading ckpool log');
                 }
               } else {
                 throw err;
@@ -586,7 +587,7 @@ class MinerService {
                 
                 // Skip empty files
                 if (!ckpoolUsersData.trim()) {
-                  console.log(`Skipping empty solo file: ${filename}`);
+                  log.debug({ filename }, 'skipping empty solo file');
                   return null;
                 }
 
@@ -601,18 +602,18 @@ class MinerService {
 
                 // Validate JSON structure
                 if (!cleanedData.startsWith('{') || !cleanedData.endsWith('}')) {
-                  console.log(`Invalid JSON format in solo file ${filename}, skipping...`);
+                  log.debug({ filename }, 'invalid JSON format in solo file, skipping');
                   return null;
                 }
 
                 try {
                   return JSON.parse(cleanedData);
                 } catch (parseError) {
-                  console.log(`Failed to parse JSON in solo file ${filename}: ${parseError.message}`);
+                  log.debug({ filename, err: parseError }, 'failed to parse JSON in solo file');
                   return null;
                 }
               } catch (fileError) {
-                console.log(`Error processing solo file ${filename}: ${fileError.message}`);
+                log.debug({ filename, err: fileError }, 'error processing solo file');
                 return null;
               }
             });
@@ -624,7 +625,7 @@ class MinerService {
             try {
               poolData = await this._parseFileToJsonArray(ckpoolPoolStatsFile);
             } catch (poolError) {
-              console.log(`Error parsing pool stats file: ${poolError.message}`);
+              log.debug({ err: poolError }, 'error parsing pool stats file');
             }
 
             ckpoolData = {
@@ -667,16 +668,14 @@ class MinerService {
               allKeys[key] = value;
             });
           } catch (error) {
-            console.error(
-              `Error during the parsing of the line: ${error.message}`
-            );
+            log.debug({ err: error }, 'error parsing a line of the stats file');
           }
         }
       });
 
       return allKeys;
     } catch (error) {
-      console.error(`Error during the reading of the file: ${error.message}`);
+      log.warn({ err: error }, 'error reading the stats file');
       return {};
     }
   }

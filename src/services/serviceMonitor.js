@@ -6,6 +6,7 @@ const path = require('path');
 const net = require('net');
 const pubsub = require('../graphql/pubsub');
 const TOPICS = require('../graphql/topics');
+const log = require('../logger')('service-monitor');
 
 const execAsync = promisify(exec);
 
@@ -45,11 +46,11 @@ class ServiceMonitor {
       );
       if (fs.existsSync(configPath)) {
         const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        console.log('Service monitor configuration loaded:', config);
+        log.info({ config }, 'service monitor configuration loaded');
         return config;
       }
     } catch (error) {
-      console.error('Error loading service monitor configuration:', error);
+      log.error({ err: error }, 'error loading service monitor configuration');
     }
 
     // Default configuration
@@ -75,29 +76,31 @@ class ServiceMonitor {
   // Start monitoring
   async start() {
     if (!this.config.enabled) {
-      console.log('Service monitor disabled in configuration');
+      log.info('service monitor disabled in configuration');
       return;
     }
 
     if (this.monitoring) {
-      console.log('Service monitor already active');
+      log.debug('service monitor already active');
       return;
     }
 
     // In development mode, check if development monitoring is enabled
     if (this.isDevelopment()) {
       if (!this.config.developmentEnabled) {
-        console.log(
-          'Service monitor skipped in development environment - status managed by API calls only'
+        log.info(
+          'service monitor skipped in development environment - status managed by API calls only'
         );
         return;
       }
       // Use only development services (miner, node, solo) without systemd
       this.systemdServices = this.config.developmentServices || ['apollo-miner', 'node', 'ckpool'];
-      console.log('Starting service monitor in DEVELOPMENT mode (no systemd, app-level checks only)...');
-      console.log(`Monitoring services: ${this.systemdServices.join(', ')}`);
+      log.info(
+        { services: this.systemdServices },
+        'starting service monitor in DEVELOPMENT mode (no systemd, app-level checks only)'
+      );
     } else {
-      console.log('Starting service monitor...');
+      log.info('starting service monitor');
     }
 
     this.monitoring = true;
@@ -106,7 +109,7 @@ class ServiceMonitor {
     try {
       await this.checkAllServices();
     } catch (error) {
-      console.error('Error during initial service check:', error);
+      log.error({ err: error }, 'error during initial service check');
     }
 
     // Then periodic checks
@@ -114,13 +117,11 @@ class ServiceMonitor {
       try {
         await this.checkAllServices();
       } catch (error) {
-        console.error('Error during periodic service check:', error);
+        log.error({ err: error }, 'error during periodic service check');
       }
     }, this.checkInterval);
 
-    console.log(
-      `Service monitor started with interval of ${this.checkInterval}ms`
-    );
+    log.info({ intervalMs: this.checkInterval }, 'service monitor started');
   }
 
   // Stop monitoring
@@ -130,7 +131,7 @@ class ServiceMonitor {
       this.interval = null;
     }
     this.monitoring = false;
-    console.log('Service monitor stopped');
+    log.info('service monitor stopped');
   }
 
   // Get database service name from systemd service name
@@ -254,9 +255,12 @@ class ServiceMonitor {
             applicationOnline = nodeStatus?.online?.status;
           }
         } catch (error) {
-          // RPC connection failed - mark as error so we don't show "online" 
+          // RPC connection failed - mark as error so we don't show "online"
           // when systemd is active but app can't connect (e.g., wrong port for testnet)
-          console.log(`Application check failed for ${serviceName}: ${error.message}`);
+          log.debug(
+            { service: serviceName, err: error },
+            'application check failed'
+          );
           applicationOnline = 'rpc_error';
         }
       }
@@ -303,7 +307,7 @@ class ServiceMonitor {
       // Detect manual actions FIRST using systemd status (source of truth for manual actions)
       // This ensures the UI reflects reality instead of fighting user actions
       let isWithinGracePeriod = false;
-      
+
       // The updater intentionally stops services while /tmp/update_progress
       // exists. Preserve the user's requested state instead of classifying
       // those stops as manual actions.
@@ -311,15 +315,15 @@ class ServiceMonitor {
       if (existing && !updateInProgress) {
         // Get time since last request (if any)
         const currentTime = Date.now();
-        const requestedAtTime = existing.requested_at 
-          ? new Date(existing.requested_at).getTime() 
+        const requestedAtTime = existing.requested_at
+          ? new Date(existing.requested_at).getTime()
           : 0;
         const timeSinceRequest = currentTime - requestedAtTime;
-        
+
         // Grace period for services to start/stop (don't interfere during this time)
         const startGracePeriod = 90000; // 60 seconds for service to become active
         const stopGracePeriod = 30000;   // 30 seconds for service to stop
-        
+
         // MANUAL START: Systemd is active/activating but was requested to be offline
         // → User started it manually (CLI or other means)
         // BUT: Only if not within stop grace period (service might still be stopping)
@@ -330,18 +334,20 @@ class ServiceMonitor {
           // Check if service was recently requested to stop (within grace period)
           const isWithinStopGracePeriod = timeSinceRequest <= stopGracePeriod;
           const wasStopping = existing.status === 'pending';
-          
+
           if (isWithinStopGracePeriod && wasStopping) {
             // Still within grace period and was stopping - don't interfere
-            console.log(
-              `⏳ Service ${serviceName} (${dbServiceName}) still stopping (${Math.round(timeSinceRequest/1000)}s since request)`
+            log.debug(
+              { service: serviceName, dbService: dbServiceName, secondsSinceRequest: Math.round(timeSinceRequest / 1000) },
+              'service still stopping'
             );
             isWithinGracePeriod = true;
             mappedStatus = 'pending'; // Override to keep it pending
           } else {
             // Outside grace period or wasn't stopping - must be manual start
-            console.log(
-              `🔄 Service ${serviceName} (${dbServiceName}) started manually (systemd: ${status}) - updating requested_status to 'online'`
+            log.info(
+              { service: serviceName, dbService: dbServiceName, systemd: status },
+              'service started manually - updating requested_status to online'
             );
             requestedStatus = 'online';
           }
@@ -369,17 +375,22 @@ class ServiceMonitor {
           if ((isWithinStartGracePeriod && wasStarting) || blockedOnNode) {
             // Still starting, or waiting on the node - don't interfere.
             // Keep status as pending and don't change requested_status.
-            console.log(
-              `⏳ Service ${serviceName} (${dbServiceName}) ${
-                blockedOnNode ? 'waiting for node.service' : 'still starting'
-              } (${Math.round(timeSinceRequest / 1000)}s since request)`
+            log.debug(
+              {
+                service: serviceName,
+                dbService: dbServiceName,
+                reason: blockedOnNode ? 'waiting for node.service' : 'still starting',
+                secondsSinceRequest: Math.round(timeSinceRequest / 1000),
+              },
+              'service not yet active'
             );
             isWithinGracePeriod = true;
             mappedStatus = 'pending'; // Override to keep it pending
           } else {
             // Outside grace period or wasn't starting - must be manual stop
-            console.log(
-              `🔄 Service ${serviceName} (${dbServiceName}) stopped manually (systemd: inactive) - updating requested_status to 'offline'`
+            log.info(
+              { service: serviceName, dbService: dbServiceName },
+              'service stopped manually (systemd: inactive) - updating requested_status to offline'
             );
             requestedStatus = 'offline';
           }
@@ -391,18 +402,19 @@ class ServiceMonitor {
           existing.requested_status === 'online' &&
           this.config.autoStart
         ) {
-          console.log(
-            `🔄 Auto-restarting failed service ${serviceName} (${dbServiceName})`
+          log.warn(
+            { service: serviceName, dbService: dbServiceName },
+            'auto-restarting failed service'
           );
           try {
             await execAsync(`sudo systemctl restart ${serviceName}`);
-            console.log(`✅ Successfully restarted service ${serviceName}`);
+            log.info({ service: serviceName }, 'service restarted successfully');
             // Override status to pending as it's restarting
             mappedStatus = 'pending';
           } catch (restartError) {
-            console.error(
-              `❌ Failed to auto-restart service ${serviceName}:`,
-              restartError.message
+            log.error(
+              { service: serviceName, err: restartError },
+              'failed to auto-restart service'
             );
             mappedStatus = 'error';
           }
@@ -412,7 +424,7 @@ class ServiceMonitor {
       // Now determine final status for UI/DB
       // Priority: grace period > application status > systemd mapped status
       let finalStatus;
-      
+
       // If within grace period, keep as pending regardless of other checks
       if (isWithinGracePeriod) {
         finalStatus = 'pending';
@@ -421,12 +433,12 @@ class ServiceMonitor {
       else if (applicationOnline) {
         // If systemd says active but RPC connection failed, it's a config error
         // (e.g., wrong port for testnet, wrong credentials, etc.)
-        if ((status === 'active' || status === 'activating') && 
+        if ((status === 'active' || status === 'activating') &&
             applicationOnline === 'rpc_error') {
           finalStatus = 'error';
         }
         // If systemd says active but app says offline/pending, service is probably starting up
-        else if ((status === 'active' || status === 'activating') && 
+        else if ((status === 'active' || status === 'activating') &&
             (applicationOnline === 'offline' || applicationOnline === 'error')) {
           finalStatus = 'pending';
         }
@@ -456,8 +468,7 @@ class ServiceMonitor {
         systemdStatus: status,
       };
     } catch (error) {
-      console.error(`Error checking service ${serviceName}:`, error.message);
-      console.error(`Error stack for ${serviceName}:`, error.stack);
+      log.error({ service: serviceName, err: error }, 'error checking service');
       // Only mark as unknown if there's a real error (not systemctl exit codes)
       const dbServiceName = this.getDatabaseServiceName(serviceName);
       await this.updateServiceStatus(dbServiceName, 'unknown', null);
@@ -482,7 +493,7 @@ class ServiceMonitor {
           status = minerStatus?.online?.status || 'unknown';
           checkMethod = 'miner.checkOnline()';
         } catch (error) {
-          console.log(`Dev check: miner checkOnline failed: ${error.message}`);
+          log.debug({ service: 'miner', err: error }, 'dev check failed');
           status = 'offline';
           checkMethod = 'miner.checkOnline() failed';
         }
@@ -492,7 +503,7 @@ class ServiceMonitor {
           status = nodeStatus?.online?.status || 'unknown';
           checkMethod = 'node.checkOnline()';
         } catch (error) {
-          console.log(`Dev check: node checkOnline failed: ${error.message}`);
+          log.debug({ service: 'node', err: error }, 'dev check failed');
           status = 'offline';
           checkMethod = 'node.checkOnline() failed';
         }
@@ -509,7 +520,7 @@ class ServiceMonitor {
           }
           checkMethod = 'solo.getStatus()';
         } catch (error) {
-          console.log(`Dev check: solo getStatus failed: ${error.message}`);
+          log.debug({ service: 'solo', err: error }, 'dev check failed');
           status = 'offline';
           checkMethod = 'solo.getStatus() failed';
         }
@@ -557,7 +568,7 @@ class ServiceMonitor {
         systemdStatus: `dev:${checkMethod}`,
       };
     } catch (error) {
-      console.error(`Error in dev check for ${serviceName}:`, error.message);
+      log.error({ service: serviceName, err: error }, 'error in dev check');
       await this.updateServiceStatus(dbServiceName, 'unknown', null);
       return {
         serviceName: dbServiceName,
@@ -575,41 +586,47 @@ class ServiceMonitor {
       );
       const results = await Promise.all(promises);
 
-      // Always log service status summary for monitoring
-      console.log('Service Status:');
-      for (const result of results) {
-        console.log(`  - ${result.serviceName}: ${result.status} (systemd: ${result.systemdStatus})`);
-      }
+      // Per-poll status summary is debug-only. Gate the whole block — including the
+      // per-service DB reads for the discrepancy check — behind the level, so at the
+      // default level this loop costs nothing beyond the checks themselves (the
+      // discrepancy queries used to run every 10s only to be printed).
+      if (log.isLevelEnabled('debug')) {
+        log.debug(
+          {
+            services: results.map((r) => ({
+              name: r.serviceName,
+              status: r.status,
+              systemd: r.systemdStatus,
+            })),
+          },
+          'service status summary'
+        );
 
-      // Check for discrepancies with requested status
-      const discrepancies = [];
-      for (const result of results) {
-        const dbRecord = await this.knex('service_status')
-          .where({ service_name: result.serviceName })
-          .first();
-        
-        if (dbRecord && dbRecord.requested_status) {
-          if (dbRecord.requested_status !== result.status) {
-            discrepancies.push({
-              service: result.serviceName,
-              requested: dbRecord.requested_status,
-              actual: result.status
-            });
+        const discrepancies = [];
+        for (const result of results) {
+          const dbRecord = await this.knex('service_status')
+            .where({ service_name: result.serviceName })
+            .first();
+
+          if (dbRecord && dbRecord.requested_status) {
+            if (dbRecord.requested_status !== result.status) {
+              discrepancies.push({
+                service: result.serviceName,
+                requested: dbRecord.requested_status,
+                actual: result.status,
+              });
+            }
           }
         }
-      }
 
-      if (discrepancies.length > 0) {
-        console.log('⚠️  Discrepancies:');
-        for (const d of discrepancies) {
-          console.log(`  - ${d.service}: requested=${d.requested}, actual=${d.actual}`);
+        if (discrepancies.length > 0) {
+          log.debug({ discrepancies }, 'status discrepancies');
         }
       }
 
       return results;
     } catch (error) {
-      console.error('Error checking services:', error);
-      console.error('Error stack:', error.stack);
+      log.error({ err: error }, 'error checking services');
     }
   }
 
@@ -647,8 +664,11 @@ class ServiceMonitor {
               requested_at: finalRequestedAt,
             });
 
-          console.log(
-            `Service ${serviceName} updated: ${existing.status} -> ${status}`
+          // Service state transition — the signal, always logged (this replaces the
+          // per-poll summary that used to bury it).
+          log.info(
+            { service: serviceName, from: existing.status, to: status },
+            'service status changed'
           );
 
           // Push updated services list to all WebSocket subscribers.
@@ -674,7 +694,7 @@ class ServiceMonitor {
               services: { result: { data: allServices }, error: null },
             });
           } catch (pubErr) {
-            console.error('Error publishing services update:', pubErr.message);
+            log.error({ err: pubErr }, 'error publishing services update');
           }
 
           // A miner online/offline change is an automation input — re-evaluate so
@@ -706,12 +726,13 @@ class ServiceMonitor {
           last_checked: now,
         });
 
-        console.log(
-          `New service ${serviceName} registered with status: ${status}`
+        log.info(
+          { service: serviceName, status },
+          'new service registered'
         );
       }
     } catch (error) {
-      console.error(`Error updating database for ${serviceName}:`, error);
+      log.error({ service: serviceName, err: error }, 'error updating database');
     }
   }
 
@@ -723,14 +744,14 @@ class ServiceMonitor {
       );
       return await Promise.all(promises);
     } catch (error) {
-      console.error('Error getting current statuses:', error);
+      log.error({ err: error }, 'error getting current statuses');
       return [];
     }
   }
 
   // Force immediate check
   async forceCheck() {
-    console.log('Forcing service check...');
+    log.debug('forcing service check');
     return await this.checkAllServices();
   }
 
@@ -746,7 +767,7 @@ class ServiceMonitor {
       this.start();
     }
 
-    console.log('Service monitor configuration reloaded');
+    log.info('service monitor configuration reloaded');
   }
 
   // Get remote node information for debugging

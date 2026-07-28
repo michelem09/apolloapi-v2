@@ -3,6 +3,7 @@ const { GraphQLError } = require('graphql');
 const fs = require('fs').promises;
 const path = require('path');
 const { getCkpoolLogsDir } = require('../paths');
+const log = require('../logger')('solo');
 
 // Import the dev solo service for development mode
 const devSoloService =
@@ -38,7 +39,7 @@ class SoloService {
 
       // Start the solo pool based on environment
       if (process.env.NODE_ENV === 'development') {
-        console.log('Starting dev solo pool...');
+        log.debug('starting dev solo pool');
         await devSoloService.startDevSolo();
       } else {
         await this._execCommand('sudo systemctl start ckpool');
@@ -76,7 +77,7 @@ class SoloService {
 
       // Stop the solo pool based on environment
       if (process.env.NODE_ENV === 'development') {
-        console.log('Stopping dev solo pool...');
+        log.debug('stopping dev solo pool');
         await devSoloService.stopDevSolo();
       } else {
         await this._execCommand('sudo systemctl stop ckpool');
@@ -107,7 +108,7 @@ class SoloService {
 
       // Restart the solo pool based on environment
       if (process.env.NODE_ENV === 'development') {
-        console.log('Restarting dev solo pool...');
+        log.debug('restarting dev solo pool');
         await devSoloService.restartDevSolo();
       } else {
         await this._execCommand('sudo systemctl restart ckpool');
@@ -161,7 +162,7 @@ class SoloService {
       try {
         ckpoolData = await this._getCkpoolStats();
       } catch (ckpoolError) {
-        console.error('Error getting solo stats:', ckpoolError);
+        log.error({ err: ckpoolError }, 'error getting solo stats');
         // Continue with null ckpool data instead of failing completely
       }
 
@@ -221,7 +222,7 @@ class SoloService {
               blockFound = true;
             }
           } catch (logErr) {
-            console.error('Error reading solo log:', logErr.message);
+            log.warn({ err: logErr }, 'error reading solo log');
           }
         }
       }
@@ -230,7 +231,7 @@ class SoloService {
       try {
         poolData = await this._parseFileToJsonArray(ckpoolPoolStatsFile);
       } catch (poolError) {
-        console.log(`Error parsing pool stats file: ${poolError.message}`);
+        log.debug({ err: poolError }, 'error parsing pool stats file');
       }
 
       // Get users data
@@ -276,13 +277,13 @@ class SoloService {
 
               // Validate JSON structure
               if (!cleanedData.startsWith('{') || !cleanedData.endsWith('}')) {
-                console.log(`Invalid JSON format in solo file ${filename}, skipping...`);
+                log.debug({ filename }, 'invalid JSON format in solo file, skipping');
                 return null;
               }
 
               return JSON.parse(cleanedData);
             } catch (fileError) {
-              console.log(`Error processing solo file ${filename}: ${fileError.message}`);
+              log.debug({ filename, err: fileError }, 'error processing solo file');
               return null;
             }
           });
@@ -291,7 +292,7 @@ class SoloService {
         }
       } catch (dirError) {
         if (dirError.code !== 'ENOENT') {
-          console.error('Error accessing users directory:', dirError.message);
+          log.debug({ err: dirError }, 'error accessing users directory');
         }
       }
 
@@ -301,7 +302,7 @@ class SoloService {
         blockFound: blockFound,
       };
     } catch (error) {
-      console.error('Error in _getCkpoolStats:', error);
+      log.error({ err: error }, 'error in _getCkpoolStats');
       return {
         pool: {},
         users: [],
@@ -348,7 +349,7 @@ class SoloService {
       
       return {};
     } catch (error) {
-      console.error(`Error parsing file ${filePath}:`, error);
+      log.debug({ filePath, err: error }, 'error parsing file');
       return {};
     }
   }
@@ -365,7 +366,7 @@ class SoloService {
           });
       }
     } catch (error) {
-      console.error('Error updating service status:', error);
+      log.error({ err: error }, 'error updating service status');
     }
   }
 
@@ -380,7 +381,7 @@ class SoloService {
           });
       }
     } catch (error) {
-      console.error('Error updating last_checked:', error);
+      log.error({ err: error }, 'error updating last_checked');
     }
   }
 
@@ -418,7 +419,7 @@ class SoloService {
           return;
         }
         if (stderr) {
-          console.warn(`Command stderr: ${stderr}`);
+          log.warn({ stderr }, 'command produced stderr');
         }
         resolve({ stdout, stderr });
       });

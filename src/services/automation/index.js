@@ -22,11 +22,14 @@ const { MINER_MODES } = require('../../constants/minerModes');
 const EVENTS_CAP = 500;
 
 // Everything the engine decides goes to the journal too, not just to the events
-// table: on a device you read `journalctl -u apollo-api | grep '\[automation\]'`,
-// and during the dry-run phase that log *is* the deliverable. Prefixed so it can
-// be grepped out of a journal shared with the rest of the backend.
-const log = (message) => console.log(`[automation] ${message}`);
-const logError = (message) => console.error(`[automation] ${message}`);
+// table: during the dry-run phase that log *is* the deliverable, and it is
+// deliberately a human-readable sentence (read via `journalctl -u apollo-api`),
+// not structured fields — the automation signals it interpolates (temperature,
+// time, sun, tariff) carry no secrets, so readability wins here. Errors, by
+// contrast, call logger.error({ err }, …) directly so the stack survives and the
+// serializer/redaction apply. The child logger tags every line with
+// { component: 'automation' } for filtering.
+const logger = require('../../logger')('automation');
 
 function parseJson(value, fallback) {
   if (value === null || value === undefined) return fallback;
@@ -118,10 +121,10 @@ class AutomationService {
       if (input.enabled !== undefined || input.dryRun !== undefined) {
         const before = await this.getConfig();
         if (input.enabled !== undefined && !!before.enabled !== !!input.enabled) {
-          log(`config: enabled ${before.enabled} -> ${input.enabled}`);
+          logger.info(`config: enabled ${before.enabled} -> ${input.enabled}`);
         }
         if (input.dryRun !== undefined && !!before.dryRun !== !!input.dryRun) {
-          log(`config: dryRun ${before.dryRun} -> ${input.dryRun}`);
+          logger.info(`config: dryRun ${before.dryRun} -> ${input.dryRun}`);
         }
       }
 
@@ -447,7 +450,7 @@ class AutomationService {
         // loudly and leave the state alone: the next tick will try again, and the
         // guard rails keep that from turning into a retry storm.
         failure = error.message;
-        logError(`failed to ${guard.changeType}: ${error.message}`);
+        logger.error({ err: error, changeType: guard.changeType }, 'failed to apply miner change');
       }
     }
 
@@ -471,14 +474,14 @@ class AutomationService {
         const rule = decision.ruleName ? `rule "${decision.ruleName}"` : decision.reason;
         const blocked = guard.blockedBy ? ` BLOCKED(${guard.blockedBy})` : '';
         const prefix = dryRun ? '[dry-run] ' : '';
-        log(
+        logger.info(
           `${prefix}${rule} → ${describeTarget(decision.target)}${blocked} — ${message} | ` +
             `${this._formatSignals(currentSignals)}`
         );
       }
     } catch (error) {
       // Bookkeeping must never break the tick: the miner was already moved (or not).
-      logError(`failed to record event: ${error.message}`);
+      logger.error({ err: error }, 'failed to record automation event');
     }
 
     // loggedEvent is the fresh row (or null) — the scheduler pushes it so the UI

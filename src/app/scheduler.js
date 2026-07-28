@@ -3,8 +3,7 @@ const _ = require('lodash');
 const services = require('../services');
 const pubsub = require('../graphql/pubsub');
 const TOPICS = require('../graphql/topics');
-
-const isDev = process.env.NODE_ENV === 'development';
+const log = require('../logger')('scheduler');
 
 /**
  * Parse hashrate string (e.g., "810M", "3.2T", "1.5G") to GH/s
@@ -44,10 +43,10 @@ async function startServiceMonitor() {
   try {
     if (services.serviceMonitor) {
       await services.serviceMonitor.start();
-      console.log('Service monitor started automatically');
+      log.info('service monitor started automatically');
     }
   } catch (error) {
-    console.error('Error starting service monitor:', error);
+    log.error({ err: error }, 'error starting service monitor');
   }
 }
 
@@ -59,17 +58,15 @@ async function checkServices() {
   try {
     // Just verify services are responding - no DB updates
     // The ServiceMonitor is the single source of truth for status updates
-    
+
     // We can log status for debugging but don't update DB
     const statuses = await knex('service_status')
       .select('service_name', 'status')
       .whereIn('service_name', ['miner', 'node']);
-    
-    if (process.env.NODE_ENV === 'development') {
-      console.log('Current service statuses:', statuses);
-    }
+
+    log.debug({ statuses }, 'current service statuses');
   } catch (error) {
-    console.error('Error checking services:', error);
+    log.error({ err: error }, 'error checking services');
   }
 }
 
@@ -86,10 +83,10 @@ async function initServiceStatusRows() {
     if (!record) {
       // Set default requested_status based on service type
       // This prevents the race condition where requested_status is null
-      const defaultRequestedStatus = (service === 'apollo-api' || service === 'apollo-ui-v2') 
+      const defaultRequestedStatus = (service === 'apollo-api' || service === 'apollo-ui-v2')
         ? 'online'  // API and UI should always be online
         : null;     // Other services start as not requested (user will decide)
-      
+
       await knex('service_status').insert({
         service_name: service,
         status: 'unknown',  // Start as unknown until ServiceMonitor checks
@@ -97,8 +94,11 @@ async function initServiceStatusRows() {
         requested_at: defaultRequestedStatus ? new Date() : null,
         last_checked: new Date(),
       });
-      
-      console.log(`Initialized service status for ${service} with requested_status=${defaultRequestedStatus}`);
+
+      log.info(
+        { service, requestedStatus: defaultRequestedStatus },
+        'initialized service status row'
+      );
     }
   }
 }
@@ -206,12 +206,12 @@ async function fetchStatistics() {
       // Insert new data
       await trx('time_series_data').insert(boards);
 
-      // Table bookkeeping, once a minute, forever: useful while debugging, pure
-      // noise in production, where it buried everything else in the journal.
-      if (isDev) console.log(`Time series data inserted (pruned ${deletedRows} rows)`);
+      // Table bookkeeping, once a minute, forever: useful while debugging, silent
+      // at the default level so it can't bury everything else in the journal.
+      log.debug({ prunedRows: deletedRows }, 'time series data inserted');
     });
   } catch (error) {
-    console.error('Error while fetching statistics from the miner:', error);
+    log.error({ err: error }, 'error while fetching statistics from the miner');
   }
 }
 
@@ -257,10 +257,10 @@ async function fetchSoloStatistics() {
       // Insert new data
       await trx('time_series_solo_data').insert(soloData);
 
-      if (isDev) console.log(`Time series solo data inserted (pruned ${deletedRows} rows)`);
+      log.debug({ prunedRows: deletedRows }, 'time series solo data inserted');
     });
   } catch (error) {
-    console.error('Error while fetching statistics from solo pool:', error);
+    log.error({ err: error }, 'error while fetching statistics from solo pool');
   }
 }
 
@@ -277,7 +277,7 @@ async function fetchRecentBlocks() {
       .first();
 
     if (!nodeService || nodeService.status !== 'online') {
-      console.log('Node is not online, skipping recent blocks update');
+      log.debug('node is not online, skipping recent blocks update');
       // Only update rows with no error yet — preserves per-block error messages and avoids
       // re-stamping every row every interval once already marked (no WHERE was updating all rows)
       const NODE_OFFLINE_MSG = 'Node is not online';
@@ -292,7 +292,7 @@ async function fetchRecentBlocks() {
 
     // 2. Retrieve blocks from node
     const blocks = await services.node.getRecentBlocksFromNode(15);
-    
+
     if (!blocks || blocks.length === 0) {
       throw new Error('No blocks retrieved from node');
     }
@@ -344,10 +344,10 @@ async function fetchRecentBlocks() {
       }
     });
 
-    console.log(`Recent blocks updated: ${blocks.length} blocks`);
+    log.debug({ count: blocks.length }, 'recent blocks updated');
   } catch (error) {
-    console.error('Error while fetching recent blocks:', error);
-    
+    log.error({ err: error }, 'error while fetching recent blocks');
+
     // Optionally mark blocks that had no error yet (don't blanket-overwrite per-block errors)
     try {
       const msg = error.message || 'Unknown error';
@@ -358,7 +358,7 @@ async function fetchRecentBlocks() {
           updated_at: knex.fn.now()
         });
     } catch (updateError) {
-      console.error('Error updating blocks with error message:', updateError);
+      log.error({ err: updateError }, 'error updating blocks with error message');
     }
   }
 }
@@ -396,7 +396,7 @@ async function pushMinerStats() {
 
   for (const outcome of [stats, online]) {
     if (outcome.status === 'rejected') {
-      console.error('[PubSub] MINER error:', outcome.reason?.message ?? outcome.reason);
+      log.error({ err: outcome.reason }, 'pubsub: miner push failed');
     }
   }
 
@@ -407,7 +407,7 @@ async function pushMinerStats() {
     },
   });
 
-  if (process.env.NODE_ENV === 'development') console.log('[PubSub] MINER published');
+  log.debug('pubsub: miner published');
 }
 
 /**
@@ -418,9 +418,9 @@ async function pushMcuStats() {
   try {
     const result = await withTimeout(services.mcu.getStats(), 8000, 'mcu.getStats');
     pubsub.publish(TOPICS.MCU, { mcu: { result, error: null } });
-    if (process.env.NODE_ENV === 'development') console.log('[PubSub] MCU published');
+    log.debug('pubsub: mcu published');
   } catch (e) {
-    console.error('[PubSub] MCU error:', e.message);
+    log.error({ err: e }, 'pubsub: mcu failed');
     pubsub.publish(TOPICS.MCU, { mcu: { result: null, error: { message: e.message } } });
   }
 }
@@ -433,9 +433,9 @@ async function pushNodeStats() {
   try {
     const result = await withTimeout(services.node.getStats(), 10000, 'node.getStats');
     pubsub.publish(TOPICS.NODE, { node: { result, error: null } });
-    if (process.env.NODE_ENV === 'development') console.log('[PubSub] NODE published');
+    log.debug('pubsub: node published');
   } catch (e) {
-    console.error('[PubSub] NODE error:', e.message);
+    log.error({ err: e }, 'pubsub: node failed');
     pubsub.publish(TOPICS.NODE, { node: { result: null, error: { message: e.message } } });
   }
 }
@@ -453,9 +453,9 @@ async function pushServicesStatus() {
     pubsub.publish(TOPICS.SERVICES, {
       services: { result, error: null },
     });
-    if (process.env.NODE_ENV === 'development') console.log('[PubSub] SERVICES pushed (initial)');
+    log.debug('pubsub: services pushed (initial)');
   } catch (e) {
-    console.error('[PubSub] SERVICES error:', e.message);
+    log.error({ err: e }, 'pubsub: services failed');
     pubsub.publish(TOPICS.SERVICES, {
       services: { result: null, error: { message: e.message } },
     });
@@ -470,9 +470,9 @@ async function pushSoloStats() {
   try {
     const result = await withTimeout(services.solo.getStats(), 8000, 'solo.getStats');
     pubsub.publish(TOPICS.SOLO, { solo: { result, error: null } });
-    if (process.env.NODE_ENV === 'development') console.log('[PubSub] SOLO published');
+    log.debug('pubsub: solo published');
   } catch (e) {
-    console.error('[PubSub] SOLO error:', e.message);
+    log.error({ err: e }, 'pubsub: solo failed');
     pubsub.publish(TOPICS.SOLO, { solo: { result: null, error: { message: e.message } } });
   }
 }
@@ -496,7 +496,7 @@ async function evaluateAutomation() {
 
     pubsub.publish(TOPICS.AUTOMATION, { automation: { result, error: null } });
   } catch (e) {
-    console.error('[automation] tick failed:', e.message);
+    log.error({ err: e }, 'automation tick failed');
     pubsub.publish(TOPICS.AUTOMATION, {
       automation: { result: null, error: { message: e.message } },
     });
@@ -512,7 +512,7 @@ async function pushMqttState() {
   try {
     await withTimeout(services.mqttOutput.publishState(), 8000, 'mqttOutput.publishState');
   } catch (e) {
-    console.error('[mqtt] publish state error:', e.message);
+    log.error({ err: e }, 'mqtt publish state failed');
   }
 }
 
@@ -524,7 +524,7 @@ async function pushMqttExtras() {
   try {
     await withTimeout(services.mqttOutput.publishExtras(), 12000, 'mqttOutput.publishExtras');
   } catch (e) {
-    console.error('[mqtt] publish extras error:', e.message);
+    log.error({ err: e }, 'mqtt publish extras failed');
   }
 }
 
@@ -546,18 +546,18 @@ async function startAllSchedulers() {
     // opening the connection, so the will is set on connect. Then open the broker
     // link (if configured) so input.* signals get fed and the output can publish.
     services.mqttOutput.init();
-    services.mqtt.init().catch((err) => console.error('[mqtt] init failed:', err.message));
+    services.mqtt.init().catch((err) => log.error({ err }, 'mqtt init failed'));
 
     // Service status checks are now handled by ServiceMonitor
     // We only need to collect statistics periodically
     setInterval(fetchStatistics, process.env.TIMESERIES_INTERVAL || 60000); // Collect miner statistics every 60 seconds
     setInterval(fetchSoloStatistics, process.env.TIMESERIES_INTERVAL || 60000); // Collect solo statistics every 60 seconds
-    
+
     // Fetch recent blocks immediately on startup (don't wait 5 minutes)
     fetchRecentBlocks().catch(err => {
-      console.error('Error in initial recent blocks fetch:', err);
+      log.error({ err }, 'error in initial recent blocks fetch');
     });
-    
+
     // Then run periodically every 5 minutes
     setInterval(fetchRecentBlocks, 5 * 60 * 1000); // Every 5 minutes (300000 ms)
 
@@ -585,7 +585,7 @@ async function startAllSchedulers() {
     // ready by the time a client lands, instead of cold on the first page load.
     evaluateAutomation().catch(() => {});
   } catch (error) {
-    console.error('Failed to initialize schedulers:', error);
+    log.error({ err: error }, 'failed to initialize schedulers');
   }
 }
 

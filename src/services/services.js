@@ -1,5 +1,6 @@
 const moment = require('moment');
 const { GraphQLError } = require('graphql');
+const log = require('../logger')('services');
 
 class ServicesService {
   constructor(knex) {
@@ -60,7 +61,7 @@ class ServicesService {
 
       return { data };
     } catch (error) {
-      console.error('Error fetching service status:', error);
+      log.error({ err: error }, 'error fetching service status');
       throw new GraphQLError(`Failed to get service status: ${error.message}`);
     }
   }

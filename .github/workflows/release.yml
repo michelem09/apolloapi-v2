@@ -116,6 +116,13 @@ jobs:
           yarn install --frozen-lockfile
           yarn --cwd apolloui-v2 install --frozen-lockfile --ignore-engines
 
+      - name: Lint
+        # Enforces no-console over src/ (see eslint.config.js): a raw console.* skips
+        # the level gating AND the logger's redaction/err serializer, which is how an
+        # RPC credential would reach the persistent journal. A guard that nothing runs
+        # is not a guard, so it gates the release like the tests do.
+        run: yarn lint
+
       - name: Test
         # A signature attests provenance, not that the code works. Refusing to
         # publish a failing build is the only thing standing between a bad commit

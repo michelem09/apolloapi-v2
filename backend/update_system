@@ -204,6 +204,15 @@ for unit in \
 done
 install -m 755 "${APOLLO_DIR}/backend/rc.local" /etc/rc.local
 
+# Persistent journald on the eMMC, so an abrupt hang leaves evidence (see
+# backend/systemd/journald-apollo.conf). No restart here: the reboot below applies
+# it, and restarting journald under the live services this update runs beneath
+# would blip their journal connection.
+# Non-fatal: persistent logging is a diagnostic aid, never a reason to abort an
+# update or an install half-way (these scripts run under set -e / an ERR trap).
+bash "${APOLLO_DIR}/backend/utils/install-journald.sh" "${APOLLO_DIR}" || \
+    echo "[journald] WARNING: could not install the journald policy; continuing" >&2
+
 systemctl daemon-reload
 systemctl enable \
     apollo-bootstrap.service \

@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const config = require('config');
 const services = require('../services');
 const { knex } = require('../db');
+const log = require('../logger')('graphql');
 
 async function createContext({ req }) {
   // Extract token from Authorization header
@@ -25,8 +26,11 @@ async function createContext({ req }) {
       context.user = decoded;
       context.isAuthenticated = true;
     } catch (error) {
-      // Token verification failed, but we'll continue with unauthenticated context
-      console.error('JWT verification failed:', error.message);
+      // Token verification failed, but we'll continue with unauthenticated context.
+      // warn, not debug: an expired token is routine, but a failed auth is the only
+      // trace of credential probing in the journal, and it must not be silent at the
+      // production level. Matches the WS path's 'WS auth failed'.
+      log.warn({ err: error }, 'JWT verification failed');
     }
   }
 

@@ -9,6 +9,7 @@ const {
   getStateDir,
   loadRpcCredentials,
 } = require('../node/credentials');
+const log = require('../logger')('node');
 
 // Convert exec to use promises
 const execPromise = util.promisify(exec);
@@ -179,7 +180,7 @@ class NodeService {
       } catch (error) {
         if (error.code === 'ENOENT') {
           // File doesn't exist
-          console.log('format_node_disk_c_done file not found. Returning default progress.');
+          log.debug('format_node_disk_c_done file not found, returning default progress');
           fileExists = false;
         } else {
           throw error;
@@ -196,7 +197,7 @@ class NodeService {
 
       return { value: progress };
     } catch (error) {
-      console.log('Error getting format progress:', error);
+      log.error({ err: error }, 'error getting format progress');
       return { value: 0 };
     }
   }
@@ -235,7 +236,7 @@ class NodeService {
 
       return { online };
     } catch (error) {
-      console.error('Error checking node status:', error.message);
+      log.error({ err: error }, 'error checking node status');
       throw new GraphQLError('Failed to check node status.');
     }
   }
@@ -323,14 +324,14 @@ class NodeService {
       // Check for errors in each response
       const errors = results.data.filter(r => r.error);
       if (errors.length > 0) {
-        console.error('RPC Batch Errors:', errors);
+        log.error({ errors }, 'RPC batch errors');
         throw new Error(`RPC batch errors: ${errors.map(e => e.error.message).join(', ')}`);
       }
 
       // Extract results from the batch response with fallback values
       const [connectionCount, miningInfo, peerInfo, networkInfo, block] = results.data.map(r => {
         if (!r.result) {
-          console.warn(`Missing result for RPC call ${r.id}`);
+          log.warn({ rpcId: r.id }, 'missing result for RPC call');
           return null;
         }
         return r.result;
@@ -346,13 +347,20 @@ class NodeService {
         block ?? { time: Math.floor(Date.now() / 1000) } // Fallback to current time if block info is missing
       ];
     } catch (error) {
-      console.error('Error in _getNodeStats:', error.message);
+      // The logger's err serializer strips axios's config/request, so the RPC
+      // credentials nested there don't reach the journal; message/code/status stay.
+      log.error(
+        {
+          err: error,
+          rpcStatus: error.response?.status,
+          rpcStatusText: error.response?.statusText,
+        },
+        'error in _getNodeStats'
+      );
+      // Response body kept at debug purely for volume (it repeats every routine RPC
+      // failure), not out of the output entirely — useful when diagnosing at depth.
       if (error.response) {
-        console.error('RPC Error Response:', {
-          status: error.response.status,
-          statusText: error.response.statusText,
-          data: error.response.data
-        });
+        log.debug({ data: error.response.data }, 'rpc error response body');
       }
       throw error;
     }
@@ -384,7 +392,7 @@ class NodeService {
         networkhashps: unrefinedMiningInfo.networkhashps ?? 0,
       };
     } catch (error) {
-      console.error('Error in _formatMiningInfo:', error.message);
+      log.error({ err: error }, 'error in _formatMiningInfo');
       return { difficulty: 0, networkhashps: 0 };
     }
   }
@@ -393,7 +401,7 @@ class NodeService {
   _formatPeerInfo(unrefinedPeerInfo) {
     try {
       if (!unrefinedPeerInfo || !Array.isArray(unrefinedPeerInfo)) {
-        console.log('Invalid peer info:', unrefinedPeerInfo);
+        log.debug({ unrefinedPeerInfo }, 'invalid peer info');
         return [];
       }
       return unrefinedPeerInfo.map(peer => ({
@@ -401,7 +409,7 @@ class NodeService {
         subver: peer?.subver ?? 'unknown'
       }));
     } catch (error) {
-      console.error('Error in _formatPeerInfo:', error.message);
+      log.error({ err: error }, 'error in _formatPeerInfo');
       return [];
     }
   }
@@ -426,7 +434,7 @@ class NodeService {
         connections_out: unrefinedNetworkInfo.connections_out ?? 0,
       };
     } catch (error) {
-      console.error('Error in _formatNetworkInfo:', error.message);
+      log.error({ err: error }, 'error in _formatNetworkInfo');
       return {
         version: '0',
         subversion: 'unknown',
@@ -465,7 +473,7 @@ class NodeService {
           return { status: 'online' };
         } catch (err) {
           if (isWarmupError(err)) return { status: 'online' };
-          console.log('Node not responding and no requested status:', err.message);
+          log.debug({ err }, 'node not responding and no requested status');
           return { status: 'offline' };
         }
       }
@@ -479,7 +487,7 @@ class NodeService {
           // RPC_IN_WARMUP: Bitcoin Core is starting up — treat the service as online
           if (isWarmupError(err)) return { status: 'online' };
 
-          console.log('Error checking node status:', err.message);
+          log.debug({ err }, 'node not responding, checking pending threshold');
 
           // If the node doesn't respond, check the pending threshold
           if (currentTime - requestedAtTime <= pendingThresholdMs) {
@@ -508,7 +516,7 @@ class NodeService {
 
       return { status: 'error' }; // Catch-all fallback for unexpected cases
     } catch (error) {
-      console.error('Error checking node status:', error.message);
+      log.error({ err: error }, 'error checking node status');
       return { status: 'error' };
     }
   }
@@ -530,18 +538,32 @@ class NodeService {
         ? spawn('sudo', ['bash', scriptPath])
         : spawn('bash', [scriptPath]);
 
+      // Outcome is decided by the exit code, not by the first byte on stderr:
+      // mkfs writes progress and warnings there, and rejecting on those aborted the
+      // caller (with a raw Buffer, so `error.message` was undefined and the UI showed
+      // an empty failure) while the format actually ran to completion.
+      let stderr = '';
+
       cmd.stdout.on('data', (data) => {
-        console.log(`stdout: ${data}`);
+        log.debug({ output: data.toString().trim() }, 'format_node_disk stdout');
       });
 
       cmd.stderr.on('data', (data) => {
-        console.error(`stderr: ${data}`);
-        reject(data);
+        const chunk = data.toString();
+        stderr += chunk;
+        log.warn({ output: chunk.trim() }, 'format_node_disk stderr');
       });
 
+      cmd.on('error', (error) => reject(error));
+
       cmd.on('close', (code) => {
-        console.log(`child process exited with code ${code}`);
-        resolve();
+        if (code === 0) {
+          log.debug({ code }, 'format_node_disk finished');
+          resolve();
+        } else {
+          log.error({ code }, 'format_node_disk exited non-zero');
+          reject(new Error(`format_node_disk exited with code ${code}: ${stderr.trim()}`));
+        }
       });
     });
   }
@@ -551,7 +573,7 @@ class NodeService {
     try {
       const { stdout, stderr } = await execPromise(command);
       if (stderr) {
-        console.error(`Command stderr: ${stderr}`);
+        log.warn({ stderr }, 'command produced stderr');
       }
       return stdout.trim();
     } catch (error) {
@@ -679,7 +701,7 @@ class NodeService {
       
       return formattedBlocks;
     } catch (error) {
-      console.error('Error getting recent blocks from node:', error);
+      log.error({ err: error }, 'error getting recent blocks from node');
       throw error;
     }
   }
@@ -793,7 +815,7 @@ class NodeService {
       
       return null;
     } catch (error) {
-      console.error('Error extracting pool from coinbase:', error);
+      log.debug({ err: error }, 'error extracting pool from coinbase');
       return null;
     }
   }
@@ -825,7 +847,7 @@ class NodeService {
 
       return blocks;
     } catch (error) {
-      console.error('Error getting recent blocks from DB:', error);
+      log.error({ err: error }, 'error getting recent blocks from DB');
       throw error;
     }
   }

@@ -3,6 +3,7 @@ const { execFile } = require('child_process');
 const util = require('util');
 const generateConf = require('../configurator');
 const { applyNodeConfiguration } = require('../node/configManager');
+const log = require('../logger')('settings');
 
 const execFilePromise = util.promisify(execFile);
 
@@ -277,9 +278,7 @@ class SettingsService {
             ckpoolLifecycleRequired,
           });
         } catch (rollbackError) {
-          console.error(
-            `[settings] Failed to roll back settings application: ${rollbackError.message}`
-          );
+          log.error({ err: rollbackError }, 'failed to roll back settings application');
         }
       }
       throw new GraphQLError(`Failed to update settings: ${error.message}`);
@@ -319,7 +318,7 @@ class SettingsService {
 
   async _runSystemctl(...args) {
     if (process.env.NODE_ENV !== 'production') {
-      console.log(`[settings] Skipping systemctl ${args.join(' ')} outside production`);
+      log.debug({ args }, 'skipping systemctl outside production');
       return;
     }
     await execFilePromise('sudo', ['systemctl', ...args]);

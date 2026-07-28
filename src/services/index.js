@@ -46,6 +46,18 @@ const mqttOutputService = require('./mqtt/output')(knex, {
   mcu: mcuService
 });
 
+// Diagnostic bundle: read-only collector over the services above, so it is wired
+// last and takes them explicitly (no cycle through this index). Everything it
+// produces is scrubbed — see diagnostics/redact.js.
+const diagnosticsService = require('./diagnostics')(knex, {
+  mcu: mcuService,
+  services: servicesService,
+  settings: settingsService,
+  pools: poolsService,
+  automation: automationService,
+  node: nodeService
+});
+
 // Export all services
 module.exports = {
   auth: authService,
@@ -61,5 +73,6 @@ module.exports = {
   serviceMonitor: serviceMonitor,
   automation: automationService,
   mqtt: mqttService,
-  mqttOutput: mqttOutputService
+  mqttOutput: mqttOutputService,
+  diagnostics: diagnosticsService
 };

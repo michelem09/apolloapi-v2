@@ -2,6 +2,7 @@ const fsPromises = require('fs').promises;
 const _ = require('lodash');
 const { knex } = require('./db')
 const { getMinerRuntimeDir } = require('./paths');
+const log = require('./logger')('configurator');
 
 const generate = async function (pools = null, settings = null ) {
   	if (!settings) {
@@ -46,7 +47,7 @@ const generate = async function (pools = null, settings = null ) {
 
 	// If no pool configured, skip miner configuration
 	if (!mainPool || !mainPool.url) {
-		console.log('No pool configured, skipping miner configuration');
+		log.debug('no pool configured, skipping miner configuration');
 		return;
 	}
 
@@ -98,9 +99,9 @@ const generate = async function (pools = null, settings = null ) {
 		// keeps super-eco as-is. Harmless on BTC/II-only devices (binary not run).
 		// TBD: John — confirm miner_config3 format and Apollo III custom tunables schema.
 		await fsPromises.writeFile(confDir + '/miner_config3', minerMode);
-		console.log('Configuration saved');
+		log.debug('miner configuration saved');
 	} catch (err) {
-		console.log('Error saving configuration files');
+		log.error({ err }, 'error saving configuration files');
 	}
 }
 

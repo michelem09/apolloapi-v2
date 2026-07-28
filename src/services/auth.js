@@ -2,6 +2,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const config = require('config');
 const { GraphQLError } = require('graphql');
+const log = require('../logger')('auth');
 
 // Helper function to check if we're in production environment
 const isProduction = () => process.env.NODE_ENV === 'production';
@@ -93,7 +94,9 @@ class AuthService {
         password: hashedPassword
       });
     } catch (err) {
-      console.log('ERROR', err);
+      // This is a Knex error whose bindings include the password hash; the
+      // logger's redaction censors `bindings` so it can't reach the journal.
+      log.error({ err }, 'setup failed');
       throw err;
     }
   }
