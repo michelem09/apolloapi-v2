@@ -1,3 +1,20 @@
 #!/bin/bash
 
+# Launches the disk format in a detached screen session.
+#
+# Refuses to start a second one while a format is under way. This is not
+# hypothetical: Node.format is modelled as a GraphQL query rather than a
+# mutation, and Apollo treats queries as safe to re-execute, so a single click
+# has been observed firing it twice, a second apart. Two concurrent runs race
+# wipefs, parted and mkfs on the same device — one wipes the partition table the
+# other is formatting — and whichever loses writes a failure the UI then reports
+# over a format that is still going.
+#
+# The guard belongs here rather than in the UI because it protects every caller.
+
+if screen -ls 2>/dev/null | grep -qE '[0-9]+\.disk[[:space:]]'; then
+    echo "format_node_disk: a format is already running; ignoring this request" >&2
+    exit 0
+fi
+
 screen -dmS disk /opt/apolloapi/backend/format_node_disk_c
