@@ -377,28 +377,37 @@ function withTimeout(promise, ms, label) {
  * Push miner stats + online status to all active WebSocket subscribers.
  * Runs every 5 seconds — replaces the client-side 5 s poll.
  */
+// Settled independently, NOT with Promise.all: these two are separate answers to
+// separate questions, and Promise.all throws away the winner when the other side
+// loses. A getStats timeout — routine while the device is busy, e.g. rebuilding
+// the UI — used to publish that same timeout as `online.error` too, so the UI
+// reported the miner as offline over a miner that had answered perfectly well,
+// and printed the one message twice because it renders both fields.
+const settledSection = (outcome) =>
+  outcome.status === 'fulfilled'
+    ? { result: outcome.value, error: null }
+    : { result: null, error: { message: outcome.reason?.message ?? String(outcome.reason) } };
+
 async function pushMinerStats() {
-  try {
-    const [statsResult, onlineResult] = await Promise.all([
-      withTimeout(services.miner.getStats(),    8000, 'miner.getStats'),
-      withTimeout(services.miner.checkOnline(), 8000, 'miner.checkOnline'),
-    ]);
-    pubsub.publish(TOPICS.MINER, {
-      miner: {
-        stats:  { result: statsResult,  error: null },
-        online: { result: onlineResult, error: null },
-      },
-    });
-    if (process.env.NODE_ENV === 'development') console.log('[PubSub] MINER published');
-  } catch (e) {
-    console.error('[PubSub] MINER error:', e.message);
-    pubsub.publish(TOPICS.MINER, {
-      miner: {
-        stats:  { result: null, error: { message: e.message } },
-        online: { result: null, error: { message: e.message } },
-      },
-    });
+  const [stats, online] = await Promise.allSettled([
+    withTimeout(services.miner.getStats(),    8000, 'miner.getStats'),
+    withTimeout(services.miner.checkOnline(), 8000, 'miner.checkOnline'),
+  ]);
+
+  for (const outcome of [stats, online]) {
+    if (outcome.status === 'rejected') {
+      console.error('[PubSub] MINER error:', outcome.reason?.message ?? outcome.reason);
+    }
   }
+
+  pubsub.publish(TOPICS.MINER, {
+    miner: {
+      stats:  settledSection(stats),
+      online: settledSection(online),
+    },
+  });
+
+  if (process.env.NODE_ENV === 'development') console.log('[PubSub] MINER published');
 }
 
 /**

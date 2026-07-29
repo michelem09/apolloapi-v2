@@ -139,6 +139,48 @@ describe('scheduler push functions', () => {
       expect(call[1].miner.stats.result).toBeNull();
       expect(call[1].miner.stats.error).toHaveProperty('message');
     });
+
+    // The two are separate answers to separate questions. Promise.all threw away
+    // the winner when the other side lost, so a stats timeout — routine while the
+    // device is busy — published itself as `online.error` as well: the UI showed
+    // the miner as offline over a miner that had answered, and printed the one
+    // message twice because it renders both fields.
+    it('keeps the online result when only getStats fails', async () => {
+      const onlineResult = { online: { status: 'online' } };
+      services.miner.getStats.mockRejectedValue(new Error('miner.getStats timed out after 8000ms'));
+      services.miner.checkOnline.mockResolvedValue(onlineResult);
+
+      await scheduler.pushAllStats();
+
+      const call = publishSpy.mock.calls.find(([t]) => t === TOPICS.MINER);
+      expect(call[1].miner.online).toEqual({ result: onlineResult, error: null });
+      expect(call[1].miner.stats.result).toBeNull();
+      expect(call[1].miner.stats.error.message).toMatch(/getStats timed out/);
+    });
+
+    it('keeps the stats result when only checkOnline fails', async () => {
+      const statsResult = { boards: [{ uuid: 'abc' }] };
+      services.miner.getStats.mockResolvedValue(statsResult);
+      services.miner.checkOnline.mockRejectedValue(new Error('miner.checkOnline timed out after 8000ms'));
+
+      await scheduler.pushAllStats();
+
+      const call = publishSpy.mock.calls.find(([t]) => t === TOPICS.MINER);
+      expect(call[1].miner.stats).toEqual({ result: statsResult, error: null });
+      expect(call[1].miner.online.result).toBeNull();
+      expect(call[1].miner.online.error.message).toMatch(/checkOnline timed out/);
+    });
+
+    it('reports each failure on its own side rather than one message twice', async () => {
+      services.miner.getStats.mockRejectedValue(new Error('stats blew up'));
+      services.miner.checkOnline.mockRejectedValue(new Error('online blew up'));
+
+      await scheduler.pushAllStats();
+
+      const call = publishSpy.mock.calls.find(([t]) => t === TOPICS.MINER);
+      expect(call[1].miner.stats.error.message).toBe('stats blew up');
+      expect(call[1].miner.online.error.message).toBe('online blew up');
+    });
   });
 
   // ------------------------------------------------------------------ //
