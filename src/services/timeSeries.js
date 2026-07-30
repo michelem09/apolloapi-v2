@@ -1,5 +1,6 @@
 const moment = require('moment');
 const { GraphQLError } = require('graphql');
+const log = require('../logger')('time-series');
 
 // Interval configuration: default time ranges and SQL date formats (all in UTC)
 const INTERVAL_CONFIG = {
@@ -151,7 +152,7 @@ class TimeSeriesService {
 
       return result;
     } catch (error) {
-      console.error('Error while fetching miner time series:', error);
+      log.error({ err: error }, 'error while fetching miner time series');
       throw error;
     }
   }
@@ -227,7 +228,7 @@ class TimeSeriesService {
 
       return result;
     } catch (error) {
-      console.error('Error while fetching solo time series:', error);
+      log.error({ err: error }, 'error while fetching solo time series');
       throw error;
     }
   }

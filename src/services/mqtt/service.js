@@ -8,6 +8,7 @@
  * Settings → MQTT, not inside the automation feature.
  */
 const client = require('./client');
+const log = require('../../logger')('mqtt');
 
 function parseJson(value, fallback) {
   if (value === null || value === undefined) return fallback;
@@ -84,7 +85,11 @@ class MqttService {
         inputs: cfg.inputs,
       });
     } catch (e) {
-      console.log('[mqtt] configure failed:', e.message);
+      // Credential-adjacent: the broker password is in scope here. The logger covers
+      // shallow keys (password, *.password) and strips axios plumbing — it does NOT
+      // reach a credential nested deeper in some other error shape. So: never log the
+      // raw connection options from this block.
+      log.error({ err: e }, 'configure failed');
     }
     // Reconcile output discovery (toggling output does not change the connection,
     // so the client's onConnect hook won't fire). Lazy require avoids a cycle.

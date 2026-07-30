@@ -1,3 +1,4 @@
+const log = require('./logger')('init');
 const { ensureEnvFile } = require('./env');
 const {
   ensureDbLocation,
@@ -20,6 +21,6 @@ async function initializeApp() {
 }
 
 initializeApp().catch(error => {
-  console.error('Failed to initialize app:', error);
+  log.error({ err: error }, 'failed to initialize app');
   process.exit(1);
 });

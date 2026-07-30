@@ -1,4 +1,5 @@
 const path = require('path');
+const log = require('./logger')('bootstrap');
 const { ensureEnvFile } = require('./env');
 const {
   ensureDbLocation,
@@ -15,7 +16,7 @@ async function bootstrap({ knex: providedKnex, stateDir } = {}) {
   ensureEnvFile();
 
   const knex = providedKnex || require('./db').knex;
-  console.log('[bootstrap] Running database migrations');
+  log.info('running database migrations');
   await knex.migrate.latest({
     directory: path.join(APP_ROOT, 'migrations'),
   });
@@ -48,9 +49,7 @@ async function bootstrap({ knex: providedKnex, stateDir } = {}) {
     credentials,
   });
 
-  console.log(
-    `[bootstrap] Runtime configuration ready (${result.changed.length} file(s) updated)`
-  );
+  log.info({ filesUpdated: result.changed.length }, 'runtime configuration ready');
   return result;
 }
 
@@ -65,7 +64,7 @@ async function runCli() {
     knex = require('./db').knex;
     await bootstrap({ knex });
   } catch (error) {
-    console.error('[bootstrap] Failed:', error);
+    log.error({ err: error }, 'bootstrap failed');
     process.exitCode = 1;
   } finally {
     if (knex) await knex.destroy();

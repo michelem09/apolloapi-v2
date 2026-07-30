@@ -4,6 +4,7 @@ const { exec } = require('child_process');
 const util = require('util');
 const { GraphQLError } = require('graphql');
 const { getMinerRuntimeDir, getCkpoolLogsDir } = require('../paths');
+const log = require('../logger')('logs');
 
 // Convert exec to use promises
 const execPromise = util.promisify(exec);
@@ -38,14 +39,12 @@ class LogsService {
               logPath = p;
               break;
             } catch (e) {
-              console.log(`Solo log not found at: ${p}`);
+              log.debug({ path: p }, 'solo log not found at path');
             }
           }
 
           if (!logPath) {
-            console.log(
-              'Could not find Solo log file in any of the expected locations'
-            );
+            log.debug('could not find solo log file in any of the expected locations');
             // In development, proceed with a fake path for sample data
             if (process.env.NODE_ENV !== 'production') {
               logPath = possiblePaths[0];
@@ -98,9 +97,7 @@ class LogsService {
                 timestamp: new Date().toISOString(),
               };
             } catch (error) {
-              console.error(
-                `Error getting miner screen output: ${error.message}`
-              );
+              log.error({ err: error }, 'error getting miner screen output');
               return {
                 content: `Unable to retrieve miner screen output: ${error.message}. No miner screen sessions found.`,
                 timestamp: new Date().toISOString(),
@@ -118,6 +115,12 @@ class LogsService {
           if (process.env.NODE_ENV === 'production') {
             const apiLines = Math.min(Math.max(parseInt(lines) || 100, 1), 1000);
             try {
+              // The backend emits structured JSON (one pino line per entry), but
+              // read it back raw: -o short-iso keeps journald's timestamp on every
+              // line — including the still-console lines and pre-upgrade history,
+              // which are not JSON — and avoids piping 1000 pretty-expanded lines
+              // through execPromise's 1 MB buffer. Rendering the JSON belongs in a
+              // JSON-aware UI viewer (F4), not in a fragile shell pipe here.
               const { stdout } = await execPromise(
                 `journalctl -u apollo-api -n ${apiLines} --no-pager -o short-iso`
               );
@@ -126,7 +129,7 @@ class LogsService {
                 timestamp: new Date().toISOString(),
               };
             } catch (error) {
-              console.error(`Error reading apollo-api journal: ${error.message}`);
+              log.error({ err: error }, 'error reading apollo-api journal');
               return {
                 content: `Unable to read the apollo-api journal: ${error.message}`,
                 timestamp: new Date().toISOString(),
@@ -177,7 +180,7 @@ class LogsService {
             content = stdout || `No content found in ${logPath}`;
           }
         } catch (error) {
-          console.error(`Error executing tail command: ${error.message}`);
+          log.error({ err: error }, 'error executing tail command');
           content = `Error reading log file: ${error.message}`;
         }
       } else {
@@ -196,7 +199,7 @@ class LogsService {
           }
         } catch (err) {
           // File doesn't exist in dev mode
-          console.log(`Error in dev mode: ${err.message}`);
+          log.debug({ err }, 'log file not available in dev mode');
           content = `[DEV MODE] Sample log content for ${logType}\n`.repeat(
             10
           );
@@ -208,7 +211,7 @@ class LogsService {
         timestamp: new Date().toISOString(),
       };
     } catch (error) {
-      console.error(`Error reading log file: ${error.message}`);
+      log.error({ err: error }, 'error reading log file');
       return {
         content: `Error reading log: ${error.message}`,
         timestamp: new Date().toISOString(),

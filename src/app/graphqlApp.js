@@ -8,6 +8,7 @@ const jwt = require('jsonwebtoken');
 const config = require('config');
 const schema = require('../graphql/schema');
 const { createContext } = require('../graphql/context');
+const log = require('../logger')('graphql-ws');
 const { knex } = require('../db');
 const services = require('../services');
 
@@ -45,7 +46,7 @@ async function setupApolloServer(app, httpServer) {
             audience: 'auth',
           });
 
-          console.log(`[WS] Client connected, user: ${user.username || user.sub || 'unknown'}`);
+          log.debug({ user: user.username || user.sub || 'unknown' }, 'WS client connected');
 
           // Trigger an immediate data push ~1s after connection so the client
           // gets data right away without waiting for the next scheduler tick.
@@ -56,10 +57,10 @@ async function setupApolloServer(app, httpServer) {
               const { pushAllStats } = require('./scheduler');
               if (typeof pushAllStats !== 'function') return;
               Promise.resolve(pushAllStats()).catch((error) => {
-                console.error('[WS] Initial stats push failed:', error);
+                log.error({ err: error }, 'WS initial stats push failed');
               });
             } catch (error) {
-              console.error('[WS] Could not start initial stats push:', error);
+              log.error({ err: error }, 'WS could not start initial stats push');
             }
           }, 1000);
           if (ctx.extra) {
@@ -68,7 +69,7 @@ async function setupApolloServer(app, httpServer) {
 
           return { user };
         } catch (err) {
-          console.warn('[WS] Auth failed:', err.message);
+          log.warn({ err }, 'WS auth failed');
           throw new Error('Unauthorized: invalid token');
         }
       },
@@ -77,7 +78,7 @@ async function setupApolloServer(app, httpServer) {
           clearTimeout(ctx.extra.apolloInitialPushTimer);
           ctx.extra.apolloInitialPushTimer = null;
         }
-        console.log('[WS] Client disconnected');
+        log.debug('WS client disconnected');
       },
       // Build the GraphQL execution context for each subscription operation
       context: (ctx) => ({

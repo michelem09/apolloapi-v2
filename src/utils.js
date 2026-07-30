@@ -2,6 +2,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { spawn } = require('child_process');
 const config = require('config');
+const log = require('./logger')('utils');
 
 const isProduction = () => process.env.NODE_ENV === 'production';
 
@@ -17,7 +18,7 @@ module.exports.auth = {
 
   async changeSystemPassword(password) {
     if (!isProduction()) {
-      console.log("[DEV] Would change system password for user 'futurebit'");
+      log.debug("[dev] would change system password for user 'futurebit'");
       return;
     }
 

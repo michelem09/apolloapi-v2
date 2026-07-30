@@ -260,6 +260,14 @@ cp $APOLLO_DIR/backend/systemd/swap.service /etc/systemd/system/
 cp $APOLLO_DIR/backend/systemd/rc-local.service /etc/systemd/system/
 cp $APOLLO_DIR/backend/rc.local /etc/rc.local
 chmod +x /etc/rc.local
+
+# Persistent journald on the eMMC, so an abrupt hang leaves evidence (see
+# backend/systemd/journald-apollo.conf). Without it a hard crash is undiagnosable.
+# Non-fatal: persistent logging is a diagnostic aid, never a reason to abort an
+# update or an install half-way (these scripts run under set -e / an ERR trap).
+bash "${APOLLO_DIR}/backend/utils/install-journald.sh" "${APOLLO_DIR}" || \
+    echo "[journald] WARNING: could not install the journald policy; continuing" >&2
+systemctl restart systemd-journald
 install -d -o futurebit -g futurebit -m 700 /var/lib/apollo
 
 echo -e "${GREEN} ---> Copied apollo-api.service, apollo-ui-v2.service and ckpool.service to /etc/systemd/system${NC}"

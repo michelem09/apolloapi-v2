@@ -1,6 +1,26 @@
 const { knex } = require('../src/db');
 const { toDbTime } = require('../src/services/automation/time');
 
+// The engine's decisions go through the logger now, not raw console.log. Capture
+// them so the "writes the decision to the journal" test can read them back — the
+// dry-run log is a behavioural contract, so it stays under test.
+jest.mock('../src/logger', () => {
+  const calls = [];
+  const record = (level) => (...args) => calls.push({ level, args });
+  const logger = {
+    trace: record('trace'),
+    debug: record('debug'),
+    info: record('info'),
+    warn: record('warn'),
+    error: record('error'),
+    fatal: record('fatal'),
+    isLevelEnabled: () => false,
+  };
+  const factory = () => logger;
+  factory.__calls = calls;
+  return factory;
+});
+
 // The native sqlite3 driver does not recognise a Date created inside Jest's VM
 // realm (it stores it as "[object Object]"), so tests write timestamps the same
 // way the service does: as explicit ISO-8601 UTC strings.
@@ -330,21 +350,22 @@ describe('automation service — evaluate (dry run)', () => {
 
   it('writes the decision to the journal, with the numbers behind it', async () => {
     // The dry-run phase is only useful if you can *read* what the engine thought,
-    // and on a device that means `journalctl -u apollo-api | grep '[automation]'`.
-    const spy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    // and on a device that means `journalctl -u apollo-api | grep automation`.
+    const logger = require('../src/logger');
+    logger.__calls.length = 0; // only this evaluate's lines
 
     await overheating({ dryRun: true });
     await automation.evaluate();
 
-    // The decision line, not the config-audit lines that share the [automation] tag.
-    const line = spy.mock.calls.map(([m]) => m).find((m) => String(m).includes('→'));
+    // The decision line, not the config-audit lines that also go through the logger.
+    const line = logger.__calls
+      .map((c) => c.args[0])
+      .find((m) => String(m).includes('→'));
 
     expect(line).toContain('dry-run');
     expect(line).toContain('Thermal protection');
     expect(line).toContain('off');
     expect(line).toContain('miner.temperature=88'); // the evidence, not just the verdict
-
-    spy.mockRestore();
   });
 
   it('leaves a cool miner alone', async () => {

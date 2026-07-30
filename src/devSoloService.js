@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getCkpoolLogsDir } = require('./paths');
+const log = require('./logger')('dev-solo');
 
 let devSoloInterval = null;
 const ckpoolDir = getCkpoolLogsDir();
@@ -133,52 +134,52 @@ const updateCkpoolLogs = () => {
       fs.writeFileSync(userFilePath, JSON.stringify(generateUserData(wallet), null, 2));
     });
 
-    console.log('Solo log files updated successfully');
+    log.debug('solo log files updated successfully');
   } catch (error) {
-    console.error('Error updating Solo log files:', error);
+    log.error({ err: error }, 'error updating solo log files');
   }
 };
 
 // Start the dev solo pool (ckpool)
 const startDevSolo = async () => {
   if (!devSoloInterval) {
-    console.log('Starting dev solo pool...');
+    log.debug('starting dev solo pool');
     await delay(3000); // Simulate startup delay
 
     isRunning = true;
     devSoloInterval = setInterval(() => {
       try {
         updateCkpoolLogs();
-        console.log('Dev solo pool stats updated');
+        log.debug('dev solo pool stats updated');
       } catch (error) {
-        console.error(`Error updating dev solo pool stats: ${error.message}`);
+        log.error({ err: error }, 'error updating dev solo pool stats');
       }
     }, 10000); // Update every 10 seconds
 
-    console.log('Dev solo pool started.');
+    log.debug('dev solo pool started');
   }
 };
 
 // Stop the dev solo pool (ckpool)
 const stopDevSolo = async () => {
   if (devSoloInterval) {
-    console.log('Stopping dev solo pool...');
+    log.debug('stopping dev solo pool');
     await delay(2000); // Simulate shutdown delay
 
     clearInterval(devSoloInterval);
     devSoloInterval = null;
     isRunning = false;
 
-    console.log('Dev solo pool stopped.');
+    log.debug('dev solo pool stopped');
   }
 };
 
 // Restart the dev solo pool (ckpool)
 const restartDevSolo = async () => {
-  console.log('Restarting dev solo pool...');
+  log.debug('restarting dev solo pool');
   await stopDevSolo();
   await startDevSolo();
-  console.log('Dev solo pool restarted.');
+  log.debug('dev solo pool restarted');
 };
 
 // Get the current status

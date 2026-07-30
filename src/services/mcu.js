@@ -4,6 +4,7 @@ const axios = require('axios');
 const fs = require('fs').promises;
 const { GraphQLError } = require('graphql');
 const util = require('util');
+const log = require('../logger')('mcu');
 
 // Convert exec to use promises
 const execPromise = util.promisify(exec);
@@ -117,7 +118,7 @@ class McuService {
       if (process.env.NODE_ENV === 'production') {
         await this._spawnCommand('sudo', ['timedatectl', 'set-timezone', timezone]);
       } else {
-        console.log(`[DEV] Would set system timezone to ${timezone}`);
+        log.debug({ timezone }, '[dev] would set system timezone');
       }
 
       return this.getTimezone();
@@ -132,7 +133,7 @@ class McuService {
       if (process.env.NODE_ENV === 'production') {
         await this._execCommand('sudo reboot');
       } else {
-        console.log('Reboot command would execute in production mode');
+        log.debug('reboot command would execute in production mode');
       }
     } catch (error) {
       throw new GraphQLError(`Failed to reboot device: ${error.message}`);
@@ -145,7 +146,7 @@ class McuService {
       if (process.env.NODE_ENV === 'production') {
         await this._execCommand('sudo shutdown -h now');
       } else {
-        console.log('Shutdown command would execute in production mode');
+        log.debug('shutdown command would execute in production mode');
       }
     } catch (error) {
       throw new GraphQLError(`Failed to shutdown device: ${error.message}`);
@@ -165,7 +166,7 @@ class McuService {
         return gitAppVersion.data.version;
       }
     } catch (error) {
-      console.log('Failed to get remote version, falling back to local version:', error.message);
+      log.debug({ err: error }, 'failed to get remote version, falling back to local');
     }
 
     // If remote version fails, return local version
@@ -187,16 +188,20 @@ class McuService {
       const cmd = spawn(process.env.NODE_ENV === 'development' ? 'bash' : 'sudo', 
         process.env.NODE_ENV === 'development' ? [updateScript] : ['bash', updateScript]);
 
+      // info, not debug: an update is rare, high-stakes, and the device reboots
+      // right after — if this is not in the journal at the production level, a
+      // failed update leaves no trace anywhere and is undiagnosable after the fact.
       cmd.stdout.on('data', (data) => {
-        console.log(`stdout: ${data}`);
+        log.info({ output: data.toString().trim() }, 'update script stdout');
       });
 
       cmd.stderr.on('data', (data) => {
-        console.error(`stderr: ${data}`);
+        log.warn({ output: data.toString().trim() }, 'update script stderr');
       });
 
       cmd.on('close', (code) => {
-        console.log(`child process exited with code ${code}`);
+        if (code === 0) log.info({ code }, 'update script finished');
+        else log.error({ code }, 'update script exited non-zero');
       });
     } catch (error) {
       throw new GraphQLError(`Failed to update firmware: ${error.message}`);
@@ -215,7 +220,7 @@ class McuService {
       } catch (error) {
         if (error.code === 'ENOENT') {
           // File doesn't exist
-          console.log('update_progress file not found. Returning default progress.');
+          log.debug('update_progress file not found, returning default progress');
           fileExists = false;
         } else {
           throw error;
@@ -232,7 +237,7 @@ class McuService {
 
       return { value: progress };
     } catch (error) {
-      console.log('Error getting update progress:', error);
+      log.error({ err: error }, 'error getting update progress');
       return { value: 0 };
     }
   }
@@ -407,7 +412,7 @@ class McuService {
     try {
       const { stdout, stderr } = await execPromise(command);
       if (stderr) {
-        console.error(`Command stderr: ${stderr}`);
+        log.warn({ stderr }, 'command produced stderr');
       }
       return stdout.trim();
     } catch (error) {

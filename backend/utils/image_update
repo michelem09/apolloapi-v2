@@ -118,6 +118,15 @@ for unit in \
 done
 install -m 755 "${APOLLO_DIR}/backend/rc.local" /etc/rc.local
 
+# Persistent journald on the eMMC, so an abrupt hang leaves evidence (see
+# backend/systemd/journald-apollo.conf). No restart: this is a factory-capture
+# flow that leaves services stopped — the config file is on the image and applies
+# on the first boot of every device flashed from it.
+# Non-fatal: persistent logging is a diagnostic aid, never a reason to abort an
+# update or an install half-way (these scripts run under set -e / an ERR trap).
+bash "${APOLLO_DIR}/backend/utils/install-journald.sh" "${APOLLO_DIR}" || \
+    echo "[journald] WARNING: could not install the journald policy; continuing" >&2
+
 ### FACTORY STATE RESET ###
 ###########################
 echo -e "${YELLOW} ---> Removing device-local state for image capture${NC}"

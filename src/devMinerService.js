@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getMinerRuntimeDir, getCkpoolLogsDir } = require('./paths');
+const log = require('./logger')('dev-miner');
 
 let devMinerInterval = null;
 const statsDir = getMinerRuntimeDir();
@@ -14,7 +15,7 @@ const clearApolloMinerFiles = async (directory) => {
     for (const file of files) {
       if (file.startsWith('apollo-miner')) {
         fs.unlinkSync(path.join(directory, file));
-        console.log(`Deleted file: ${file}`);
+        log.debug({ file }, 'deleted file');
       }
     }
   }
@@ -147,23 +148,23 @@ const updateCkpoolLogs = () => {
     const userFilePath2 = path.join(usersDir, wallet2);
     fs.writeFileSync(userFilePath2, JSON.stringify(generateUserData(wallet2), null, 2));
 
-    console.log('Solo log files updated successfully');
+    log.debug('solo log files updated successfully');
   } catch (error) {
-    console.error('Error updating Solo log files:', error);
+    log.error({ err: error }, 'error updating solo log files');
   }
 };
 
 // Start the dev miner
 const startDevMiner = async () => {
   if (!devMinerInterval) {
-    console.log('Starting dev miner...');
+    log.debug('starting dev miner');
     await delay(5_000); // Simulate startup delay
 
     // Clear existing apollo-miner files
     try {
       await clearApolloMinerFiles(statsDir);
     } catch (error) {
-      console.error(`Error clearing apollo-miner files: ${error.message}`);
+      log.error({ err: error }, 'error clearing apollo-miner files');
       return;
     }
 
@@ -174,7 +175,7 @@ const startDevMiner = async () => {
       try {
         fs.mkdirSync(statsDir, { recursive: true });
       } catch (error) {
-        console.error(`Error creating directory ${statsDir}: ${error.message}`);
+        log.error({ err: error, statsDir }, 'error creating directory');
         return;
       }
     }
@@ -183,23 +184,23 @@ const startDevMiner = async () => {
       try {
         const stats = generateDevStats();
         fs.writeFileSync(statsFilePath, JSON.stringify(stats, null, 2));
-        console.log(`Dev miner stats written to ${statsFilePath}`);
+        log.debug({ statsFilePath }, 'dev miner stats written');
         
         // Update CKPool log files
         updateCkpoolLogs();
       } catch (error) {
-        console.error(`Error writing dev miner stats: ${error.message}`);
+        log.error({ err: error }, 'error writing dev miner stats');
       }
     }, 10_000);
 
-    console.log('Dev miner started.');
+    log.debug('dev miner started');
   }
 };
 
 // Stop the dev miner
 const stopDevMiner = async () => {
   if (devMinerInterval) {
-    console.log('Stopping dev miner...');
+    log.debug('stopping dev miner');
     await delay(5_000); // Simulate shutdown delay
 
     clearInterval(devMinerInterval);
@@ -208,23 +209,23 @@ const stopDevMiner = async () => {
     if (statsFilePath && fs.existsSync(statsFilePath)) {
       try {
         fs.unlinkSync(statsFilePath);
-        console.log(`Dev miner stats file ${statsFilePath} deleted.`);
+        log.debug({ statsFilePath }, 'dev miner stats file deleted');
       } catch (error) {
-        console.error('Error deleting Dev miner stats file:', error);
+        log.error({ err: error }, 'error deleting dev miner stats file');
       }
     }
 
     statsFilePath = null;
-    console.log('Dev miner stopped.');
+    log.debug('dev miner stopped');
   }
 };
 
 // Restart the dev miner
 const restartDevMiner = async () => {
-  console.log('Restarting dev miner...');
+  log.debug('restarting dev miner');
   await stopDevMiner();
   await startDevMiner();
-  console.log('Dev miner restarted.');
+  log.debug('dev miner restarted');
 };
 
 // Generate dev stats

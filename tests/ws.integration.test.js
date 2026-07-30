@@ -118,18 +118,30 @@ describe('WebSocket GraphQL Subscriptions — integration', () => {
     try {
       const eventPromise = subscribeToMcu(client);
 
-      // Give the subscription a moment to register, then publish
-      await new Promise((r) => setTimeout(r, 400));
-      pubsub.publish(TOPICS.MCU, {
-        mcu: { result: { stats: { uptime: '12345' } }, error: null },
+      // PubSub is fire-and-forget: it delivers to whoever is subscribed at the
+      // moment of publish, with no replay. Sleeping a fixed 400ms and publishing
+      // once assumed the subscription had registered by then — under load (the full
+      // suite on a busy machine) it often had not, the event went to nobody, and the
+      // test failed waiting for something that would never arrive again. Publish
+      // repeatedly until it lands instead, so the assertion is about delivery
+      // working, not about winning a race.
+      let publisher;
+      const publishUntilReceived = new Promise((resolve) => {
+        const publish = () =>
+          pubsub.publish(TOPICS.MCU, {
+            mcu: { result: { stats: { uptime: '12345' } }, error: null },
+          });
+        publish();
+        publisher = setInterval(publish, 150);
+        setTimeout(() => resolve({ type: 'timeout' }), 10000);
       });
 
-      const result = await Promise.race([
-        eventPromise,
-        new Promise((resolve) =>
-          setTimeout(() => resolve({ type: 'timeout' }), 5000)
-        ),
-      ]);
+      let result;
+      try {
+        result = await Promise.race([eventPromise, publishUntilReceived]);
+      } finally {
+        clearInterval(publisher);
+      }
 
       expect(result.type).toBe('next');
       // graphql-ws next callback receives { data: { mcu: ... } }

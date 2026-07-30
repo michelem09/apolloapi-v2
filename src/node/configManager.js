@@ -3,6 +3,7 @@ const fs = require('fs').promises;
 const os = require('os');
 const path = require('path');
 const { getCkpoolLogsDir } = require('../paths');
+const log = require('../logger')('node-config');
 const {
   ensureRpcCredentials,
   getStateDir,
@@ -111,9 +112,7 @@ function getLanCidrs(interfaces) {
     try {
       interfaces = os.networkInterfaces();
     } catch (error) {
-      console.warn(
-        `[node-config] Could not enumerate network interfaces: ${error.message}`
-      );
+      log.warn({ err: error }, 'could not enumerate network interfaces');
       interfaces = {};
     }
   }
