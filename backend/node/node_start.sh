@@ -127,6 +127,15 @@ if ! cp -f "$SRC_CONF" "$CONF_DST"; then
     log "WARN: failed to copy $(basename "$SRC_CONF"); using existing bitcoin.conf"
 fi
 
+# --- Datadir left behind by a full disk ---
+# A settings.json truncated on the way down stops every start before bitcoind
+# even opens its log. The launcher clears it rather than looping on it.
+. /opt/apolloapi/backend/lib/node_datadir.sh
+if aside="$(node_datadir_heal_settings /media/nvme/Bitcoin)" && [ -n "$aside" ]; then
+    log "WARN: settings.json was not valid JSON (a full disk does this); moved to $aside"
+fi
+# --- end ---
+
 # Start bitcoind
 screen -dmS node \
     /opt/apolloapi/backend/node/bitcoind \
