@@ -139,6 +139,14 @@ module.exports = gql`
     size: String
     disk: String
     mountpoint: String
+    # Bytes still free on a ready drive; null otherwise (never 0, which would
+    # read as "full"). Same string encoding as size.
+    free: String
+    # The drive is filling up. Not a state of its own — the node keeps running
+    # right up to the wall, and this is the notice ahead of it. bitcoind stops
+    # itself when the disk fills, and the datadir it leaves then refuses every
+    # restart until someone intervenes.
+    low: Boolean!
   }
 
   type NodeFormatProgressOutput {

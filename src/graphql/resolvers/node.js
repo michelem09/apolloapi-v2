@@ -103,6 +103,8 @@ module.exports = {
             size: s.size != null ? String(s.size) : null,
             disk: s.disk || null,
             mountpoint: s.mountpoint || null,
+            free: s.free != null ? String(s.free) : null,
+            low: s.low === true,
           },
           error: null,
         };

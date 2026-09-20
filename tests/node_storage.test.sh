@@ -159,6 +159,60 @@ check "does not wait when the drive is gone" "no-drive quick" "$(settled_with ""
 check "does not wait when it is already ready" "ready quick" \
     "$(settled_with "/dev/fake0 /dev/fake0p1" "/dev/fake0p1" 30)"
 
+
+# --- Free space ---
+# Running out is not a state: the drive is ready right up to the wall, and what
+# breaks there is bitcoind. So `ready` must stay `ready`, and the warning rides
+# alongside it. The probe is `df`, shadowed here like the others.
+low_with() {
+    # $1 free bytes ("" = df fails), $2 threshold in GB
+    local free="$1" gb="$2"
+    (
+        NODE_STORAGE_LOW_GB="$gb"
+        # shellcheck disable=SC1090
+        . "$LIB"
+        df() { [ -n "$free" ] || return 1; printf 'Avail\n%s\n' "$free"; }
+        f="$(node_storage_free)"
+        if node_storage_is_low "$f"; then echo "low"; else echo "fine"; fi
+    )
+}
+
+GB=$((1024 * 1024 * 1024))
+check "flags a drive under the line"        "low"  "$(low_with $((15 * GB)) 20)"
+check "leaves a drive over the line alone"  "fine" "$(low_with $((25 * GB)) 20)"
+check "the line is configurable"            "low"  "$(low_with $((25 * GB)) 30)"
+check "an unreadable figure is not an alarm" "fine" "$(low_with "" 20)"
+
+# The JSON the API reads: low is only ever computed on a ready drive, and a drive
+# that is not ready reports free as null, not 0 — 0 would read as "full".
+json_with() {
+    # $1 blocks, $2 findmnt source, $3 free bytes
+    local blocks="$1" mnt="$2" free="$3"
+    (
+        NODE_DISK=/dev/fake0 NODE_PARTITION=/dev/fake0p1 NODE_MOUNTPOINT=/media/fake
+        NODE_STORAGE_LOW_GB=20
+        # shellcheck disable=SC1090
+        . "$LIB"
+        node_storage_is_block() { case " $blocks " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+        findmnt() {
+            case " $* " in *" --mountpoint "*) [ -n "$mnt" ] || return 1 ;; esac
+            case " $* " in *" SOURCE "*) echo "$mnt" ;; esac; return 0
+        }
+        lsblk() { echo 1000000000000; }
+        df() { printf 'Avail\n%s\n' "$free"; }
+        state="$(node_storage_state)"; size="$(node_storage_size)"
+        f=""; [ "$state" = "ready" ] && f="$(node_storage_free)"
+        low=false; node_storage_is_low "$f" && low=true
+        printf '%s free=%s low=%s' "$state" "${f:-null}" "$low"
+    )
+}
+check "json: ready and roomy"      "ready free=$((100 * GB)) low=false" \
+    "$(json_with "/dev/fake0 /dev/fake0p1" "/dev/fake0p1" $((100 * GB)))"
+check "json: ready but running out" "ready free=$((5 * GB)) low=true" \
+    "$(json_with "/dev/fake0 /dev/fake0p1" "/dev/fake0p1" $((5 * GB)))"
+check "json: no drive reports null, never 0" "no-drive free=null low=false" \
+    "$(json_with "" "" 0)"
+
 echo
 echo "--- $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

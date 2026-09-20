@@ -20,10 +20,21 @@
 #   not-mounted  the partition is there, nothing is mounted at the mountpoint
 #   foreign      something IS mounted there, but not from the node drive
 #   ready        mounted, from the right device
+#
+# A ready drive also reports how much room is left ("free", bytes) and whether
+# that is below NODE_STORAGE_LOW_GB ("low"). Running out is not a state of its
+# own: the drive stays usable and the node keeps running right up to the wall.
+# What ends there is bitcoind — it stops itself when the disk fills — and on the
+# way down it can leave a half-written settings.json that then refuses every
+# restart. The warning exists so that is seen coming, weeks ahead, not found
+# afterwards in a crash loop.
 
 NODE_DISK="${NODE_DISK:-/dev/nvme0n1}"
 NODE_PARTITION="${NODE_PARTITION:-/dev/nvme0n1p1}"
 NODE_MOUNTPOINT="${NODE_MOUNTPOINT:-/media/nvme}"
+# The chain grows by roughly 10 GB a month; 20 GB is a couple of months of
+# notice, and still well clear of the ~50 MB at which bitcoind gives up.
+NODE_STORAGE_LOW_GB="${NODE_STORAGE_LOW_GB:-20}"
 
 # Indirection, not decoration: the states below are told apart only by which
 # block devices exist, and a test cannot create one without root. Overriding this
@@ -79,6 +90,20 @@ node_storage_size() {
     lsblk -bdno SIZE "$target" 2>/dev/null | tr -d ' '
 }
 
+# Bytes still available at the mountpoint, or empty when nothing usable is
+# mounted there. Only meaningful for `ready`; the callers check the state first.
+node_storage_free() {
+    df -B1 --output=avail "$NODE_MOUNTPOINT" 2>/dev/null | tail -n 1 | tr -d ' '
+}
+
+# Whether a free-space figure is below the warning line. Empty (unknown) is not
+# low: a probe that could not run must not raise an alarm on a healthy drive.
+node_storage_is_low() {
+    local free="$1"
+    [ -n "$free" ] || return 1
+    [ "$free" -lt $((NODE_STORAGE_LOW_GB * 1024 * 1024 * 1024)) ]
+}
+
 # The state, once it has stopped being one a boot race can still resolve. The
 # mount comes from rc.local, not fstab, so it can land after the unit is
 # evaluated, and on a fresh unit first_run partitions and formats the disk first.
@@ -124,6 +149,10 @@ fi
 if [ "${1:-}" = "--json" ]; then
     state="$(node_storage_state)"
     size="$(node_storage_size)"
-    printf '{"state":"%s","disk":"%s","partition":"%s","mountpoint":"%s","size":%s}\n' \
-        "$state" "$NODE_DISK" "$NODE_PARTITION" "$NODE_MOUNTPOINT" "${size:-null}"
+    free=""
+    [ "$state" = "ready" ] && free="$(node_storage_free)"
+    low=false
+    node_storage_is_low "$free" && low=true
+    printf '{"state":"%s","disk":"%s","partition":"%s","mountpoint":"%s","size":%s,"free":%s,"low":%s}\n' \
+        "$state" "$NODE_DISK" "$NODE_PARTITION" "$NODE_MOUNTPOINT" "${size:-null}" "${free:-null}" "$low"
 fi

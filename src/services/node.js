@@ -183,6 +183,9 @@ class NodeService {
         partition: '/dev/nvme0n1p1',
         mountpoint: '/media/nvme',
         size: 1000204886016,
+        // Set NODE_STORAGE_FAKE_LOW=1 to see the low-space notice on a laptop.
+        free: process.env.NODE_STORAGE_FAKE_LOW ? 5368709120 : 400000000000,
+        low: !!process.env.NODE_STORAGE_FAKE_LOW,
       };
     }
 

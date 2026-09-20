@@ -135,3 +135,33 @@ describe('NodeService.getStorage', () => {
     await expect(q).resolves.toMatchObject({ state: 'no-drive' });
   });
 });
+
+// The shape the UI receives. Two things are easy to get wrong here and each
+// would show as a false alarm: free must be null, not "0", when there is no
+// drive to measure; and low must be false, not undefined, so a client that
+// branches on it strictly never sees a hole.
+describe('Node.storage resolver — free space', () => {
+  const nodeResolver = require('../src/graphql/resolvers/node');
+  const ask = (answer) =>
+    nodeResolver.NodeActions.storage(null, {}, {
+      services: { node: { getStorage: jest.fn().mockResolvedValue(answer) } },
+    });
+
+  it('passes the free figure through as a string', async () => {
+    const { result } = await ask({ state: 'ready', size: 1e12, free: 5368709120, low: true });
+    expect(result).toMatchObject({ available: true, free: '5368709120', low: true });
+  });
+
+  it('reports null free space — never 0 — on a drive it could not measure', async () => {
+    const { result } = await ask({ state: 'no-drive', size: null, free: null, low: false });
+    expect(result.free).toBeNull();
+    expect(result.low).toBe(false);
+  });
+
+  it('never leaves low undefined, whatever the script answered', async () => {
+    // A script older than this field, or an unknown answer, carries no `low`.
+    const { result } = await ask({ state: 'unknown' });
+    expect(result.low).toBe(false);
+    expect(result.free).toBeNull();
+  });
+});
