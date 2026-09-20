@@ -21,8 +21,11 @@ if [ ! -f "$DEBUGLOG" ]; then
   exit 1
 fi
 
-# Last UpdateTip line
-last_line=$(grep 'UpdateTip' "$DEBUGLOG" | tail -n 1 || true)
+# Last UpdateTip line. -a: a debug.log that lived through a full disk carries
+# NUL bytes, and without it grep stops at the first one and reports "binary file
+# matches" instead — so the tip read here was whatever came before the damage,
+# not the last one, and the sync estimate was days off.
+last_line=$(grep -a 'UpdateTip' "$DEBUGLOG" | tail -n 1 || true)
 
 if [ -z "$last_line" ]; then
   echo "unsynced (no UpdateTip entries yet)"
