@@ -37,8 +37,17 @@ module.exports = gql`
     pool: SoloStatsPool
     users: [SoloStatsUsers]
     blockFound: Boolean
+    # The record kept in the database. SoloStatsPool.bestshare is ckpool's own
+    # figure for the current run and goes back to zero whenever ckpool restarts;
+    # this one only ever rises.
+    bestShareEver: SoloBestShare
     error: Error
     timestamp: String
+  }
+
+  type SoloBestShare {
+    value: Float
+    at: String
   }
 
   type SoloStatsPool {

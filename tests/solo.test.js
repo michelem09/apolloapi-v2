@@ -243,6 +243,9 @@ describe('Solo API', () => {
         pool: null,
         users: [],
         blockFound: false,
+        // Carried on every payload, stopped ckpool or not: it is the device's
+        // record, not the current run's.
+        bestShareEver: { value: expect.any(Number), at: null },
         timestamp: expect.any(String),
         error: null,
       });
@@ -267,6 +270,7 @@ describe('Solo API', () => {
         expect(result).toEqual({
           status,
           ...ckpoolData,
+          bestShareEver: { value: expect.any(Number), at: null },
           timestamp: expect.any(String),
           error: null,
         });

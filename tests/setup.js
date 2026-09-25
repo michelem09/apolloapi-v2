@@ -246,6 +246,19 @@ beforeAll(async () => {
     }
   });
 
+  await knex.schema.hasTable('solo_best_share').then(exists => {
+    if (!exists) {
+      return knex.schema.createTable('solo_best_share', table => {
+        table.integer('id').primary();
+        table.float('best_share').notNullable().defaultTo(0);
+        table.datetime('found_at');
+      });
+    }
+  });
+
+  const bestShareRow = await knex('solo_best_share').where({ id: 1 }).first();
+  if (!bestShareRow) await knex('solo_best_share').insert({ id: 1, best_share: 0 });
+
   // Inserisci dati di default per le impostazioni
   const settingsCount = await knex('settings').count('* as count').first();
   if (!settingsCount || settingsCount.count === 0) {
