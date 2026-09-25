@@ -390,6 +390,34 @@ class ServiceMonitor {
             mappedStatus = 'error';
           }
         }
+
+        // A transition in flight is protected whatever systemd happens to say.
+        // The branches above each guard only the one reading they expect — a
+        // unit `inactive` while starting, `active` while stopping — so one
+        // caught as `failed`, `deactivating`, or unreadable in the middle of a
+        // transition was written straight through as a terminal status. The UI
+        // then flashed "the pool is off" two seconds after someone pressed
+        // Start. Measured locally: pending -> offline -> online inside three
+        // seconds, with the panel reappearing in between.
+        if (existing.status === 'pending' && existing.requested_status) {
+          const wantsOnline = existing.requested_status === 'online';
+          const window = wantsOnline ? startGracePeriod : stopGracePeriod;
+          // Settle the moment reality matches the request instead of waiting
+          // for the next tick to reason about it — the point of this is to be
+          // quicker, not only quieter.
+          // `failed` is systemd's terminal answer in both directions. Holding
+          // it as pending would hide the only signal a misconfigured unit ever
+          // gives: ckpool with a bad pool address fails in under a second, and
+          // the user would watch a spinner for ninety seconds instead.
+          const arrived =
+            status === 'failed' ||
+            (wantsOnline ? status === 'active' : status === 'inactive');
+
+          if (!arrived && timeSinceRequest <= window) {
+            isWithinGracePeriod = true;
+            mappedStatus = 'pending';
+          }
+        }
       }
 
       // Now determine final status for UI/DB
@@ -506,6 +534,12 @@ class ServiceMonitor {
         .first();
 
       if (existing && existing.requested_at) {
+        // requested_at holds milliseconds. Node binds a Date to this column as
+        // an integer and reading it back works either way, but jest runs under
+        // jsdom, where a jsdom Date fails knex's cross-realm instanceof check
+        // and is bound as the string "[object Object]" — so a Date written by a
+        // service is readable on a device and unreadable in the suite. Writing
+        // the number everywhere keeps the two honest with each other.
         const timeSinceRequest = Date.now() - new Date(existing.requested_at).getTime();
         const startGracePeriod = 45000; // 45 s — service has been explicitly started
         const stopGracePeriod  = 20000; // 20 s — service has been explicitly stopped
@@ -528,6 +562,31 @@ class ServiceMonitor {
           timeSinceRequest <= stopGracePeriod
         ) {
           status = 'offline';
+        }
+
+        // And don't call a transition finished before it is. The two rules
+        // above only stop a settled status being dragged back to pending; this
+        // is the opposite direction, and it is the one that showed: a check
+        // reporting "offline" two seconds into a start is the pool not being up
+        // *yet*, and writing it through made the panel reappear mid-start.
+        //
+        // The production path has the same shape but not the same numbers: 45s
+        // and 20s here against 90s and 30s there, and 'error' here where
+        // systemd says 'failed'. The windows differ because these checks ask
+        // the application directly and settle sooner — but it does mean a
+        // transition still protected on a device can be released early in
+        // development, so a flap seen on hardware may not reproduce locally.
+        // If that ever bites, make the windows equal before assuming anything
+        // else changed.
+        if (existing.status === 'pending' && existing.requested_status) {
+          const wantsOnline = existing.requested_status === 'online';
+          const window = wantsOnline ? startGracePeriod : stopGracePeriod;
+          // 'error' is this path's terminal failure, as `failed` is systemd's.
+          const arrived =
+            status === 'error' ||
+            (wantsOnline ? status === 'online' : status === 'offline');
+
+          if (!arrived && timeSinceRequest <= window) status = 'pending';
         }
       }
 
