@@ -31,13 +31,20 @@ async function setupApolloServer(app, httpServer) {
     {
       schema,
       // Authenticate the WS connection using the JWT passed in connectionParams.
-      // Throwing here rejects the connection before any subscription can be opened.
+      //
+      // Returning false rather than throwing, and the difference is visible to the
+      // user: a throw is caught by graphql-ws and closed as 4500 "Internal server
+      // error", which the client can only read as "the backend is broken" — so a
+      // refused token produced a full-screen "backend offline" on a device that was
+      // answering perfectly well. `false` closes with 4403 Forbidden, which says
+      // what actually happened and which the client turns into a trip to sign in.
       onConnect: async (ctx) => {
         const authHeader = ctx.connectionParams?.authorization || '';
         const token = authHeader.replace('Bearer ', '').trim();
 
         if (!token) {
-          throw new Error('Unauthorized: missing token');
+          console.warn('[WS] connection refused: no token');
+          return false;
         }
 
         try {
@@ -58,8 +65,8 @@ async function setupApolloServer(app, httpServer) {
 
           return { user };
         } catch (err) {
-          console.warn('[WS] Auth failed:', err.message);
-          throw new Error('Unauthorized: invalid token');
+          console.warn('[WS] connection refused: invalid token:', err.message);
+          return false;
         }
       },
       onDisconnect: (ctx) => {
