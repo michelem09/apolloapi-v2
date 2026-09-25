@@ -34,7 +34,7 @@ class NodeService {
         .update({
           status: 'pending',
           requested_status: 'online',
-          requested_at: new Date()
+          requested_at: Date.now()
         });
 
       this._notifyServicesStatus();
@@ -52,7 +52,7 @@ class NodeService {
         .update({
           status: 'pending',
           requested_status: 'offline',
-          requested_at: new Date()
+          requested_at: Date.now()
         });
 
       this._notifyServicesStatus();
@@ -267,7 +267,7 @@ class NodeService {
         .update({
           status: 'pending',
           requested_status: 'offline',
-          requested_at: new Date()
+          requested_at: Date.now()
         });
       this._notifyServicesStatus();
     } catch (error) {

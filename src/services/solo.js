@@ -126,7 +126,7 @@ class SoloService {
           .update({
             status: 'pending',
             requested_status: 'online',
-            requested_at: new Date(),
+            requested_at: Date.now(),
           });
         this._notifyServicesStatus();
       }
@@ -164,7 +164,7 @@ class SoloService {
           .update({
             status: 'pending',
             requested_status: 'offline',
-            requested_at: new Date(),
+            requested_at: Date.now(),
           });
         this._notifyServicesStatus();
       }
@@ -195,7 +195,7 @@ class SoloService {
           .update({
             status: 'pending',
             requested_status: 'online',
-            requested_at: new Date(),
+            requested_at: Date.now(),
           });
         this._notifyServicesStatus();
       }

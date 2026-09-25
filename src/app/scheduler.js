@@ -92,8 +92,8 @@ async function initServiceStatusRows() {
         service_name: service,
         status: 'unknown',  // Start as unknown until ServiceMonitor checks
         requested_status: defaultRequestedStatus,
-        requested_at: defaultRequestedStatus ? new Date() : null,
-        last_checked: new Date(),
+        requested_at: defaultRequestedStatus ? Date.now() : null,
+        last_checked: Date.now(),
       });
       
       console.log(`Initialized service status for ${service} with requested_status=${defaultRequestedStatus}`);

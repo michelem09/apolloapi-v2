@@ -33,7 +33,7 @@ class MinerService {
         .update({
           status: 'pending',
           requested_status: 'online',
-          requested_at: new Date(),
+          requested_at: Date.now(),
         });
 
       // Notify subscribers immediately so the UI shows "pending" without waiting
@@ -78,7 +78,7 @@ class MinerService {
         .update({
           status: 'pending',
           requested_status: 'offline',
-          requested_at: new Date(),
+          requested_at: Date.now(),
         });
 
       this._notifyServicesStatus();
@@ -115,7 +115,7 @@ class MinerService {
         .update({
           status: 'pending',
           requested_status: 'online',
-          requested_at: new Date(),
+          requested_at: Date.now(),
         });
 
       this._notifyServicesStatus();
