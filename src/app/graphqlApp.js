@@ -54,14 +54,30 @@ async function setupApolloServer(app, httpServer) {
 
           console.log(`[WS] Client connected, user: ${user.username || user.sub || 'unknown'}`);
 
-          // Trigger an immediate data push ~1s after connection so the client
-          // gets data right away without waiting for the next scheduler tick.
-          // The delay lets all 6 subscription async iterators register before the first publish.
-          setTimeout(() => {
+          // Fill the client without waiting for the next scheduler tick.
+          //
+          // Twice, not once. The single push waited a second so that all six
+          // subscription iterators would have registered — but a client that
+          // registered sooner then sat for that whole second with a dashboard
+          // and no service status, which is the window where the navbar badges
+          // have nothing to show. The early push serves whoever is ready; the
+          // one at a second is the safety net for whoever was not, and a
+          // duplicate publish costs a DB read and is idempotent at the client.
+          const fillClient = () => {
             // Import lazily to avoid circular dependency at module load time
             const { pushAllStats } = require('./scheduler');
             pushAllStats();
-          }, 1000);
+          };
+
+          // Held on the socket so a client that drops in between does not make
+          // the device pay for them. A sweep is five publishes, one of them a
+          // batch RPC to bitcoind and one an os_stats spawn — and the client's
+          // own silence watchdog makes reconnects deliberately frequent on a
+          // flapping link, so an uncancelled pair would be charged per retry.
+          ctx.extra.fillTimers = [
+            setTimeout(fillClient, 150),
+            setTimeout(fillClient, 1000),
+          ];
 
           return { user };
         } catch (err) {
@@ -70,6 +86,7 @@ async function setupApolloServer(app, httpServer) {
         }
       },
       onDisconnect: (ctx) => {
+        (ctx.extra?.fillTimers || []).forEach(clearTimeout);
         console.log('[WS] Client disconnected');
       },
       // Build the GraphQL execution context for each subscription operation
