@@ -483,6 +483,14 @@ class SoloService {
             status: newStatus,
             last_checked: Date.now()
           });
+        // The end of the transition is a state change like the start of it, and
+        // it was the only one nobody announced. Going into `pending` published;
+        // arriving at online or offline did not, and the monitor that would
+        // otherwise have noticed finds the row already up to date and says
+        // nothing. The UI then held a stopped pool on screen for up to ten
+        // seconds — the next periodic push — while its statistics were already
+        // arriving every five.
+        this._notifyServicesStatus();
       }
     } catch (error) {
       console.error('Error updating service status:', error);

@@ -51,8 +51,10 @@ class MinerService {
           .where({ service_name: 'miner' })
           .update({
             status: 'online',
-            last_checked: new Date(),
+            last_checked: Date.now(),
           });
+        // Same reason as solo: the arrival has to be announced too.
+        this._notifyServicesStatus();
         console.log('Dev miner started - status updated to online');
       } else {
         // --no-block: miner_start.sh sleeps ~35s waiting for USB boards to
@@ -92,8 +94,9 @@ class MinerService {
           .where({ service_name: 'miner' })
           .update({
             status: 'offline',
-            last_checked: new Date(),
+            last_checked: Date.now(),
           });
+        this._notifyServicesStatus();
         console.log('Dev miner stopped - status updated to offline');
       } else {
         await this._execCommand('sudo systemctl stop apollo-miner');
@@ -128,8 +131,10 @@ class MinerService {
           .where({ service_name: 'miner' })
           .update({
             status: 'online',
-            last_checked: new Date(),
+            last_checked: Date.now(),
           });
+        // Same reason as solo: the arrival has to be announced too.
+        this._notifyServicesStatus();
         console.log('Dev miner restarted - status updated to online');
       } else {
         // --no-block: see start(). The 35s device-side wait is unchanged; the
