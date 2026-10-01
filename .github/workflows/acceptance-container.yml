@@ -17,7 +17,13 @@ jobs:
     if: github.repository == 'michelem09/apolloapi-v2'
     runs-on: ubuntu-latest
     steps:
+      # The submodule too: two of the backend suites are cross-repo contract
+      # tests — i18n parity and UI queries against the schema — and they read
+      # files out of apolloui-v2. Without it they fail on ENOENT, which looks
+      # like a broken test and is a missing checkout.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version-file: '.nvmrc'
