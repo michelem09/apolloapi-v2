@@ -39,9 +39,12 @@ const restoreSnapshot = async (profile, snapshot) => {
   if (now !== snapshot.timezone) {
     await sshExec(profile, `sudo timedatectl set-timezone ${snapshot.timezone}`);
     notes.push(`timezone put back to ${snapshot.timezone}`);
-    // Honest about what restoring cannot undo: processes started before the
-    // change keep the old zone in their logs until the device restarts.
-    notes.push('a reboot is still owed for services to log the restored zone');
+    // Precise about what this costs: the running services already hold the zone
+    // the device started on, which is the one just restored — nothing is wrong
+    // with their logs. But rebootPending reads the mtime of /etc/localtime, and
+    // that cannot tell "changed" from "changed and changed back", so the panel
+    // will claim a restart is owed until the next boot. Conservative, not wrong.
+    notes.push('the panel will report a restart owed until the next boot, though the zone is back where it started');
   }
 
   await sshExec(profile, 'sudo systemctl start apollo-api', { timeoutMs: 60000 });
