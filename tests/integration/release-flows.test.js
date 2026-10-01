@@ -293,3 +293,94 @@ describe('release — nothing side-effectful is reachable without a token', () =
     expect(message).toMatch(/auth|token|unauthenticated/i);
   });
 });
+
+// Setup is only ever exercised here. It runs once per device and cannot be
+// repeated on one, so the container is the only place it can be driven at all —
+// which makes this file its sole guardian. The wizard is three API calls in a
+// fixed order, and the order is the part that bites: enabling solo rewrites
+// bitcoin.conf and takes ckpool with it, so it has to land before the pool.
+describe('release — the setup sequence, as the wizard performs it', () => {
+  const SETUP = `query($in: AuthSetupInput!) { Auth { setup(input: $in) { error { message } } } }`;
+  const POOLS = `query($in: PoolUpdateAllInput!) {
+    Pool { updateAll(input: $in) { result { pools { url username index enabled } } error { message } } }
+  }`;
+  const SETTINGS = `query($in: SettingsUpdateInput!) {
+    Settings { update(input: $in) { result { settings { nodeEnableSoloMining } } error { message } } }
+  }`;
+
+  const fs = require('fs');
+
+  // The LAST write, not the first: a settings change regenerates the miner
+  // config too, so the first one carries whatever pool was there before.
+  const lastWriteTo = (suffix) =>
+    fs.promises.writeFile.mock.calls.filter((c) => String(c[0]).endsWith(suffix)).pop();
+
+  beforeEach(async () => {
+    process.env.NODE_ENV = 'test';
+    await run(SETUP, { variables: { in: { password: 'a-good-password' } }, auth: false });
+    fs.promises.writeFile.mockClear();
+  });
+
+  it('a pooled setup puts the chosen pool on the miner command line', async () => {
+    const res = await run(POOLS, {
+      variables: {
+        in: {
+          pools: [{
+            index: 1,
+            enabled: true,
+            url: 'stratum+tcp://mine.ocean.xyz:3334',
+            username: 'bc1qexample',
+            password: 'x',
+          }],
+        },
+      },
+    });
+
+    expect(res.data.Pool.updateAll.error).toBeNull();
+
+    // The bug this guards: the wizard once applied a pool the user had not
+    // picked. Persisted is not enough — it has to reach the binary's arguments.
+    const written = lastWriteTo('/miner_config');
+    expect(written).toBeDefined();
+    expect(written[1]).toContain('-host mine.ocean.xyz -port 3334 -user bc1qexample');
+
+    // Apollo III reads its own file, and a setup that wrote only the legacy one
+    // would leave a III mining nowhere.
+    const third = lastWriteTo('/miner_config3');
+    expect(third).toBeDefined();
+    expect(third[1]).toContain('-host mine.ocean.xyz -port 3334');
+  });
+
+  it('a solo setup enables solo mining before the pool is applied', async () => {
+    // bitcoin.conf is rewritten by manageBitcoinConf, not by a plain file write.
+    const conf = jest.spyOn(utils.auth, 'manageBitcoinConf').mockResolvedValue(undefined);
+
+    const solo = await run(SETTINGS, { variables: { in: { nodeEnableSoloMining: true } } });
+    expect(solo.data.Settings.update.error).toBeNull();
+    expect(solo.data.Settings.update.result.settings.nodeEnableSoloMining).toBe(true);
+
+    // Regenerating bitcoin.conf is what makes this step the one the wizard
+    // awaits before touching anything else: it takes ckpool with it.
+    expect(conf).toHaveBeenCalled();
+
+    const res = await run(POOLS, {
+      variables: {
+        in: {
+          pools: [{
+            index: 1,
+            enabled: true,
+            url: 'stratum+tcp://127.0.0.1:3333',
+            username: '36kNhMVxznYLhz3YhShXAEbBCDf5pZgojo',
+            password: 'x',
+          }],
+        },
+      },
+    });
+
+    expect(res.data.Pool.updateAll.error).toBeNull();
+    const written = lastWriteTo('/miner_config');
+    // Solo points the miner at the device's own pool, with the payout address as
+    // the username — not at anything on the internet.
+    expect(written[1]).toContain('-host 127.0.0.1 -port 3333 -user 36kNhMVxznYLhz3YhShXAEbBCDf5pZgojo');
+  });
+});
