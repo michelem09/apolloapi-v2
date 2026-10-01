@@ -102,3 +102,5 @@ docs-ai/
 /test-results/
 /playwright-report/
 /playwright/.cache/
+# Local acceptance profile: host, SSID — never committed
+acceptance/profile.json

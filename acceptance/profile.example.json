@@ -1,0 +1,8 @@
+{
+  "host": "192.168.86.236",
+  "user": "futurebit",
+  "apiPort": 5000,
+  "uiPort": 3000,
+  "wifi": { "ssid": "Wiffy" },
+  "allow": ["preflight", "timezone", "miner"]
+}

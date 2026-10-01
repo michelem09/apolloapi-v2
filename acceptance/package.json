@@ -1,0 +1,11 @@
+{
+  "name": "apollo-acceptance",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Pre-release acceptance runs against a real device. Development only — never shipped: see docs-ai/ACCEPTANCE_SUITE.md.",
+  "engines": { "node": ">=21" },
+  "scripts": {
+    "run": "node run.js"
+  },
+  "dependencies": {}
+}
