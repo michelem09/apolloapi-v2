@@ -3,6 +3,15 @@
   "user": "futurebit",
   "apiPort": 5000,
   "uiPort": 3000,
-  "wifi": { "ssid": "Wiffy" },
-  "allow": ["preflight", "timezone", "miner"]
+  "wifi": {
+    "ssid": "Wiffy"
+  },
+  "allow": [
+    "preflight",
+    "timezone",
+    "miner",
+    "password",
+    "wifi",
+    "reboot"
+  ]
 }

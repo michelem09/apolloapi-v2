@@ -21,6 +21,9 @@ const CHECKS = [
   require('./checks/preflight'),
   require('./checks/timezone'),
   require('./checks/miner'),
+  require('./checks/password'),
+  require('./checks/wifi'),
+  require('./checks/reboot'),
 ].sort((a, b) => a.risk - b.risk);
 
 const arg = (name, fallback = null) => {
@@ -50,9 +53,19 @@ const main = async () => {
   const snapshot = await takeSnapshot(profile);
   console.log(`snapshot: db + timezone ${snapshot.timezone}`);
 
-  const tunnel = await openTunnel(profile, profile.apiPort);
+  let tunnel = await openTunnel(profile, profile.apiPort);
   profile.apiBase = `http://127.0.0.1:${tunnel.port}`;
   console.log(`tunnel:   127.0.0.1:${tunnel.port} → ${profile.host}:${profile.apiPort}\n`);
+
+  // A reboot takes the tunnel with it, so a check that restarts the device has
+  // to be able to build it again — otherwise everything after the reboot fails
+  // for want of a pipe rather than for anything about the product.
+  const reopenTunnel = async () => {
+    try { tunnel.close(); } catch { /* already gone */ }
+    tunnel = await openTunnel(profile, profile.apiPort);
+    profile.apiBase = `http://127.0.0.1:${tunnel.port}`;
+    return tunnel.port;
+  };
 
   // From here on the device may have been changed, so every exit path goes
   // through the restore — including one where a check never got to run.
@@ -60,13 +73,13 @@ const main = async () => {
   let failed = false;
   try {
     const token = await mintToken(profile);
-    failed = await runChecks({ profile, token, only, results });
+    failed = await runChecks({ profile, token, only, results, reopenTunnel });
   } catch (err) {
     console.log(`\n! ${err.message}`);
     failed = true;
   }
 
-  tunnel.close();
+  try { tunnel.close(); } catch { /* already gone */ }
 
   console.log('\nrestoring…');
   const notes = await restoreSnapshot(profile, snapshot);
@@ -77,7 +90,7 @@ const main = async () => {
   process.exit(failed ? 1 : 0);
 };
 
-const runChecks = async ({ profile, token, only, results }) => {
+const runChecks = async ({ profile, token, only, results, reopenTunnel }) => {
   let failed = false;
 
   for (const check of CHECKS) {
@@ -93,7 +106,7 @@ const runChecks = async ({ profile, token, only, results }) => {
 
     process.stdout.write(`${check.name}\n`);
     try {
-      const out = await check.run({ profile, token, assert, skip });
+      const out = await check.run({ profile, token, assert, skip, reopenTunnel });
       lines.forEach((l) => console.log(l));
       if (out?.skipped) console.log(`    – skipped: ${out.skipped}`);
       results.push({ check: check.name, ok: true });
