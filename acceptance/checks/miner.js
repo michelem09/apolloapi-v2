@@ -10,10 +10,9 @@ const isActive = (profile, unit) => async () =>
 module.exports = {
   name: 'miner',
   risk: 2,
-  async run({ profile, token, assert, skip }) {
-    const board = (await sshExec(profile, 'grep -m1 ^BOARD_NAME= /etc/armbian-release || true')).stdout;
-    if (board.includes('Solo Node')) {
-      return skip('a Solo Node has no internal miner to stop');
+  async run({ profile, token, assert, skip, device }) {
+    if (!device.hasInternalMiner) {
+      return skip(`a ${device.kind} has no internal miner to stop`);
     }
 
     const active = isActive(profile, 'apollo-miner');

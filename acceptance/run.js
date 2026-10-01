@@ -15,6 +15,7 @@ const path = require('path');
 const { assertDeviceIsDisposable } = require('./lib/guard');
 const { takeSnapshot, restoreSnapshot } = require('./lib/snapshot');
 const { mintToken } = require('./lib/api');
+const { describeDevice } = require('./lib/device');
 const { wifiPassphrase } = require('./lib/secrets');
 const { openTunnel } = require('./lib/tunnel');
 
@@ -23,6 +24,7 @@ const CHECKS = [
   require('./checks/timezone'),
   require('./checks/miner'),
   require('./checks/browser'),
+  require('./checks/node'),
   require('./checks/password'),
   require('./checks/wifi'),
   require('./checks/reboot'),
@@ -50,7 +52,8 @@ const main = async () => {
   const started = Date.now();
 
   const { hostname } = await assertDeviceIsDisposable(profile);
-  console.log(`device:   ${hostname} (${profile.host})`);
+  const device = await describeDevice(profile);
+  console.log(`device:   ${hostname} (${profile.host}) — ${device.kind}, BOARD_NAME ${device.board}`);
 
   const snapshot = await takeSnapshot(profile);
   console.log(`snapshot: db + timezone ${snapshot.timezone}`);
@@ -75,7 +78,7 @@ const main = async () => {
   let failed = false;
   try {
     const token = await mintToken(profile);
-    failed = await runChecks({ profile, token, only, results, reopenTunnel });
+    failed = await runChecks({ profile, token, only, results, reopenTunnel, device });
   } catch (err) {
     console.log(`\n! ${err.message}`);
     failed = true;
@@ -92,7 +95,7 @@ const main = async () => {
   process.exit(failed ? 1 : 0);
 };
 
-const runChecks = async ({ profile, token, only, results, reopenTunnel }) => {
+const runChecks = async ({ profile, token, only, results, reopenTunnel, device }) => {
   let failed = false;
 
   for (const check of CHECKS) {
@@ -108,7 +111,7 @@ const runChecks = async ({ profile, token, only, results, reopenTunnel }) => {
 
     process.stdout.write(`${check.name}\n`);
     try {
-      const out = await check.run({ profile, token, assert, skip, reopenTunnel });
+      const out = await check.run({ profile, token, assert, skip, reopenTunnel, device });
       lines.forEach((l) => console.log(l));
       if (out?.skipped) console.log(`    – skipped: ${out.skipped}`);
       results.push({ check: check.name, ok: true });

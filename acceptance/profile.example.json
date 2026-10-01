@@ -11,6 +11,7 @@
     "timezone",
     "miner",
     "browser",
+    "node",
     "password",
     "wifi",
     "reboot"

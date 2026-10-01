@@ -38,7 +38,17 @@ const gql = async (profile, token, query, variables = {}) => {
     body: JSON.stringify({ query, variables }),
   });
   const body = await res.json();
-  if (body.errors) throw new Error(`GraphQL: ${body.errors.map((e) => e.message).join('; ')}`);
+  if (body.errors) {
+    const message = body.errors.map((e) => e.message).join('; ');
+    const error = new Error(`GraphQL: ${message}`);
+    // A query the schema rejects is a mistake in the suite, not a device that is
+    // not ready yet. Flagged, so a polling check can stop instead of waiting out
+    // its deadline for an answer that can never come.
+    error.malformed = body.errors.some(
+      (e) => e.extensions?.code === 'GRAPHQL_VALIDATION_FAILED'
+    );
+    throw error;
+  }
   return body.data;
 };
 
