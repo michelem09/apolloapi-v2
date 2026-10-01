@@ -104,3 +104,7 @@ docs-ai/
 /playwright/.cache/
 # Local acceptance profile: host, SSID — never committed
 acceptance/profile.json
+
+# Acceptance workspace: its dependencies are its own, never the root's
+acceptance/node_modules/
+acceptance/test-results/

@@ -21,6 +21,7 @@ const CHECKS = [
   require('./checks/preflight'),
   require('./checks/timezone'),
   require('./checks/miner'),
+  require('./checks/browser'),
   require('./checks/password'),
   require('./checks/wifi'),
   require('./checks/reboot'),

@@ -2,10 +2,16 @@
   "name": "apollo-acceptance",
   "private": true,
   "version": "0.1.0",
-  "description": "Pre-release acceptance runs against a real device. Development only — never shipped: see docs-ai/ACCEPTANCE_SUITE.md.",
-  "engines": { "node": ">=21" },
-  "scripts": {
-    "run": "node run.js"
+  "description": "Pre-release acceptance runs against a real device. Development only \u2014 never shipped: see docs-ai/ACCEPTANCE_SUITE.md.",
+  "engines": {
+    "node": ">=21"
   },
-  "dependencies": {}
+  "scripts": {
+    "run": "node run.js",
+    "browser": "playwright test --config browser/playwright.config.js"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@playwright/test": "^1.61.1"
+  }
 }

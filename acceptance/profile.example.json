@@ -10,6 +10,7 @@
     "preflight",
     "timezone",
     "miner",
+    "browser",
     "password",
     "wifi",
     "reboot"

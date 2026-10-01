@@ -1,6 +1,10 @@
 # Acceptance runs
 
-Development only. This directory is never packaged: the release workflow stages
+Development only. Install its dependencies here, never in the repo root:
+
+    yarn --cwd acceptance install
+    npx --prefix acceptance playwright install chromium   # once, for the browser tier
+ This directory is never packaged: the release workflow stages
 an allow-list (`src config migrations knexfile.js package.json node_modules` plus
 the UI standalone), and it carries no dependencies, so nothing here can reach a
 device through an install. See `docs-ai/ACCEPTANCE_SUITE.md`.
@@ -26,6 +30,10 @@ checks while the Linux user kept the new password — the two would disagree.
 
 Checks run in order of increasing risk: preflight, timezone, miner, password,
 wifi, reboot. A failure stops the run there, so nothing riskier follows it.
+
+The browser tier runs as one check (`browser`) and can also be driven alone:
+
+    ACCEPTANCE_UI_BASE=http://localhost:3000 yarn --cwd acceptance browser
 
 Exit codes: `0` all checks passed · `1` a check failed · `2` the run never
 started (no profile, device not declared, ssh unreachable).
