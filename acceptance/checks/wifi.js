@@ -2,7 +2,10 @@ const { gql } = require('../lib/api');
 const { waitUntil } = require('../lib/wait');
 const { howToStore } = require('../lib/secrets');
 
-const INTERFACES = `{ Mcu { wifiInterfaces { result { interfaces { device kind connected } preferred } error { message } } } }`;
+const INTERFACES = `{ Mcu { wifiInterfaces { result {
+  interfaces { device kind connected connection carriesDefaultRoute }
+  preferred
+} error { message } } } }`;
 const NETWORKS = `query($ifname: String!) {
   Mcu { wifiNetworks(ifname: $ifname) { result { networks { ssid signal } } error { message } } }
 }`;
@@ -30,8 +33,19 @@ module.exports = {
       return skip('the API reported no manageable wifi radio at this moment');
     }
 
-    const radio = interfaces[0];
-    assert(!!radio.device, `the API sees a wifi radio (${radio.device}, ${radio.kind})`);
+    // Never the radio carrying this session, and never one already holding a
+    // network. Disconnecting the first would cut the run's own link — the reboot
+    // check and the restore would both fail and the device would be left as the
+    // run made it. Disconnecting the second would take away someone's network:
+    // the snapshot covers the database, not NetworkManager.
+    const radio = interfaces.find((i) => !i.carriesDefaultRoute && !i.connected);
+    if (!radio) {
+      const busy = interfaces
+        .map((i) => `${i.device}${i.carriesDefaultRoute ? ' (carries the route)' : ''}${i.connected ? ` (on ${i.connection || 'a network'})` : ''}`)
+        .join(', ');
+      return skip(`no free radio to exercise — ${busy}`);
+    }
+    assert(!!radio.device, `a free wifi radio to work with (${radio.device}, ${radio.kind})`);
 
     const scan = await gql(profile, token, NETWORKS, { ifname: radio.device });
     const networks = scan.Mcu.wifiNetworks.result?.networks ?? [];
@@ -57,7 +71,8 @@ module.exports = {
     }, { timeoutMs: 60000, everyMs: 3000 });
     assert(up.ok, `the radio holds ${ssid} with an address`);
 
-    // Leave the radio as it was found: down, with its saved profiles intact.
+    // Leave the radio as it was found — down, which is how it was chosen, with
+    // its saved profiles intact.
     await gql(profile, token, DISCONNECT, { ifname: radio.device });
     const down = await waitUntil(async () => {
       const s = await gql(profile, token, STATUS, { ifname: radio.device });

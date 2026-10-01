@@ -16,15 +16,16 @@ const deviceNode = async (profile) => {
 };
 
 // The token is minted ON the device from its own APP_SECRET: the secret never
-// travels, and the run needs no password of its own. Short-lived and local to
-// the run.
+// travels, and the run needs no password of its own. It expires in two hours —
+// longer than any run, short enough that one left in a log is not a standing key
+// to the device.
 const mintToken = async (profile) => {
   const script = [
     'const fs=require("fs");const jwt=require("/opt/apolloapi/node_modules/jsonwebtoken");',
     'const env=Object.fromEntries(fs.readFileSync("/opt/apolloapi/.env","utf8").split("\\n")',
     '.filter(Boolean).filter(l=>!l.startsWith("#")).map(l=>{const i=l.indexOf("=");',
     'return [l.slice(0,i).trim(),l.slice(i+1).trim()];}));',
-    'console.log(jwt.sign({sub:"apollouser",aud:"auth"},env.APP_SECRET));',
+    'console.log(jwt.sign({sub:"apollouser",aud:"auth"},env.APP_SECRET,{expiresIn:"2h"}));',
   ].join('');
   const node = await deviceNode(profile);
   const { stdout } = await sshExec(profile, `${node} -e '${script}'`);

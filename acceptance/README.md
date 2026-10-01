@@ -41,12 +41,11 @@ Linux user kept the new password — the two would silently disagree.
 over the keychain, for a one-off run. Without either, those checks skip and print
 the command above.
 
-Checks run in order of increasing risk: preflight, timezone, miner, password,
-wifi, reboot. A failure stops the run there, so nothing riskier follows it.
+Checks run in order of increasing risk: preflight, timezone, miner, browser,
+node, password, wifi, reboot. A failure stops the run there, so nothing riskier
+follows it.
 
-The browser tier runs as one check (`browser`) and can also be driven alone:
-
-    ACCEPTANCE_UI_BASE=http://localhost:3000 yarn --cwd acceptance browser
-
-Exit codes: `0` all checks passed · `1` a check failed · `2` the run never
-started (no profile, device not declared, ssh unreachable).
+Exit codes: `0` everything ran and passed · `1` a check failed · `2` the run
+never started (no profile, device not declared, ssh unreachable) · `3` everything
+that ran passed, but something skipped — a skip proves nothing, so it is not a
+green light.

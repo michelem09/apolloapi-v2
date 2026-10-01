@@ -36,15 +36,21 @@ module.exports = {
     const changed = await gql(profile, token, CHANGE, { input: { password: temporary } });
     assert(changed.Auth.changePassword.error === null, 'the password was changed');
 
-    const stale = await gql(profile, token, LOGIN, { input: { password: original } });
-    assert(!stale.Auth.login.result, 'the old password stopped working');
+    // From here the device is on a generated password, so every path out of this
+    // block has to put the old one back — including a failing assertion. The
+    // alternative is the exact divergence this check exists to prevent: the
+    // snapshot restores the hash the dashboard checks, while the Linux user
+    // keeps the password this run set.
+    let back;
+    try {
+      const stale = await gql(profile, token, LOGIN, { input: { password: original } });
+      assert(!stale.Auth.login.result, 'the old password stopped working');
 
-    const fresh = await gql(profile, token, LOGIN, { input: { password: temporary } });
-    assert(!!fresh.Auth.login.result?.accessToken, 'the new password logs in');
-
-    // Put it back before anything else can fail: leaving a device on a
-    // generated password is worse than any assertion this check could make.
-    const back = await gql(profile, token, CHANGE, { input: { password: original } });
+      const fresh = await gql(profile, token, LOGIN, { input: { password: temporary } });
+      assert(!!fresh.Auth.login.result?.accessToken, 'the new password logs in');
+    } finally {
+      back = await gql(profile, token, CHANGE, { input: { password: original } });
+    }
     assert(back.Auth.changePassword.error === null, 'the original password was restored');
 
     const final = await gql(profile, token, LOGIN, { input: { password: original } });

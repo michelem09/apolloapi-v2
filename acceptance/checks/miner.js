@@ -32,15 +32,28 @@ module.exports = {
     assert(started.ok, `systemd reports the miner running again (${Math.round(started.waitedMs / 1000)}s)`);
 
     // Running is not the same as mining: the proof is a live connection to the
-    // pool, which is what the owner actually cares about.
+    // pool. Which port that is comes from the device's own configuration —
+    // hardcoding 3333/3334 would fail every device pointed at a pool on 443 or
+    // 21496, and fail it for three minutes before saying so.
+    const pools = await gql(profile, token, `{ Pool { list { result { pools { url enabled } } error { message } } } }`);
+    const ports = (pools.Pool.list.result?.pools ?? [])
+      .filter((p) => p.enabled)
+      .map((p) => (String(p.url).match(/:(\d+)\s*$/) || [])[1])
+      .filter(Boolean);
+
+    if (!ports.length) {
+      return skip('no enabled pool with a port in its URL — nothing to watch for');
+    }
+
+    const pattern = ports.map((p) => `:${p}`).join('\\|');
     const pool = await waitUntil(async () => {
       const { stdout } = await sshExec(
         profile,
-        'sudo ss -tn state established 2>/dev/null | grep -c ":3333\\|:3334" || true'
+        `sudo ss -tn state established 2>/dev/null | grep -c "${pattern}" || true`
       );
       return Number(stdout) > 0;
     }, { timeoutMs: 180000, everyMs: 5000 });
-    assert(pool.ok, `the miner reconnected to its pool (${Math.round(pool.waitedMs / 1000)}s)`);
+    assert(pool.ok, `the miner reconnected to its pool on ${ports.join('/')} (${Math.round(pool.waitedMs / 1000)}s)`);
 
     return { restored: true };
   },

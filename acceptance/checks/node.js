@@ -10,9 +10,16 @@ const isActive = (profile, unit) => async () =>
 module.exports = {
   name: 'node',
   risk: 3,
-  async run({ profile, token, assert }) {
+  async run({ profile, token, assert, skip }) {
     const active = isActive(profile, 'node');
-    assert(await active(), 'the node is running before we touch it');
+
+    // A device with no blockchain drive keeps the node deliberately stopped —
+    // that is a supported configuration, not a fault, and failing here would
+    // also abort every riskier check behind it.
+    if (!(await active())) {
+      return skip('the node is not running — expected on a device with no blockchain drive');
+    }
+    assert(true, 'the node is running before we touch it');
 
     await gql(profile, token, `mutation { Node { stop { error { message } } } }`);
     const stopped = await waitUntil(async () => !(await active()), { timeoutMs: 120000, everyMs: 5000 });

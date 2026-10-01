@@ -2,6 +2,7 @@ const { test, expect } = require('@playwright/test');
 const { devicePassword } = require('../lib/secrets');
 
 const PASSWORD = devicePassword();
+const KIND = process.env.ACCEPTANCE_DEVICE_KIND;
 
 // The pool panel, exercised WITHOUT saving.
 //
@@ -13,6 +14,10 @@ const PASSWORD = devicePassword();
 // down to the binary's command line.
 test.describe('settings — pool', () => {
   test.skip(!PASSWORD, 'set the device password in the keychain to drive the UI');
+  // A Solo Node has no pools tab: settings/[tab].js maps solo|node|system|logs|
+  // extra and falls back to the Solo tab for anything else, so this would wait
+  // on a field that is never rendered rather than failing with a reason.
+  test.skip(KIND === 'solo-node', 'a Solo Node has no pools tab');
 
   const signIn = async (page) => {
     await page.goto('/signin');

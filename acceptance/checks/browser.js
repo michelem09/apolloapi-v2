@@ -27,7 +27,7 @@ const reachable = (host, port, timeoutMs = 3000) =>
 module.exports = {
   name: 'browser',
   risk: 2,
-  async run({ profile, assert, skip }) {
+  async run({ profile, assert, skip, device }) {
     if (!devicePassword()) {
       return skip(`store the device password to drive the UI:\n      ${howToStore('device-password')}`);
     }
@@ -51,9 +51,13 @@ module.exports = {
           'the AirPlay receiver (System Settings → General → AirDrop & Handoff).'
         );
       }
+      // Registered one at a time: if the second fails to open, the first is
+      // still a live ssh child holding the API port — and the next run would
+      // then blame the AirPlay receiver for a port this suite never released.
       const api = await openTunnel(profile, profile.apiPort, profile.apiPort);
+      close.push(api);
       const ui = await openTunnel(profile, uiPort);
-      close.push(api, ui);
+      close.push(ui);
       base = `http://127.0.0.1:${ui.port}`;
     }
 
@@ -64,7 +68,15 @@ module.exports = {
           ['test', '--config', path.join(__dirname, '..', 'browser', 'playwright.config.js')],
           {
             stdio: 'inherit',
-            env: { ...process.env, ACCEPTANCE_UI_BASE: base, ACCEPTANCE_REAL_DEVICE: '1' },
+            env: {
+              ...process.env,
+              ACCEPTANCE_UI_BASE: base,
+              ACCEPTANCE_REAL_DEVICE: '1',
+              // The specs need it too: a Solo Node has no pools tab at all, and
+              // the router renders the Solo one for /settings/pools instead of
+              // failing — so a spec that waits for a pool field waits forever.
+              ACCEPTANCE_DEVICE_KIND: device.kind,
+            },
           }
         );
         child.on('exit', resolve);

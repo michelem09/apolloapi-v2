@@ -49,6 +49,9 @@ const main = async () => {
   profile.wifi = { ...(profile.wifi || {}), passphrase: wifiPassphrase() };
 
   const only = arg('only');
+  if (only && !CHECKS.some((c) => c.name === only)) {
+    throw new Error(`no check named "${only}" — try one of: ${CHECKS.map((c) => c.name).join(', ')}`);
+  }
   const started = Date.now();
 
   const { hostname } = await assertDeviceIsDisposable(profile);
@@ -56,6 +59,24 @@ const main = async () => {
   console.log(`device:   ${hostname} (${profile.host}) — ${device.kind}, BOARD_NAME ${device.board}`);
 
   const snapshot = await takeSnapshot(profile);
+
+  // Ctrl-C is the likeliest way a long run ends early, and it must not be the
+  // one path that leaves a device with a stopped miner and a foreign timezone.
+  let interrupted = false;
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, async () => {
+      if (interrupted) process.exit(130); // insisting ends it now
+      interrupted = true;
+      console.log(`\n${signal} — restoring before leaving…`);
+      try {
+        const n = await restoreSnapshot(profile, snapshot);
+        n.forEach((note) => console.log(`  · ${note}`));
+      } catch (err) {
+        console.error(`  ! restore failed: ${err.message}`);
+      }
+      process.exit(130);
+    });
+  }
   console.log(`snapshot: db + timezone ${snapshot.timezone}`);
 
   let tunnel = await openTunnel(profile, profile.apiPort);
@@ -91,8 +112,20 @@ const main = async () => {
   notes.forEach((n) => console.log(`  · ${n}`));
 
   const mins = ((Date.now() - started) / 60000).toFixed(1);
-  console.log(`\n${results.filter((r) => r.ok).length}/${results.length} checks passed in ${mins} min`);
-  process.exit(failed ? 1 : 0);
+  const passed = results.filter((r) => r.ok).length;
+  const skipped = results.filter((r) => r.skipped);
+
+  // Skips are not passes. A gate that answers "8/8 passed" after testing nothing
+  // — no keychain entry, no SSID, no playwright — is worse than one that fails:
+  // it is a green light nobody earned.
+  console.log(
+    `\n${passed}/${results.length} checks passed in ${mins} min` +
+    (skipped.length ? `, ${skipped.length} skipped: ${skipped.map((s) => s.check).join(', ')}` : '')
+  );
+  if (skipped.length) {
+    console.log('skipped checks proved nothing — exit code 3');
+  }
+  process.exit(failed ? 1 : skipped.length ? 3 : 0);
 };
 
 const runChecks = async ({ profile, token, only, results, reopenTunnel, device }) => {
@@ -113,8 +146,12 @@ const runChecks = async ({ profile, token, only, results, reopenTunnel, device }
     try {
       const out = await check.run({ profile, token, assert, skip, reopenTunnel, device });
       lines.forEach((l) => console.log(l));
-      if (out?.skipped) console.log(`    – skipped: ${out.skipped}`);
-      results.push({ check: check.name, ok: true });
+      if (out?.skipped) {
+        console.log(`    – skipped: ${out.skipped}`);
+        results.push({ check: check.name, skipped: true });
+      } else {
+        results.push({ check: check.name, ok: true });
+      }
     } catch (err) {
       lines.forEach((l) => console.log(l));
       console.log(`    ! ${err.message}`);
