@@ -6,8 +6,6 @@ const PASSWORD = process.env.ACCEPTANCE_DEVICE_PASSWORD;
 // save bar and the caption are UI state and hold either way.
 const REAL_DEVICE = process.env.ACCEPTANCE_REAL_DEVICE === '1';
 
-test.skip(!PASSWORD, 'set ACCEPTANCE_DEVICE_PASSWORD to drive the UI');
-
 // Never name a zone from memory: the list comes from `timedatectl` on a device
 // and from the platform's own ICU data in dev, and they do not hold the same
 // names — "UTC" is in one and not the other. Pick from what the page offers.
@@ -26,6 +24,12 @@ const signIn = async (page) => {
   await page.locator('button[type="submit"], button:has-text("Sign")').first().click();
   await page.waitForURL(/\/overview/, { timeout: 30000 });
 };
+
+test.describe('settings — timezone', () => {
+  // Inside the block, not at file level: at the top of a file this is a load
+  // error in playwright >= 1.62, and the file then reports "no tests found"
+  // rather than skipping.
+  test.skip(!PASSWORD, 'set ACCEPTANCE_DEVICE_PASSWORD to drive the UI');
 
 test('signing in reaches the dashboard', async ({ page }) => {
   await signIn(page);
@@ -100,4 +104,5 @@ test('saving a timezone closes the save bar without a reload', async ({ page }) 
       await expect(back).toBeHidden({ timeout: 30000 });
     }
   }
+});
 });

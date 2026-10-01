@@ -3,7 +3,11 @@
 Development only. Install its dependencies here, never in the repo root:
 
     yarn --cwd acceptance install
-    npx --prefix acceptance playwright install chromium   # once, for the browser tier
+    acceptance/node_modules/.bin/playwright install chromium   # once, for the browser tier
+
+Playwright is pinned, not ranged: `test.skip()` at the top of a file is a load
+error from 1.62 on, and a range quietly moved the suite onto a version it had
+never been run against.
  This directory is never packaged: the release workflow stages
 an allow-list (`src config migrations knexfile.js package.json node_modules` plus
 the UI standalone), and it carries no dependencies, so nothing here can reach a

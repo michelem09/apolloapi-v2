@@ -1,4 +1,5 @@
 const path = require('path');
+const fs = require('fs');
 const { spawn } = require('child_process');
 const { openTunnel } = require('../lib/tunnel');
 
@@ -15,12 +16,20 @@ module.exports = {
       return skip('set ACCEPTANCE_DEVICE_PASSWORD to drive the UI in a browser');
     }
 
+    // The local binary, never `npx`: from the repo root npx does not find the
+    // one in acceptance/node_modules and offers to download a different version
+    // — which stops the run on a prompt, and would test something else anyway.
+    const bin = path.join(__dirname, '..', 'node_modules', '.bin', 'playwright');
+    if (!fs.existsSync(bin)) {
+      return skip('run `yarn --cwd acceptance install` first — playwright is not installed here');
+    }
+
     const ui = await openTunnel(profile, profile.uiPort || 3000);
     try {
       const code = await new Promise((resolve) => {
         const child = spawn(
-          'npx',
-          ['playwright', 'test', '--config', path.join(__dirname, '..', 'browser', 'playwright.config.js')],
+          bin,
+          ['test', '--config', path.join(__dirname, '..', 'browser', 'playwright.config.js')],
           {
             stdio: 'inherit',
             env: {
