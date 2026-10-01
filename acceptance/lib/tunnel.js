@@ -30,8 +30,11 @@ const waitForPort = async (port, attempts = 50) => {
   throw new Error(`the ssh tunnel never opened on 127.0.0.1:${port}`);
 };
 
-const openTunnel = async (profile, remotePort) => {
-  const port = await freePort();
+const openTunnel = async (profile, remotePort, localPort = null) => {
+  // A fixed local port when the caller needs one: the UI asks for GraphQL at its
+  // own hostname on a port baked into the build, so for the browser tier the
+  // tunnel cannot land anywhere it likes.
+  const port = localPort || (await freePort());
   const child = spawn('ssh', [
     '-N',
     '-o', 'StrictHostKeyChecking=no',

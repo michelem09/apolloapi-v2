@@ -1,6 +1,10 @@
 const { test, expect } = require('@playwright/test');
 
-const PASSWORD = process.env.ACCEPTANCE_DEVICE_PASSWORD;
+const { devicePassword } = require('../lib/secrets');
+
+// Same source as the rest of the suite, so the specs can also be driven on their
+// own without re-exporting a secret into the shell.
+const PASSWORD = devicePassword();
 // Against a dev instance the backend logs the timezone change instead of making
 // it, so anything downstream of the system clock cannot be asserted there. The
 // save bar and the caption are UI state and hold either way.
