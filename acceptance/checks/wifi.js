@@ -1,5 +1,6 @@
 const { gql } = require('../lib/api');
 const { waitUntil } = require('../lib/wait');
+const { howToStore } = require('../lib/secrets');
 
 const INTERFACES = `{ Mcu { wifiInterfaces { result { interfaces { device kind connected } preferred } error { message } } } }`;
 const NETWORKS = `query($ifname: String!) {
@@ -41,7 +42,7 @@ module.exports = {
     assert(networks.some((n) => n.ssid === ssid), `${ssid} is among them`);
 
     if (!profile.wifi.passphrase) {
-      return skip('set ACCEPTANCE_WIFI_PASSPHRASE to exercise joining a network');
+      return skip(`store the passphrase to exercise joining a network:\n      ${howToStore('wifi-passphrase')}`);
     }
 
     const joined = await gql(profile, token, CONNECT, {

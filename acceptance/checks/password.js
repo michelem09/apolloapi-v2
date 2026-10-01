@@ -1,4 +1,5 @@
 const { gql } = require('../lib/api');
+const { devicePassword, howToStore } = require('../lib/secrets');
 
 const CHANGE = `query($input: AuthChangePasswordInput!) {
   Auth { changePassword(input: $input) { error { message } } }
@@ -19,9 +20,9 @@ module.exports = {
   name: 'password',
   risk: 3,
   async run({ profile, token, assert, skip }) {
-    const original = process.env.ACCEPTANCE_DEVICE_PASSWORD;
+    const original = devicePassword();
     if (!original) {
-      return skip('set ACCEPTANCE_DEVICE_PASSWORD to the device\'s current password to run this');
+      return skip(`store the device's current password first:\n      ${howToStore('device-password')}`);
     }
 
     const temporary = `acceptance-${Date.now()}`;

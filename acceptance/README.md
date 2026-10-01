@@ -22,15 +22,20 @@ The device must declare itself disposable first, or the run refuses to start:
     ssh futurebit@<host> "sudo mkdir -p /var/lib/apollo && \
       echo 'acceptance test device' | sudo tee /var/lib/apollo/ACCEPTANCE_OK"
 
-Secrets never live in the profile, only in the environment of the run:
+Secrets never live in the profile. Store them once in the keychain and every
+run from then on picks them up — nothing in a file, nothing in shell history:
 
-    ACCEPTANCE_WIFI_PASSPHRASE     exercises joining a network, not just scanning
-    ACCEPTANCE_DEVICE_PASSWORD     the device's CURRENT password, so the password
-                                   check can change it and put it back
+    security add-generic-password -s apollo-acceptance -a device-password -w
+    security add-generic-password -s apollo-acceptance -a wifi-passphrase -w
 
-Without them those checks skip and say so. The password one needs the current
-value because restoring the database would put back the hash the dashboard
-checks while the Linux user kept the new password — the two would disagree.
+Both prompt for the value. `-a device-password` is the device's CURRENT password:
+the password check needs it to set a new one and put the old one back, because
+restoring the database would put back the hash the dashboard checks while the
+Linux user kept the new password — the two would silently disagree.
+
+`ACCEPTANCE_DEVICE_PASSWORD` and `ACCEPTANCE_WIFI_PASSPHRASE` still work and win
+over the keychain, for a one-off run. Without either, those checks skip and print
+the command above.
 
 Checks run in order of increasing risk: preflight, timezone, miner, password,
 wifi, reboot. A failure stops the run there, so nothing riskier follows it.

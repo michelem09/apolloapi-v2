@@ -15,6 +15,7 @@ const path = require('path');
 const { assertDeviceIsDisposable } = require('./lib/guard');
 const { takeSnapshot, restoreSnapshot } = require('./lib/snapshot');
 const { mintToken } = require('./lib/api');
+const { wifiPassphrase } = require('./lib/secrets');
 const { openTunnel } = require('./lib/tunnel');
 
 const CHECKS = [
@@ -43,7 +44,7 @@ const main = async () => {
 
   // The passphrase never lives in the profile: a file gets committed by accident,
   // and a command line ends up in shell history and in logs.
-  profile.wifi = { ...(profile.wifi || {}), passphrase: process.env.ACCEPTANCE_WIFI_PASSPHRASE || null };
+  profile.wifi = { ...(profile.wifi || {}), passphrase: wifiPassphrase() };
 
   const only = arg('only');
   const started = Date.now();

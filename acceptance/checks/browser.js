@@ -2,6 +2,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { openTunnel } = require('../lib/tunnel');
+const { devicePassword, howToStore } = require('../lib/secrets');
 
 // The browser tier, run as one check so a release has a single gate.
 //
@@ -12,8 +13,9 @@ module.exports = {
   name: 'browser',
   risk: 2,
   async run({ profile, assert, skip }) {
-    if (!process.env.ACCEPTANCE_DEVICE_PASSWORD) {
-      return skip('set ACCEPTANCE_DEVICE_PASSWORD to drive the UI in a browser');
+    const password = devicePassword();
+    if (!password) {
+      return skip(`store the device password to drive the UI:\n      ${howToStore('device-password')}`);
     }
 
     // The local binary, never `npx`: from the repo root npx does not find the
@@ -35,6 +37,8 @@ module.exports = {
             env: {
               ...process.env,
               ACCEPTANCE_UI_BASE: `http://127.0.0.1:${ui.port}`,
+              // Handed to the child process only; never printed, never stored.
+              ACCEPTANCE_DEVICE_PASSWORD: password,
               ACCEPTANCE_REAL_DEVICE: '1',
             },
           }
