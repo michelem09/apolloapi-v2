@@ -1,0 +1,48 @@
+# The container tier of the acceptance suite, on every push.
+#
+# Development only, and deliberately fenced: every job is guarded on the
+# repository name, so this never runs on the upstream repo even if the branch is
+# merged there one day. It also never touches hardware — the device and browser
+# tiers need a real Apollo and run from a workstation (acceptance/README.md).
+name: acceptance (container)
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  backend:
+    # The fence. On jstefanop/apolloapi-v2 this evaluates false and nothing runs.
+    if: github.repository == 'michelem09/apolloapi-v2'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      # The five release flows plus the sweep that every mutation refuses an
+      # anonymous caller live in tests/integration/release-flows.test.js.
+      - run: yarn test
+
+  ui:
+    if: github.repository == 'michelem09/apolloapi-v2'
+    runs-on: ubuntu-latest
+    steps:
+      # The UI is a submodule; without it there is nothing to test here.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+      - run: yarn install --frozen-lockfile
+        working-directory: apolloui-v2
+      - run: yarn test
+        working-directory: apolloui-v2
+      # A build is the only thing that catches a page which compiles in jsdom
+      # but not in Next — [tab].js is not covered by any unit test.
+      - run: yarn build
+        working-directory: apolloui-v2
