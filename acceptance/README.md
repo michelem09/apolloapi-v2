@@ -8,6 +8,10 @@ Development only. Install its dependencies here, never in the repo root:
 Playwright is pinned, not ranged: `test.skip()` at the top of a file is a load
 error from 1.62 on, and a range quietly moved the suite onto a version it had
 never been run against.
+
+The repo root keeps its own `@playwright/test` for the pre-existing `e2e/` tier
+(a fake device, no hardware). This directory does not share it: one tier pinned
+to a version it was proven on, the other free to move with the rest of the repo.
  This directory is never packaged: the release workflow stages
 an allow-list (`src config migrations knexfile.js package.json node_modules` plus
 the UI standalone), and it carries no dependencies, so nothing here can reach a
