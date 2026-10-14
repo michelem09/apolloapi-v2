@@ -111,3 +111,44 @@ describe('logger redaction', () => {
     expect(out).toContain('"ok":true'); // non-sensitive fields pass through
   });
 });
+
+describe('logger errSerializer — knex errors', () => {
+  const knexLib = require('knex');
+
+  it('keeps the bcrypt hash out of message and stack of a real failing insert', async () => {
+    const db = knexLib({ client: 'sqlite3', connection: { filename: ':memory:' }, useNullAsDefault: true });
+    await db.schema.createTable('setup', (t) => t.string('password').notNullable().unique());
+    const hash = '$2a$12$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ01234';
+    await db('setup').insert({ password: hash });
+
+    let caught;
+    try {
+      await db('setup').insert({ password: hash });
+    } catch (e) {
+      caught = e;
+    }
+    await db.destroy();
+
+    // Precondition: knex really does put the hash in the raw error.
+    expect(caught.message).toContain(hash);
+
+    const { logger, text } = captureLogger();
+    logger.error({ err: caught }, 'setup failed');
+
+    expect(text()).not.toContain(hash);
+    expect(text()).not.toContain('abcdefghijklmnopqrstuu');
+    expect(text()).toMatch(/UNIQUE constraint failed|SQLITE_CONSTRAINT/);
+  });
+
+  it('does not touch the message of an ordinary error', () => {
+    const out = errSerializer(new Error('plain - with a dash'));
+    expect(out.message).toBe('plain - with a dash');
+  });
+
+  it('does not mutate the live error', () => {
+    const err = new Error("insert into `t` values ('secret') - boom");
+    err.sql = 'insert into `t` values (?)';
+    errSerializer(err);
+    expect(err.message).toContain('secret');
+  });
+});

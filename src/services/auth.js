@@ -94,10 +94,11 @@ class AuthService {
         password: hashedPassword
       });
     } catch (err) {
-      // The error OBJECT carries `bindings` (the password hash on the insert
-      // above); the logger's redaction censors `bindings`, so it cannot reach
-      // the journal. This block also wraps changeSystemPassword, whose failures
-      // are plain Errors with no `code`.
+      // A knex error carries the password hash twice: in `bindings` (censored by
+      // the logger's redaction) and inlined in `message`/`stack` as
+      // `insert into setup … values ('$2a$…') - <driver error>`. The logger's err
+      // serializer cuts both down to the driver part. This block also wraps
+      // changeSystemPassword, whose failures are plain Errors with no `code`.
       log.error({ err }, 'setup failed');
       throw err;
     }

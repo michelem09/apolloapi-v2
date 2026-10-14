@@ -49,11 +49,36 @@ const redactPaths = [
 // live error that then propagates (node.js logs the error and re-throws it), and a
 // downstream interceptor/retry/reporter would see an object nobody visibly touched.
 // So rebuild instead of delete.
+//
+// A knex error is the other shape. Its message is `<sql with the bindings inlined>
+// - <driver message>`, so `insert into \`setup\` (\`password\`) values ('$2a$12$…')`
+// lands in `message` and `stack`, where the `bindings` redaction cannot reach.
+// Keep only the driver part (after the last ` - `); the SQL with `?` placeholders
+// is still available in `sql`.
+const stripInlinedSql = (message) => {
+  const at = message.lastIndexOf(' - ');
+  return at === -1 ? '[redacted sql]' : message.slice(at + 3);
+};
+
 const errSerializer = (err) => {
   const serialized = pino.stdSerializers.err(err);
   if (!serialized || typeof serialized !== 'object') return serialized;
 
   const { config, request, response, ...rest } = serialized;
+  // The sqlite3 driver error that knex rewrites carries no `sql` or `bindings`
+  // prop (verified against a real failing insert), so the message itself is what
+  // identifies it: it starts with the statement.
+  const isKnexError =
+    err &&
+    (err.sql !== undefined ||
+      err.bindings !== undefined ||
+      (typeof err.message === 'string' &&
+        /^\s*(insert|update|delete|select|replace|with|create|alter|drop|pragma)\b[\s\S]* - /i.test(err.message)));
+  if (isKnexError && typeof rest.message === 'string') {
+    const original = rest.message;
+    rest.message = stripInlinedSql(original);
+    if (typeof rest.stack === 'string') rest.stack = rest.stack.split(original).join(rest.message);
+  }
   if (response && typeof response === 'object') {
     const { config: _config, request: _request, ...responseRest } = response;
     rest.response = responseRest;
