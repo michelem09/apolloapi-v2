@@ -56,8 +56,9 @@ check "services are stopped before the bootstrap runs" "1" "$( [ -n "$l_stop" ] 
 # --- 3. detach: re-exec through systemd-run so stopping apollo-api cannot kill us -
 mkdir -p "$tmp/fake-systemd"
 : > "$tmp/calls.log"
-PATH="$bin:$PATH" APOLLO_SOLO_REQUEST_FILE="$tmp/solo" APOLLO_UPDATE_PROGRESS_FILE="$tmp/progress" APOLLO_SYSTEMD_DIR="$tmp/fake-systemd" APOLLO_STATE_DIR="$tmp/state" \
-    bash "$SCRIPT" >/dev/null 2>&1
+out="$(PATH="$bin:$PATH" APOLLO_SOLO_REQUEST_FILE="$tmp/solo" APOLLO_UPDATE_PROGRESS_FILE="$tmp/progress" APOLLO_SYSTEMD_DIR="$tmp/fake-systemd" APOLLO_STATE_DIR="$tmp/state" \
+    bash "$SCRIPT" 2>&1)"
+check "it tells the operator how to follow the run" "1" "$(grep -c 'journalctl -fu apollo-update-system' <<<"$out")"
 check "outside its own unit it re-runs under systemd-run" "1" "$(grep -c '^systemd-run .*--wait' "$tmp/calls.log")"
 check "…and does not stop anything itself first"        "0" "$(grep -c '^systemctl stop' "$tmp/calls.log")"
 : > "$tmp/calls.log"

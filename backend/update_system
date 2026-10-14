@@ -18,6 +18,7 @@ if [ -z "${APOLLO_UPDATE_SYSTEM_DETACHED:-}" ] &&
    [ -d "${APOLLO_SYSTEMD_DIR:-/run/systemd/system}" ] &&
    command -v systemd-run >/dev/null 2>&1; then
     systemctl reset-failed apollo-update-system.service >/dev/null 2>&1 || true
+    echo "Update running as apollo-update-system.service. Follow it with: journalctl -fu apollo-update-system"
     exec systemd-run --quiet --collect --wait --unit=apollo-update-system \
         --property=TimeoutStopSec=infinity \
         --setenv=APOLLO_UPDATE_SYSTEM_DETACHED=1 \
