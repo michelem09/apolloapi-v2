@@ -134,6 +134,11 @@ describe('mqtt output — home assistant discovery', () => {
     expect(readOnly.some((t) => t.includes('/select/'))).toBe(false);
   });
 
+  it('offers super_eco among the miner mode select options', () => {
+    const select = output._entities('miner', { control: true }).find((c) => c.topic.includes('/select/'));
+    expect(select.payload.options).toContain('super_eco');
+  });
+
   it('points each domain at its own topic', () => {
     expect(output._entities('node')[0].payload.state_topic).toBe(`apollo/${deviceId()}/node`);
     expect(output._entities('solo')[0].payload.state_topic).toBe(`apollo/${deviceId()}/solo`);
@@ -175,6 +180,11 @@ describe('mqtt output — commands from home assistant', () => {
 
     expect(deps.settings.update).toHaveBeenCalledWith({ minerMode: 'balanced' });
     expect(deps.miner.restart).not.toHaveBeenCalled();
+  });
+
+  it('applies super_eco instead of dropping it', async () => {
+    await output.handleCommand(output.modeCmdTopic, 'super_eco');
+    expect(deps.settings.update).toHaveBeenCalledWith({ minerMode: 'super_eco' });
   });
 
   it('ignores an unknown mode', async () => {

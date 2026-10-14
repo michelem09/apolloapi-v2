@@ -171,6 +171,16 @@ describe('automation service — rules', () => {
     ).rejects.toThrow(/Unknown miner mode/);
   });
 
+  it('accepts the super_eco mode (listed in MINER_MODES)', async () => {
+    await expect(
+      automation.createRule({
+        name: 'Quiet night',
+        conditions: [{ signal: 'clock.time', op: '>', value: '22:00' }],
+        action: { type: 'mode', mode: 'super_eco' },
+      })
+    ).resolves.toBeTruthy();
+  });
+
   it('rejects a rule with no conditions — it would match everything, forever', async () => {
     await expect(automation.createRule({ ...thermalProtection, conditions: [] })).rejects.toThrow(
       /at least one condition/
