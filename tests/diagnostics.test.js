@@ -60,7 +60,39 @@ describe('diagnostics redaction — secrets in free text', () => {
 
     expect(out).not.toContain('Sup3rSecretPSK');
     expect(out).not.toContain('HomeNet'); // the SSID sits between "connect" and "password"
-    expect(out).toContain('password [redacted]');
+    expect(out).toContain('nmcli [redacted]');
+  });
+
+  // The exact argv forms src/services/wifi/index.js hands to nmcli, as sudo logs them.
+  describe.each([
+    ['c add, wpa-psk', 'c add type wifi con-name HomeNet ifname wlan0 ssid HomeNet autoconnect no wifi-sec.key-mgmt wpa-psk wifi-sec.psk Sup3rSecretPSK'],
+    ['c add, sae', 'c add type wifi con-name HomeNet ifname wlan0 ssid HomeNet autoconnect no wifi-sec.key-mgmt sae wifi-sec.psk Sup3rSecretPSK 802-11-wireless.hidden yes'],
+    ['c add, wep', 'c add type wifi con-name HomeNet ifname wlan0 ssid HomeNet autoconnect no wifi-sec.key-mgmt none wifi-sec.wep-key0 Sup3rSecretPSK'],
+    ['c add, multi-word passphrase', 'c add type wifi con-name HomeNet ifname wlan0 ssid HomeNet autoconnect no wifi-sec.key-mgmt wpa-psk wifi-sec.psk correct horse battery'],
+    ['c modify', 'c modify abc-uuid wifi-sec.psk Sup3rSecretPSK'],
+    ['dev wifi connect', 'dev wifi connect HomeNet password Sup3rSecretPSK ifname wlan0'],
+  ])('sudo journal line: %s', (_name, argv) => {
+    const line = `sudo: futurebit : TTY=unknown ; PWD=/opt/apolloapi ; USER=root ; COMMAND=/usr/bin/nmcli ${argv}`;
+
+    it('leaves no secret, SSID or profile name', () => {
+      const out = scrubText(line);
+      ['Sup3rSecretPSK', 'correct', 'horse', 'battery', 'HomeNet'].forEach((v) => {
+        expect(out).not.toContain(v);
+      });
+    });
+
+    // Without COMMAND= only the field-level patterns apply: the key itself must
+    // still go (a multi-word passphrase is only covered by the sudo form).
+    it('still drops a single-word key when the line has no sudo prefix', () => {
+      const out = scrubText(`nmcli ${argv}`);
+      expect(out).not.toContain('Sup3rSecretPSK');
+    });
+  });
+
+  it('does not let `psk` inside `wpa-psk` hide the real key', () => {
+    const out = scrubText('wifi-sec.key-mgmt wpa-psk wifi-sec.psk Sup3rSecretPSK');
+    expect(out).not.toContain('Sup3rSecretPSK');
+    expect(out).toContain('wpa-psk'); // the key-mgmt value is not a secret
   });
 
   it('strips the wpa_supplicant psk and the SSID in its structured forms', () => {

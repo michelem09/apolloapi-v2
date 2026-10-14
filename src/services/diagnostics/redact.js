@@ -83,7 +83,17 @@ const INLINE_SECRET =
 // `nmcli dev wifi connect <ssid> password <psk>`, and this release makes the
 // journal persistent across boots — so without this the user's WiFi PSK travels
 // inside the very bundle they attach to a public issue.
-const ARG_SECRET = /\b(password|passphrase|psk|secret|token)\s+(?!=)(\S+)/gi;
+//
+// The lookbehind keeps `psk` from matching inside `wpa-psk` (the key-mgmt VALUE of
+// `nmcli c add … wifi-sec.key-mgmt wpa-psk wifi-sec.psk <PSK>`), which used to
+// swallow the wrong token and leave the real PSK in clear.
+const ARG_SECRET =
+  /(?<![\w.-])((?:wifi-sec|802-11-wireless-security)\.(?:psk|wep-key\d)|password|passphrase|psk|secret|token)\s+(?!=)(\S+)/gi;
+
+// A sudo journal line for nmcli: the whole argv is dropped. Field-level matching
+// cannot cover it — a passphrase may hold spaces (sudo does not quote), and the
+// SSID and profile name (`ssid X`, `con-name X`) are identifying too.
+const SUDO_NMCLI = /(COMMAND=\S*\bnmcli\b).*$/gim;
 
 // `nmcli … connect <ssid>`: the network name sits between the two, unlabelled.
 const NMCLI_SSID = /\b(connect)\s+(\S+)/gi;
@@ -102,6 +112,7 @@ function scrubText(text) {
   if (typeof text !== 'string') return text;
   return maskBtcAddresses(
     text
+      .replace(SUDO_NMCLI, (_m, head) => `${head} ${CENSOR}`)
       .replace(INLINE_SECRET, (_m, key) => `${key}=${CENSOR}`)
       .replace(ARG_SECRET, (_m, key) => `${key} ${CENSOR}`)
       .replace(NMCLI_SSID, (_m, verb) => `${verb} ${CENSOR}`)
