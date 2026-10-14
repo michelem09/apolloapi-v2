@@ -4,6 +4,132 @@ const { knex } = require('./db')
 const { getMinerRuntimeDir } = require('./paths');
 const log = require('./logger')('configurator');
 
+// Apollo III accepts a different CLI vocabulary from the USB miners, so the two
+// config files are built INDEPENDENTLY rather than one derived from the other.
+// Deriving miner_config3 by appending to miner_config leaked every legacy flag
+// (-brd_ocp, -osc, -fan_temp_low/-fan_temp_hi) into a binary that rejects them.
+// Anything shared lives in buildCommonArgs(); everything else is per-family.
+
+const V3_HASHRATE_MIN = 5;
+const V3_HASHRATE_MAX = 20;
+const V3_FAN_TEMP_MIN = 40;
+const V3_FAN_TEMP_MAX = 80;
+const V3_FAN_PWM_MIN = 10;
+const V3_FAN_PWM_MAX = 100;
+
+const LEGACY_FAN_LOW_DEFAULT = 40;
+const LEGACY_FAN_HIGH_DEFAULT = 60;
+
+const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+
+// A tuning value counts as set only when it is a usable number. `0` in
+// particular reads like "no fixed speed" to anyone calling the API, but it used
+// to select the fixed-PWM branch and clamp up to 10 — pinning the fans at their
+// minimum with the PID loop switched off, which is the opposite of what it looks
+// like it asks for.
+const isSet = (value) =>
+  value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value)) && Number(value) > 0;
+
+const hasText = (value) =>
+  value !== null && value !== undefined && String(value).trim() !== '';
+
+// Super ECO is spelled three ways: `super_eco` in the GraphQL enum and the DB
+// (a hyphen is not a legal enum name), `supereco` on the Apollo III command line,
+// and `super-eco` in older UI builds. Normalise on the way in so the rest of this
+// file only deals with one of them.
+const isSuperEco = (mode) => mode === 'super_eco' || mode === 'super-eco';
+
+const splitPoolUrl = (url) => {
+  const [host, port] = url.replace(/^.*\/\//, '').split(':');
+  return { host, port };
+};
+
+/**
+ * The primary pool and the power LED are spelled the same way by both binaries.
+ * The backup pool is NOT shared: only Apollo III takes -host2 and friends.
+ */
+function buildCommonArgs(mainPool, settings) {
+  const { host, port } = splitPoolUrl(mainPool.url);
+  let args = `-host ${host} -port ${port} -user ${mainPool.username}`;
+
+  if (hasText(mainPool.password)) args += ` -pswd ${mainPool.password}`;
+
+  if (settings.powerLedOff) args += ' -pwrled off';
+
+  return args;
+}
+
+/**
+ * Apollo I/II (USB). Unchanged behaviour: custom mode drives board voltage and
+ * oscillator directly, and the mode itself is reported as `config`. Super ECO is
+ * an Apollo III power mode, so these boards get plain eco.
+ */
+function buildLegacyConfig(common, settings) {
+  let args = common;
+  let mode = settings.minerMode;
+
+  if (mode === 'custom') {
+    args += ` -brd_ocp ${settings.voltage} -osc ${settings.frequency}`;
+    mode = 'config';
+  } else if (isSuperEco(mode)) {
+    mode = 'eco';
+  }
+
+  if (settings.fan_low && settings.fan_low !== LEGACY_FAN_LOW_DEFAULT) {
+    args += ` -fan_temp_low ${settings.fan_low}`;
+  }
+  if (settings.fan_high && settings.fan_high !== LEGACY_FAN_HIGH_DEFAULT) {
+    args += ` -fan_temp_hi ${settings.fan_high}`;
+  }
+
+  return `${args} -powermode ${mode}`;
+}
+
+/**
+ * Apollo III. Custom tuning is a target hashrate — the board tunes its own
+ * voltage, so there is no voltage/frequency to expose. Fan control is a single
+ * PID target temperature, with a fixed-PWM override that replaces it.
+ *
+ * `-powermode custom` is emitted ONLY alongside a target hashrate: fan settings
+ * are orthogonal to the power mode, so someone can run eco and still tune the
+ * fan — which matters, because the III is far more sensitive to fan settings.
+ */
+function buildApollo3Config(common, settings, backupPool) {
+  let args = common;
+
+  // Failover is an Apollo III capability — the USB binaries have no second-pool
+  // flags, so passing these to them would be a command line they reject.
+  if (backupPool && backupPool.url) {
+    const backup = splitPoolUrl(backupPool.url);
+    if (backup.host && backup.port) {
+      args += ` -host2 ${backup.host} -port2 ${backup.port}` +
+        ` -user2 ${backupPool.username}`;
+      if (hasText(backupPool.password)) args += ` -pswd2 ${backupPool.password}`;
+    }
+  }
+
+  const hashrate = settings.minerHashrate;
+  const hasHashrate = settings.minerMode === 'custom' && isSet(hashrate);
+
+  if (hasHashrate) {
+    args += ` -powermode custom -hashrate ${clamp(Number(hashrate), V3_HASHRATE_MIN, V3_HASHRATE_MAX)}`;
+  } else {
+    // The binary spells it `supereco`, with no separator.
+    const mode = isSuperEco(settings.minerMode) ? 'supereco' : settings.minerMode;
+    // `custom` without a hashrate would leave the binary with nothing to act on.
+    args += ` -powermode ${mode === 'custom' ? 'eco' : mode}`;
+  }
+
+  // A fixed PWM disables automatic control, so the two are mutually exclusive.
+  if (isSet(settings.fanPwm)) {
+    args += ` -fan_pwm ${clamp(Number(settings.fanPwm), V3_FAN_PWM_MIN, V3_FAN_PWM_MAX)}`;
+  } else if (isSet(settings.fanTemp)) {
+    args += ` -fan_temp ${clamp(Number(settings.fanTemp), V3_FAN_TEMP_MIN, V3_FAN_TEMP_MAX)}`;
+  }
+
+  return args;
+}
+
 const generate = async function (pools = null, settings = null ) {
   	if (!settings) {
 	    [ settings ] = await knex('settings').select([
@@ -12,6 +138,9 @@ const generate = async function (pools = null, settings = null ) {
 			'frequency',
 			'fan_low',
 			'fan_high',
+			'miner_hashrate as minerHashrate',
+			'fan_temp as fanTemp',
+			'fan_pwm as fanPwm',
 			'api_allow as apiAllow',
 			'connected_wifi as connectedWifi',
 			'left_sidebar_visibility as leftSidebarVisibility',
@@ -44,6 +173,7 @@ const generate = async function (pools = null, settings = null ) {
 
 	const orderedPools = _.sortBy(pools, 'index');
 	const mainPool = orderedPools[0];
+	const backupPool = orderedPools[1];
 
 	// If no pool configured, skip miner configuration
 	if (!mainPool || !mainPool.url) {
@@ -51,38 +181,9 @@ const generate = async function (pools = null, settings = null ) {
 		return;
 	}
 
-	// Get miner mode
-	let minerMode = settings.minerMode;
-
-	// Get fan settings
-	const fanLow = (settings.fan_low && settings.fan_low !== 40) ? `-fan_temp_low ${settings.fan_low}` : null;
-	const fanHigh = (settings.fan_high && settings.fan_high !== 60) ? `-fan_temp_hi ${settings.fan_high}` : null;
-
-	// Get pool url
-	const poolUrl = mainPool.url.replace(/^.*\/\//, '');
-
-	const [poolHost, poolPort] = poolUrl.split(':');
-
-	// Parse miner configuration
-	let minerConfig = `-host ${poolHost} -port ${poolPort} -user ${mainPool.username} -pswd ${mainPool.password}`;
-
-	// Backup/failover pool is intentionally NOT emitted into miner_config: the legacy
-	// apollo-miner (BTC/II) binary rejects unknown flags and exits, killing hashing, and
-	// the -host2/-port2/-user2/-pswd2 CLI syntax is still unconfirmed. Extra enabled pools
-	// stay in the DB; wire them into the command line only once the real flag names are
-	// confirmed (Apollo III → miner_config3, behind a device gate).
-
-	// Add custom configuration if needed
-	if (settings.minerMode === 'custom') {
-		minerConfig += ` -brd_ocp ${settings.voltage} -osc ${settings.frequency}`;
-		minerMode = 'config';
-	}
-	
-	// Add fan configuration if needed
-	if (fanLow) minerConfig += ` ${fanLow}`;
-	if (fanHigh) minerConfig += ` ${fanHigh}`;
-
-	if (settings.powerLedOff) minerConfig += ` -pwrled off`;
+	const common = buildCommonArgs(mainPool, settings);
+	const minerConfig = buildLegacyConfig(common, settings);
+	const minerConfig3 = buildApollo3Config(common, settings, backupPool);
 
 	const confDir = getMinerRuntimeDir();
 
@@ -92,13 +193,7 @@ const generate = async function (pools = null, settings = null ) {
 		await fsPromises.mkdir(confDir, { recursive: true });
 		// Conf files
 		await fsPromises.writeFile(confDir + '/miner_config', minerConfig);
-		// BTC/II mode file: the legacy apollo-miner binary doesn't understand the
-		// Apollo III-only "super-eco" preset, so it always receives plain eco.
-		await fsPromises.writeFile(confDir + '/mode', minerMode === 'super-eco' ? 'eco' : minerMode);
-		// Apollo III config file: separate file consumed by the III binary, which
-		// keeps super-eco as-is. Harmless on BTC/II-only devices (binary not run).
-		// TBD: John — confirm miner_config3 format and Apollo III custom tunables schema.
-		await fsPromises.writeFile(confDir + '/miner_config3', minerMode);
+		await fsPromises.writeFile(confDir + '/miner_config3', minerConfig3);
 		log.debug('miner configuration saved');
 	} catch (err) {
 		log.error({ err }, 'error saving configuration files');

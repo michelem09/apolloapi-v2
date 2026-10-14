@@ -71,7 +71,7 @@ class MinerService {
         .update({
           status: 'pending',
           requested_status: 'online',
-          requested_at: new Date(),
+          requested_at: Date.now(),
         });
 
       // Notify subscribers immediately so the UI shows "pending" without waiting
@@ -90,11 +90,18 @@ class MinerService {
           .where({ service_name: 'miner' })
           .update({
             status: 'online',
-            last_checked: new Date(),
+            last_checked: Date.now(),
           });
+        // Same reason as solo: the arrival has to be announced too.
+        this._notifyServicesStatus();
         log.debug('dev miner started - status updated to online');
       } else {
-        await this._execCommand('sudo systemctl start apollo-miner');
+        // --no-block: miner_start.sh sleeps ~35s waiting for USB boards to
+        // enumerate, and a forking unit blocks systemctl for that whole time.
+        // The board reset and that wait still run in full on the device; we just
+        // don't hold the API call open for them. The service monitor reports the
+        // miner coming online.
+        await this._execCommand('sudo systemctl start --no-block apollo-miner');
       }
       this._reevaluateAutomation(source);
     } catch (error) {
@@ -111,7 +118,7 @@ class MinerService {
         .update({
           status: 'pending',
           requested_status: 'offline',
-          requested_at: new Date(),
+          requested_at: Date.now(),
         });
 
       this._notifyServicesStatus();
@@ -128,8 +135,9 @@ class MinerService {
           .where({ service_name: 'miner' })
           .update({
             status: 'offline',
-            last_checked: new Date(),
+            last_checked: Date.now(),
           });
+        this._notifyServicesStatus();
         log.debug('dev miner stopped - status updated to offline');
       } else {
         await this._execCommand('sudo systemctl stop apollo-miner');
@@ -149,7 +157,7 @@ class MinerService {
         .update({
           status: 'pending',
           requested_status: 'online',
-          requested_at: new Date(),
+          requested_at: Date.now(),
         });
 
       this._notifyServicesStatus();
@@ -166,11 +174,15 @@ class MinerService {
           .where({ service_name: 'miner' })
           .update({
             status: 'online',
-            last_checked: new Date(),
+            last_checked: Date.now(),
           });
+        // Same reason as solo: the arrival has to be announced too.
+        this._notifyServicesStatus();
         log.debug('dev miner restarted - status updated to online');
       } else {
-        await this._execCommand('sudo systemctl restart apollo-miner');
+        // --no-block: see start(). The 35s device-side wait is unchanged; the
+        // API returns at once and the service monitor tracks the miner online.
+        await this._execCommand('sudo systemctl restart --no-block apollo-miner');
       }
       this._reevaluateAutomation(source);
     } catch (error) {
@@ -408,6 +420,21 @@ class MinerService {
         log.debug({ filePath, err: parseError }, 'failed to parse JSON in stat file');
         return null;
       }
+
+      // The miner rewrites this file while we read it, and reports fields it has
+      // no measurement for yet as empty strings — which GraphQL cannot coerce
+      // into Float or Int, so a single restart replaced the whole miner page
+      // with "Float cannot represent non numeric value". Empty means "no reading",
+      // which is what null is for; the schema already allows it.
+      const blankToNull = (value) => {
+        if (value === '') return null;
+        if (Array.isArray(value)) return value.map(blankToNull);
+        if (value && typeof value === 'object') {
+          for (const key of Object.keys(value)) value[key] = blankToNull(value[key]);
+        }
+        return value;
+      };
+      received = blankToNull(received);
 
       received.uuid = fileDetails.id;
       received.version = fileDetails.version;

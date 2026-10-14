@@ -18,18 +18,18 @@ if [ -f /etc/armbian-release ]; then
     . /etc/armbian-release
 fi
 
-if [ "${BOARD_NAME:-}" = "Solo Node" ]; then
-    # Run Solo Node UI mode detector
+if [ "${BOARD_NAME:-}" = "Solo Node" ] || [ "${BOARD_NAME:-}" = "Apollo 3" ]; then
+    # Set the UI mode for Solo Node and Apollo III boards
     /opt/apolloapi/backend/utils/set_UI_mode.sh || \
         echo "[rc.local] WARN: UI mode detection failed" >&2
 else
-    # Configure GPIOs for non–Solo Node boards
+    # Configure GPIOs for other boards
     gpio mode 1 out || echo "[rc.local] WARN: GPIO 1 setup failed" >&2
     gpio write 1 0 || echo "[rc.local] WARN: GPIO 1 write failed" >&2
     gpio mode 0 out || echo "[rc.local] WARN: GPIO 0 setup failed" >&2
     gpio write 0 1 || echo "[rc.local] WARN: GPIO 0 write failed" >&2
 
-    # Configure CPU for non–Solo Node boards
+    # Configure CPU for other boards
     cpufreq-set -c0 -u 1.2GHz -g CONSERVATIVE || \
         echo "[rc.local] WARN: CPU governor setup failed" >&2
 fi

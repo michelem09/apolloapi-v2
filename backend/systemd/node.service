@@ -11,7 +11,16 @@ User=futurebit
 Group=futurebit
 WorkingDirectory=/opt/apolloapi
 EnvironmentFile=-/opt/apolloapi/.env
-ExecCondition=/opt/apolloapi/backend/node/node_storage_ready.sh
+# No drive, no node. Skipping the unit is not the same as failing it: a unit that
+# never went active is never restarted, and with Restart=always — which fires on
+# a clean exit too — that is the only way this does not loop every 30s forever.
+#
+# That cuts both ways, so the check waits for a drive that is present but not yet
+# mounted (rc.local mounts it, not fstab, and it can land after this runs) rather
+# than refusing it: a skipped unit would stay down until the next reboot.
+# Same library the API reads the storage state from (Node.storage), so the two
+# cannot disagree about whether there is a drive.
+ExecCondition=/opt/apolloapi/backend/lib/node_storage.sh --check
 ExecStart=/opt/apolloapi/backend/node/node_start.sh
 ExecStop=/opt/apolloapi/backend/node/node_stop.sh
 KillSignal=SIGTERM

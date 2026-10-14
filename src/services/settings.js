@@ -7,6 +7,10 @@ const log = require('../logger')('settings');
 
 const execFilePromise = util.promisify(execFile);
 
+// Middle of the range the UI exposes for Apollo III custom mode (5-20 TH/s); the UI seeds the same
+// value when someone picks custom mode.
+const DEFAULT_APOLLO_III_HASHRATE = 12;
+
 class SettingsService {
   constructor(knex, utils) {
     this.knex = knex;
@@ -102,6 +106,28 @@ class SettingsService {
     }
   }
 
+  // Apollo III tuning. Validated here, on the way in, rather than clamped when the
+  // command line is rendered: a value that is only clamped later is stored and
+  // read back at its original figure, so the UI reports 99 TH/s while the miner
+  // runs at 20 and nothing tells the user the two disagree.
+  _validateApolloIiiTuning(input) {
+    const ranges = {
+      minerHashrate: [5, 20, 'Target hashrate must be between 5 and 20 TH/s'],
+      fanTemp: [40, 80, 'Fan target temperature must be between 40 and 80 C'],
+      fanPwm: [10, 100, 'Fan speed must be between 10 and 100%'],
+    };
+
+    for (const [field, [min, max, message]] of Object.entries(ranges)) {
+      const value = input[field];
+      // null clears the setting — that is how "not set" is expressed.
+      if (value === undefined || value === null) continue;
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        throw new Error(`${field} must be a number`);
+      }
+      if (value < min || value > max) throw new Error(message);
+    }
+  }
+
   // Validate startdiff format
   // Must be a positive integer
   _validateStartdiff(startdiff) {
@@ -188,6 +214,36 @@ class SettingsService {
       // Validate mindiff if provided
       if (settingsInput.mindiff !== undefined) {
         this._validateMindiff(settingsInput.mindiff);
+      }
+
+      this._validateApolloIiiTuning(settingsInput);
+
+      // Custom mode needs a target hashrate to act on. Without one the generator
+      // falls back to eco, so an Apollo III would run at its lowest preset while
+      // Settings.read still reports "custom" — a disagreement with no way for the
+      // user to notice it. Settle it here, where the value is stored, rather than
+      // in the argument renderer where it stays invisible. Harmless on Apollo
+      // I/II: custom there is driven by voltage and frequency, and miner_config3
+      // is not the file that device reads.
+      // Decided on the resulting state, not on this request alone: a partial
+      // update that clears the hashrate without resending the mode would
+      // otherwise leave custom with nothing to act on, which is the mismatch this
+      // exists to prevent.
+      const storedSettings = await this._readSettings();
+      const resultingMode =
+        settingsInput.minerMode !== undefined
+          ? settingsInput.minerMode
+          : storedSettings?.minerMode;
+      const resultingHashrate =
+        settingsInput.minerHashrate !== undefined
+          ? settingsInput.minerHashrate
+          : storedSettings?.minerHashrate;
+
+      if (
+        resultingMode === 'custom' &&
+        (resultingHashrate === null || resultingHashrate === undefined)
+      ) {
+        settingsInput.minerHashrate = DEFAULT_APOLLO_III_HASHRATE;
       }
 
       // Get existing settings before update
@@ -413,6 +469,9 @@ class SettingsService {
         'fan',
         'fan_low',
         'fan_high',
+        'miner_hashrate as minerHashrate',
+        'fan_temp as fanTemp',
+        'fan_pwm as fanPwm',
         'api_allow as apiAllow',
         'custom_approval as customApproval',
         'connected_wifi as connectedWifi',
@@ -460,6 +519,9 @@ class SettingsService {
       'fan',
       'fan_low',
       'fan_high',
+      'miner_hashrate as minerHashrate',
+      'fan_temp as fanTemp',
+      'fan_pwm as fanPwm',
       'api_allow as apiAllow',
       'custom_approval as customApproval',
       'connected_wifi as connectedWifi',
@@ -512,6 +574,9 @@ class SettingsService {
       fan: 'fan',
       fan_low: 'fan_low',
       fan_high: 'fan_high',
+      minerHashrate: 'miner_hashrate',
+      fanTemp: 'fan_temp',
+      fanPwm: 'fan_pwm',
       apiAllow: 'api_allow',
       customApproval: 'custom_approval',
       connectedWifi: 'connected_wifi',
@@ -544,6 +609,9 @@ class SettingsService {
         'fan',
         'fan_low',
         'fan_high',
+        'miner_hashrate',
+        'fan_temp',
+        'fan_pwm',
         'api_allow',
         'custom_approval',
         'connected_wifi',
@@ -575,6 +643,9 @@ class SettingsService {
       fan: currentSettings?.fan,
       fan_low: currentSettings?.fan_low,
       fan_high: currentSettings?.fan_high,
+      minerHashrate: currentSettings?.miner_hashrate,
+      fanTemp: currentSettings?.fan_temp,
+      fanPwm: currentSettings?.fan_pwm,
       apiAllow: currentSettings?.api_allow,
       customApproval: currentSettings?.custom_approval,
       connectedWifi: currentSettings?.connected_wifi,

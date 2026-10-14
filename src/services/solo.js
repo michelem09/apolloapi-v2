@@ -1,4 +1,8 @@
 const { exec } = require('child_process');
+
+// How long after ckpool starts a figure may still be one it restored from disk
+// rather than one it just found.
+const RESTORE_WINDOW_SECONDS = 60;
 const { GraphQLError } = require('graphql');
 const fs = require('fs').promises;
 const path = require('path');
@@ -13,6 +17,98 @@ class SoloService {
   constructor(knex, utils) {
     this.knex = knex;
     this.utils = utils;
+    // Read from the table once and kept here, so the common case — a share that
+    // does not beat the record — costs a comparison and no query, on a method
+    // the scheduler calls every five seconds.
+    this._bestShareEver = null;
+  }
+
+  // The best share the device has ever found. ckpool's own figures cannot
+  // answer this: the pool-level one restarts with the process, and the per-user
+  // one lives in a file we drop once it is a day old.
+  async _loadBestShareEver() {
+    if (this._bestShareEver) return this._bestShareEver;
+    if (!this.knex) return { value: 0, at: null };
+
+    try {
+      const row = await this.knex('solo_best_share').where({ id: 1 }).first();
+      this._bestShareEver = {
+        value: row?.best_share || 0,
+        at: row?.found_at || null,
+      };
+    } catch (error) {
+      // A device mid-migration still has to report its current share. Cache the
+      // empty answer as well: this runs on every five-second push, and an
+      // unreadable table would otherwise print this line for ever.
+      log.error({ err: error }, 'error reading best share ever');
+      this._bestShareEver = { value: 0, at: null };
+    }
+
+    return this._bestShareEver;
+  }
+
+  // Raise the record if this sample beat it. Only ever upwards: a ckpool that
+  // has just restarted reports zero, and that is not a new record of zero.
+  async _recordBestShare(ckpoolData) {
+    const best = await this._loadBestShareEver();
+    // Same guard as the read path. Without it a device with no database logs a
+    // failure every five seconds, for ever.
+    if (!this.knex) return best;
+
+    const fromPool = Number(ckpoolData?.pool?.bestshare) || 0;
+    // A user entry carries ckpool's own persisted best, which survives its
+    // restarts — it covers the window where the pool figure is back at zero but
+    // the device has already found something.
+    const fromUsers = (ckpoolData?.users || []).reduce(
+      (max, user) => Math.max(max, Number(user?.bestever) || 0),
+      0
+    );
+    const candidate = Math.max(fromPool, fromUsers);
+
+    if (!(candidate > best.value)) return best;
+
+    // A date only when we watched the record being set, and ckpool's own
+    // runtime is the only thing that can tell us.
+    //
+    // Everything else lies at the wrong moment. A restart restores the figure
+    // from logs/users into *both* the pool status and the user file, so neither
+    // source betrays it; and "we already knew a record, so this rise is new" is
+    // wrong precisely when it matters — an upgraded device seeded from the
+    // 30-day time series meets its older, larger all-time record two seconds
+    // after ckpool starts, and would stamp it with today.
+    //
+    // Past the first minute of runtime a rise cannot be a restore: it happened
+    // while we were watching. Before that we say nothing rather than guess. The
+    // cost is a genuine record found in ckpool's first minute going undated.
+    const runtime = Number(ckpoolData?.pool?.runtime) || 0;
+    const at =
+      runtime > RESTORE_WINDOW_SECONDS ? new Date().toISOString() : null;
+
+    try {
+      // One statement, and conditional on what is stored rather than on what
+      // this instance last read. getStats runs from two schedulers at once —
+      // the push every 5 s and the time series every 60 s — and each reads
+      // pool.status for itself, so the slower one can arrive last carrying the
+      // smaller figure and undo the record. The upsert also covers the row not
+      // being there at all, which a plain update reports as nothing happening.
+      // `found_at` moves with `best_share`, null included. A date describes the
+      // record it was taken for, so carrying it onto a larger one would date a
+      // share that was never found then — and keeping it is not needed to guard
+      // against a bad read, because the WHERE below already refuses any
+      // candidate that does not beat what is stored.
+      await this.knex('solo_best_share')
+        .insert({ id: 1, best_share: candidate, found_at: at })
+        .onConflict('id')
+        .merge(['best_share', 'found_at'])
+        .where('solo_best_share.best_share', '<', candidate);
+    } catch (error) {
+      log.error({ err: error }, 'error saving best share ever');
+      return best;
+    }
+
+    // Read back rather than assume: the write is allowed to be declined.
+    this._bestShareEver = null;
+    return this._loadBestShareEver();
   }
 
   _notifyServicesStatus() {
@@ -32,7 +128,7 @@ class SoloService {
           .update({
             status: 'pending',
             requested_status: 'online',
-            requested_at: new Date(),
+            requested_at: Date.now(),
           });
         this._notifyServicesStatus();
       }
@@ -70,7 +166,7 @@ class SoloService {
           .update({
             status: 'pending',
             requested_status: 'offline',
-            requested_at: new Date(),
+            requested_at: Date.now(),
           });
         this._notifyServicesStatus();
       }
@@ -101,7 +197,7 @@ class SoloService {
           .update({
             status: 'pending',
             requested_status: 'online',
-            requested_at: new Date(),
+            requested_at: Date.now(),
           });
         this._notifyServicesStatus();
       }
@@ -156,20 +252,33 @@ class SoloService {
     try {
       // Get basic service status
       const status = await this.getStatus();
-      
-      // Get ckpool statistics by parsing the log files
-      let ckpoolData = null;
-      try {
-        ckpoolData = await this._getCkpoolStats();
-      } catch (ckpoolError) {
-        log.error({ err: ckpoolError }, 'error getting solo stats');
-        // Continue with null ckpool data instead of failing completely
+
+      // Keep publishing status while ckpool is stopped, but do not poll files
+      // that only exist after the service has started.
+      let ckpoolData = {
+        pool: null,
+        users: [],
+        blockFound: false,
+      };
+      if (status === 'active' || status === 'running') {
+        try {
+          ckpoolData = await this._getCkpoolStats();
+        } catch (ckpoolError) {
+          log.error({ err: ckpoolError }, 'error getting solo stats');
+          // Continue with empty ckpool data instead of failing completely
+        }
       }
+
+      // Recorded here rather than in the scheduler's minute-by-minute sampling:
+      // this runs on every push, so a record set shortly before a ckpool restart
+      // is not lost with it.
+      const bestShareEver = await this._recordBestShare(ckpoolData);
 
       // Build the stats object
       const stats = {
         status,
         ...ckpoolData,
+        bestShareEver,
         timestamp: new Date().toISOString(),
         error: null,
       };
@@ -364,6 +473,14 @@ class SoloService {
             status: newStatus,
             last_checked: Date.now()
           });
+        // The end of the transition is a state change like the start of it, and
+        // it was the only one nobody announced. Going into `pending` published;
+        // arriving at online or offline did not, and the monitor that would
+        // otherwise have noticed finds the row already up to date and says
+        // nothing. The UI then held a stopped pool on screen for up to ten
+        // seconds — the next periodic push — while its statistics were already
+        // arriving every five.
+        this._notifyServicesStatus();
       }
     } catch (error) {
       log.error({ err: error }, 'error updating service status');

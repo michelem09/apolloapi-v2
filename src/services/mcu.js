@@ -5,6 +5,7 @@ const fs = require('fs').promises;
 const { GraphQLError } = require('graphql');
 const util = require('util');
 const log = require('../logger')('mcu');
+const os = require('os');
 
 // Convert exec to use promises
 const execPromise = util.promisify(exec);
@@ -23,36 +24,6 @@ class McuService {
       return { stats };
     } catch (error) {
       throw new GraphQLError(`Failed to get MCU stats: ${error.message}`);
-    }
-  }
-
-  // Scan for WiFi networks
-  async scanWifi() {
-    try {
-      const wifiScan = await this._getWifiScan();
-      return { wifiScan };
-    } catch (error) {
-      throw new GraphQLError(`Failed to scan WiFi networks: ${error.message}`);
-    }
-  }
-
-  // Connect to WiFi network
-  async connectWifi({ ssid, passphrase }) {
-    try {
-      await this._wifiConnect(ssid, passphrase);
-      const address = await this._getIpAddress();
-      return { address };
-    } catch (error) {
-      throw new GraphQLError(`Failed to connect to WiFi: ${error.message}`);
-    }
-  }
-
-  // Disconnect from WiFi network
-  async disconnectWifi() {
-    try {
-      await this._wifiDisconnect();
-    } catch (error) {
-      throw new GraphQLError(`Failed to disconnect from WiFi: ${error.message}`);
     }
   }
 
@@ -90,8 +61,12 @@ class McuService {
     try {
       timezone = (await this._spawnCommand('timedatectl', ['show', '-p', 'Timezone', '--value'])).trim();
     } catch (e) {
-      timezone = detectedZone();
+      timezone = '';
     }
+    // An empty read is a failed read. Left as '' it would surface as "the device
+    // is on UTC", and picking UTC to confirm that would hit the no-op guard in
+    // setTimezone below — a device stuck on a zone the UI cannot correct.
+    if (!timezone) timezone = detectedZone();
 
     let available;
     try {
@@ -103,17 +78,45 @@ class McuService {
     if (!available.length) available = zoneList();
     if (timezone && !available.includes(timezone)) available = [timezone, ...available];
 
-    return { timezone: timezone || 'UTC', available };
+    return {
+      timezone: timezone || 'UTC',
+      available,
+      rebootPending: await this._timezoneRebootPending(),
+    };
+  }
+
+  /**
+   * True when the zone was changed after this boot.
+   *
+   * Changing it does not reach the processes already running: each one read the
+   * zone at startup, so ckpool and rsyslog keep writing the old local time into
+   * the very logs the UI shows. `timedatectl set-timezone` rewrites the
+   * /etc/localtime symlink, so its mtime against the boot time says whether a
+   * reboot is still owed — durable state on the device, not a flag in someone's
+   * browser, so the warning survives a reload and comes back on another machine.
+   */
+  async _timezoneRebootPending() {
+    try {
+      const { mtimeMs } = await fs.lstat('/etc/localtime');
+      return mtimeMs > Date.now() - os.uptime() * 1000;
+    } catch (e) {
+      // No /etc/localtime (macOS dev, a container): nothing to warn about.
+      return false;
+    }
   }
 
   async setTimezone({ timezone }) {
     try {
       // Validate against what the system actually knows, and pass the value as an
       // argv element — never interpolated into a shell string.
-      const { available } = await this.getTimezone();
-      if (!available.includes(timezone)) {
+      const current = await this.getTimezone();
+      if (!current.available.includes(timezone)) {
         throw new Error(`Unknown timezone: ${timezone}`);
       }
+
+      // Re-picking the zone it is already on must not rewrite /etc/localtime:
+      // that would ask for a reboot nobody needs.
+      if (timezone === current.timezone) return current;
 
       if (process.env.NODE_ENV === 'production') {
         await this._spawnCommand('sudo', ['timedatectl', 'set-timezone', timezone]);
@@ -185,7 +188,7 @@ class McuService {
       if (process.env.NODE_ENV === 'development') scriptName = 'update.fake';
 
       const updateScript = join(__dirname, '../../backend', scriptName);
-      const cmd = spawn(process.env.NODE_ENV === 'development' ? 'bash' : 'sudo', 
+      const cmd = spawn(process.env.NODE_ENV === 'development' ? 'bash' : 'sudo',
         process.env.NODE_ENV === 'development' ? [updateScript] : ['bash', updateScript]);
 
       // info, not debug: an update is rare, high-stakes, and the device reboots
@@ -202,6 +205,17 @@ class McuService {
       cmd.on('close', (code) => {
         if (code === 0) log.info({ code }, 'update script finished');
         else log.error({ code }, 'update script exited non-zero');
+      });
+
+      // The update runs inline for many minutes and reports through its own
+      // progress marker (-10 on failure), so its OUTCOME is not awaited here —
+      // unlike the format launcher, which detaches at once. But the spawn itself
+      // must be: a process that cannot even start ('error' — sudo or bash
+      // missing, EACCES) used to be reported as a started update, and with no
+      // 'error' listener the event would crash the whole API.
+      await new Promise((resolve, reject) => {
+        cmd.once('spawn', resolve);
+        cmd.once('error', reject);
       });
     } catch (error) {
       throw new GraphQLError(`Failed to update firmware: ${error.message}`);
@@ -220,6 +234,9 @@ class McuService {
       } catch (error) {
         if (error.code === 'ENOENT') {
           // File doesn't exist
+          // No marker file is the normal state — nothing is running. The UI polls
+          // this continuously, so this stays at debug: at info it wrote thousands
+          // of lines a day into the persistent journal.
           log.debug('update_progress file not found, returning default progress');
           fileExists = false;
         } else {
@@ -260,102 +277,6 @@ class McuService {
             resolve(result);
           } catch (err) {
             reject(err);
-          }
-        }
-      });
-    });
-  }
-
-  // Helper method to scan for WiFi networks
-  async _getWifiScan() {
-    return new Promise((resolve, reject) => {
-      const scriptName = (process.env.NODE_ENV === 'production')
-        ? 'wifi_scan'
-        : 'wifi_scan_fake';
-
-      const scriptPath = join(__dirname, '../../backend', scriptName);
-
-      exec(scriptPath, {}, (err, stdout) => {
-        if (err) {
-          reject(err);
-        } else {
-          try {
-            const result = JSON.parse(stdout.toString());
-            resolve(result);
-          } catch (err) {
-            reject(err);
-          }
-        }
-      });
-    });
-  }
-
-  // Helper method to connect to WiFi network (spawn + argv only — no shell on ssid/passphrase)
-  async _wifiConnect(ssid, passphrase) {
-    const isProd = process.env.NODE_ENV === 'production';
-    if (!isProd) {
-      await new Promise((r) => setTimeout(r, 2000));
-    }
-
-    const nmcliArgs = ['dev', 'wifi', 'connect', ssid];
-    if (passphrase) {
-      nmcliArgs.push('password', passphrase);
-    }
-
-    return new Promise((resolve, reject) => {
-      const child = isProd
-        ? spawn('sudo', ['nmcli', ...nmcliArgs], { stdio: ['ignore', 'pipe', 'pipe'] })
-        : spawn('nmcli', nmcliArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-      let stdout = '';
-      let stderr = '';
-      child.stdout.on('data', (chunk) => {
-        stdout += chunk;
-      });
-      child.stderr.on('data', (chunk) => {
-        stderr += chunk;
-      });
-      child.on('error', reject);
-      child.on('close', (code) => {
-        const out = (stdout + stderr).toString();
-        if (code !== 0) {
-          reject(new Error(out.trim() || `nmcli exited with code ${code}`));
-          return;
-        }
-        if (out.includes('Error')) {
-          const errMsg = out
-            .trim()
-            .replace(/^.+\(\d+\)\ /g, '')
-            .replace(/\.$/g, '');
-          reject(new Error(errMsg));
-        } else {
-          resolve();
-        }
-      });
-    });
-  }
-
-  // Helper method to disconnect from WiFi network
-  async _wifiDisconnect() {
-    return new Promise((resolve, reject) => {
-      let command = 'for i in $(nmcli -t c show|grep wlan); do nmcli c delete `echo $i|cut -d":" -f2`; done';
-
-      if (process.env.NODE_ENV !== 'production') {
-        command = 'sleep 2 && echo true';
-      }
-
-      exec(command, {}, (err, stdout) => {
-        if (err) {
-          reject(err);
-        } else {
-          if (stdout.includes('Error')) {
-            const errMsg = stdout.trim()
-              .replace(/^.+\(\d+\)\ /g, "")
-              .replace(/\.$/g, "");
-
-            reject(new Error(errMsg));
-          } else {
-            resolve();
           }
         }
       });

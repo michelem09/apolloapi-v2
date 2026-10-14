@@ -40,7 +40,26 @@ done
 #########################
 echo -e "${YELLOW} ---> Installing and upgrading required system packages${NC}"
 apt-get update
+# The Armbian packages own /etc/armbian-release, so this upgrade rewrites it and
+# resets BOARD_NAME — which un-identifies an Apollo III: the UI renders Apollo
+# I/II controls and miner_start.sh launches the USB miner that is not there.
+BOARD_NAME_BEFORE=""
+if [ -r /etc/armbian-release ]; then
+    BOARD_NAME_BEFORE=$(grep -E "^BOARD_NAME=" /etc/armbian-release || true)
+fi
+
 apt-get -y upgrade
+
+if [ -n "$BOARD_NAME_BEFORE" ] && [ -r /etc/armbian-release ]; then
+    if ! grep -qxF "$BOARD_NAME_BEFORE" /etc/armbian-release; then
+        echo -e "${YELLOW} ---> Restoring ${BOARD_NAME_BEFORE} (reset by the upgrade)${NC}"
+        if grep -qE "^BOARD_NAME=" /etc/armbian-release; then
+            sed -i "s|^BOARD_NAME=.*|${BOARD_NAME_BEFORE}|" /etc/armbian-release
+        else
+            echo "$BOARD_NAME_BEFORE" >> /etc/armbian-release
+        fi
+    fi
+fi
 
 git config --global --add safe.directory "$APOLLO_DIR"
 git config --global --add safe.directory "$UI_DIR"
@@ -72,6 +91,24 @@ yarn
 echo -e "${YELLOW} ---> Updating UI modules${NC}"
 git -C "$UI_DIR" reset --hard
 git -C "$UI_DIR" pull --ff-only
+
+API_BRANCH=$(git -C "$APOLLO_DIR" rev-parse --abbrev-ref HEAD)
+UI_BRANCH=$(git -C "$UI_DIR" rev-parse --abbrev-ref HEAD)
+
+# image_install falls back to the UI's dev branch when a backend branch has no UI
+# counterpart, so a mismatch is only fatal on main/staging.
+is_release_branch() {
+    [ "$1" = "main" ] || [ "$1" = "staging" ]
+}
+
+if [ "$API_BRANCH" != "$UI_BRANCH" ]; then
+    if is_release_branch "$API_BRANCH" || is_release_branch "$UI_BRANCH"; then
+        echo -e "${RED} ---> API is on $API_BRANCH but the UI is on $UI_BRANCH, refusing to capture a mixed release image${NC}" >&2
+        exit 1
+    fi
+    echo -e "${YELLOW} ---> API is on $API_BRANCH, UI is on $UI_BRANCH (developer image)${NC}" >&2
+fi
+
 cd "$UI_DIR"
 yarn --ignore-engines
 
@@ -93,6 +130,12 @@ install -m 755 \
 install -m 755 \
     "${APOLLO_DIR}/backend/apollo-miner/bin/${arch}/apollo-miner-v2" \
     "${APOLLO_DIR}/backend/apollo-miner/futurebit-miner-v2"
+# Apollo III miner: shipped for aarch64 only.
+if [ -f "${APOLLO_DIR}/backend/apollo-miner/bin/${arch}/apollo-miner-v3" ]; then
+    install -m 755 \
+        "${APOLLO_DIR}/backend/apollo-miner/bin/${arch}/apollo-miner-v3" \
+        "${APOLLO_DIR}/backend/apollo-miner/futurebit-miner-v3"
+fi
 install -m 755 \
     "${APOLLO_DIR}/backend/apollo-miner/bin/${arch}/apollo-helper" \
     "${APOLLO_DIR}/backend/apollo-miner/apollo-helper"

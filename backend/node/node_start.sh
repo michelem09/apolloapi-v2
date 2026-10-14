@@ -23,7 +23,10 @@ log() { echo "[node-start] $*" >&2; }
 set_conf_by_ram_for_ibd() {
     local mem_kb mem_gb
 
-    # ZRAM tuning is an optimization, not a condition for starting bitcoind.
+    # Shrink zram to 1GB during IBD, to leave more RAM for bitcoind's cache.
+    # An optimization, not a condition for starting bitcoind: newer Armbian
+    # manages zram through armbian-zram-config, which holds the device and
+    # refuses the resize.
     if [ -b /dev/zram0 ]; then
         sudo swapoff /dev/zram0 >/dev/null 2>&1 || true
         sudo zramctl --reset /dev/zram0 >/dev/null 2>&1 || true
@@ -31,6 +34,20 @@ set_conf_by_ram_for_ibd() {
            ! sudo mkswap /dev/zram0 >/dev/null 2>&1 ||
            ! sudo swapon /dev/zram0 >/dev/null 2>&1; then
             log "WARN: could not configure IBD ZRAM"
+
+            # Recovery matters more than the resize did. Failing halfway can
+            # leave the device with no swap at all, and bitcoind doing an IBD on a
+            # board with neither swap nor spare RAM is killed by the OOM reaper on
+            # repeat. Rebuild the signature if the resize destroyed it, then check
+            # we actually have swap back.
+            sudo swapon /dev/zram0 2>/dev/null ||
+                (sudo mkswap /dev/zram0 >/dev/null 2>&1 && sudo swapon /dev/zram0 2>/dev/null) ||
+                true
+
+            if ! grep -q "^/dev/zram0" /proc/swaps 2>/dev/null &&
+               ! grep -qE "^(/|[^ ]+swapfile)" /proc/swaps 2>/dev/null; then
+                log "ERROR: no swap is active; bitcoind may be OOM-killed during IBD"
+            fi
         fi
     fi
 
@@ -83,24 +100,30 @@ select_bitcoind() {
     log "Selected ${software}/${arch}"
 }
 
-if [ ! -b "$DEVICE" ]; then
-    log "ERROR: node drive device not found at $DEVICE"
-    exit 1
+# --- Node drive / mount validation ---
+# The same check the API reports to the UI, so a node that will not start and a
+# panel explaining why can never disagree. Some Apollo III ship with no SSD at
+# all; the states below are what the user is told, and what they can act on.
+NODE_PARTITION="$DEVICE"
+NODE_MOUNTPOINT="$MOUNTPOINT"
+. "${APOLLO_DIR}/backend/lib/node_storage.sh"
+
+storage_state="$(node_storage_state)"
+if [ "$storage_state" != "ready" ]; then
+    case "$storage_state" in
+        no-drive)    log "WARN: no node drive detected; bitcoind not started" ;;
+        unformatted) log "WARN: node drive present but not formatted; bitcoind not started" ;;
+        not-mounted) log "WARN: $MOUNTPOINT is not mounted; bitcoind not started" ;;
+        foreign)     log "WARN: $MOUNTPOINT is mounted from something other than the node drive; bitcoind not started" ;;
+    esac
+    # Under systemd this is unreachable — ExecCondition= already refused the
+    # start. It stays for anyone running the launcher by hand, and 69 is
+    # EX_UNAVAILABLE rather than 0 so a shell script calling it can tell.
+    exit 69
 fi
 
-if ! findmnt -rn --mountpoint "$MOUNTPOINT" >/dev/null 2>&1; then
-    log "ERROR: $MOUNTPOINT is not mounted"
-    exit 1
-fi
-
-mnt_src="$(findmnt -rn -o SOURCE --mountpoint "$MOUNTPOINT" 2>/dev/null || true)"
-dev_real="$(readlink -f "$DEVICE" 2>/dev/null || echo "$DEVICE")"
-src_real="$(readlink -f "$mnt_src" 2>/dev/null || echo "$mnt_src")"
-if [ -z "$mnt_src" ] || [ "$src_real" != "$dev_real" ]; then
-    log "ERROR: $MOUNTPOINT mounted from '$mnt_src' (expected '$DEVICE')"
-    exit 1
-fi
-log "Node storage OK: $MOUNTPOINT mounted from $mnt_src"
+log "Node storage OK: $MOUNTPOINT mounted from $NODE_PARTITION"
+# --- end validation ---
 
 if [ -x "$CHECK_SYNC" ] && "$CHECK_SYNC"; then
     SRC_CONF="$CONF_SYNCED"
@@ -124,6 +147,15 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$SRC_CONF" > "${CONF_DST}.tmp"
 chmod 600 "${CONF_DST}.tmp"
 mv -f "${CONF_DST}.tmp" "$CONF_DST"
+
+# --- Datadir left behind by a full disk ---
+# A settings.json truncated on the way down stops every start before bitcoind
+# even opens its log. The launcher clears it rather than looping on it.
+. "${APOLLO_DIR}/backend/lib/node_datadir.sh"
+if aside="$(node_datadir_heal_settings "$DATADIR")" && [ -n "$aside" ]; then
+    log "WARN: settings.json was not valid JSON (a full disk does this); moved to $aside"
+fi
+# --- end ---
 
 log "Starting bitcoind in attachable screen session 'node'"
 exec screen -D -m -S node "$BITCOIND" \

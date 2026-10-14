@@ -425,5 +425,55 @@ describe('Settings API', () => {
         false
       );
     });
+
+    // Ported from the 2.1.4 regression ("partial update must not touch the node"):
+    // the automation writes only minerMode, and that must not restart bitcoind.
+    // On this line the node is driven by _applyServiceLifecycle, not by
+    // switchBitcoinSoftware/manageBitcoinConf, so that is what is pinned here.
+    it('a minerMode-only update does not run the node lifecycle', async () => {
+      const lifecycle = jest
+        .spyOn(settingsService, '_applyServiceLifecycle')
+        .mockResolvedValue(undefined);
+
+      // The first write may reconcile config files left by earlier tests; the
+      // second is the one an automation mode change looks like.
+      await settingsService.update({ minerMode: 'turbo' });
+      lifecycle.mockClear();
+      await settingsService.update({ minerMode: 'eco' });
+
+      expect(lifecycle).not.toHaveBeenCalled();
+    });
+  });
+});
+// The tuning fields are settled when they are written, not when the miner
+// command line is rendered: a value only clamped later is stored and read back
+// at its original figure, so the UI reports one configuration while the miner
+// runs another, permanently and with nothing to reveal the disagreement.
+describe('Apollo III tuning is settled on write', () => {
+  const utils = require('../src/utils');
+  const settingsService = require('../src/services/settings')(knex, utils);
+
+  it('rejects a target hashrate outside the range the binary accepts', async () => {
+    await expect(settingsService.update({ minerHashrate: 99 })).rejects.toThrow(/5 and 20/);
+    await expect(settingsService.update({ minerHashrate: 1 })).rejects.toThrow(/5 and 20/);
+  });
+
+  it('rejects fan values outside their ranges', async () => {
+    await expect(settingsService.update({ fanTemp: 200 })).rejects.toThrow(/40 and 80/);
+    await expect(settingsService.update({ fanPwm: 5 })).rejects.toThrow(/10 and 100/);
+  });
+
+  it('accepts null, which is how a setting is cleared', async () => {
+    await expect(
+      settingsService.update({ minerHashrate: null, fanTemp: null, fanPwm: null })
+    ).resolves.toBeDefined();
+  });
+
+  it('gives custom mode a target instead of letting it run as eco', async () => {
+    // Without a hashrate the generator falls back to eco while the stored mode
+    // still reads "custom": the user picks custom and gets the lowest preset.
+    const result = await settingsService.update({ minerMode: 'custom' });
+    expect(result.minerMode).toBe('custom');
+    expect(result.minerHashrate).toBe(12);
   });
 });

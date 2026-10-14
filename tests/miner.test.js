@@ -205,3 +205,67 @@ describe('Miner API', () => {
     });
   });
 });
+// The miner rewrites its stat file continuously and reports fields it has no
+// measurement for yet as empty strings. GraphQL cannot coerce "" into Float or
+// Int, so on a real Apollo III a single miner restart — which every settings
+// save triggers — replaced the whole miner page with
+// "Float cannot represent non numeric value".
+describe('stat file parsing tolerates a miner that has just restarted', () => {
+  const fs = require('fs');
+
+  const PARTIAL = {
+    date: '2026-07-28 12:00:00',
+    statVersion: '1.3',
+    versions: { miner: '3.0.1', minerDate: '2026-07-28', minerDebug: '0', mspVer: '0x0' },
+    master: {
+      upTime: 2, diff: 2048, boards: 1, boardsI: '', boardsW: '',
+      intervals: {
+        30: { name: '30 sec', interval: 30, bySol: '', byPool: '', chipSpeed: '', chipRestarts: '' },
+      },
+    },
+    pool: { host: 'x', port: '3333', userName: 'w', diff: 2048, intervals: { 0: { sharesSent: '' } } },
+    fans: { 0: { rpm: [''] } },
+    slots: { 0: { temperature: '', errorRate: '' } },
+    slaves: [],
+  };
+
+  it('reports missing readings as null, which the schema allows, not as ""', async () => {
+    // Only the Apollo III file exists, and it is the half-populated one a miner
+    // writes in the seconds after it restarts.
+    fs.promises.readdir.mockResolvedValueOnce([]);
+    fs.promises.access.mockResolvedValueOnce(undefined);
+    fs.promises.readFile.mockResolvedValueOnce(Buffer.from(JSON.stringify(PARTIAL)));
+
+    const minerService = require('../src/services/miner')(knex, {});
+    const stats = await minerService._getMinerStats({}, []);
+    const board = stats.find((s) => s.version === 'v3');
+
+    expect(board).toBeDefined();
+    expect(board.master.intervals.int_30.bySol).toBeNull();
+    expect(board.master.intervals.int_30.chipRestarts).toBeNull();
+    expect(board.slots.int_0.temperature).toBeNull();
+    expect(board.master.boardsI).toBeNull();
+    expect(board.fans.int_0.rpm).toEqual([null]);
+    // Nothing left that GraphQL would refuse to coerce.
+    expect(JSON.stringify(board)).not.toContain('""');
+  });
+});
+
+// A forking miner unit blocks systemctl for the ~35s miner_start.sh spends
+// waiting on USB enumeration. --no-block returns at once so setup and the restart
+// button don't hang for it; the device-side sequence is unchanged.
+describe('miner start/restart do not block the API on the 35s device wait', () => {
+  it('start() and restart() use systemctl --no-block', async () => {
+    const minerService = require('../src/services/miner')(knex, {});
+    const exec = jest.spyOn(minerService, '_execCommand').mockResolvedValue('');
+
+    await minerService.start();
+    await minerService.restart();
+
+    expect(exec.mock.calls.map((c) => c[0])).toEqual([
+      'sudo systemctl start --no-block apollo-miner',
+      'sudo systemctl restart --no-block apollo-miner',
+    ]);
+    exec.mockRestore();
+  });
+});

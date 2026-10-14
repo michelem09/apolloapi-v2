@@ -1,42 +1,137 @@
 #!/bin/bash
 
-echo "10" > /tmp/format_node_disk_c_done
+# Formats the node SSD and mounts it at /media/nvme.
+#
+# The progress file is what the UI polls. It carries the outcome as well as the
+# position: 10..90 while running, then a terminal value that STAYS — 100 on
+# success, -1/-2 on failure — until the next format overwrites it or /tmp clears
+# on reboot. A marker removed at the end could only be seen by whoever happened
+# to poll during its final seconds; one that persists also reaches the poller
+# that was throttled, disconnected, or opened later. (Pre-mutation UI bundles
+# wait for the final 0 that no longer comes: their format still runs and
+# completes, only the dialog keeps showing 100% until the page is reloaded.)
 
-# Stop node + swap
-systemctl stop node
-swapoff /media/nvme/swapfile
-sleep 10
-
-# Umount disk, remove existing partition
-umount /media/nvme
-wipefs -af /dev/nvme0n1
-
-echo "30" > /tmp/format_node_disk_c_done
-
-# Format disk
-parted /dev/nvme0n1 mklabel gpt -s
-parted -a opt /dev/nvme0n1 mkpart primary ext4 0% 100% -s
-mkfs.ext4 /dev/nvme0n1p1 -F
-
-echo "70" > /tmp/format_node_disk_c_done
-
-#configure node drive
-mount /dev/nvme0n1p1 /media/nvme
-tune2fs -m .1 /dev/nvme0n1p1
-mkdir /media/nvme/Bitcoin
-chown -R futurebit /media/nvme/Bitcoin/
-
-echo "90" > /tmp/format_node_disk_c_done
-
-#Start node + swap
-systemctl start swap
-systemctl start node
-
-echo "100" > /tmp/format_node_disk_c_done
-
-sleep 5 
-
-if [ -f /tmp/format_node_disk_c_done ]; then
-    rm /tmp/format_node_disk_c_done
+# Only one format at a time. The lock is held for this worker's whole run and
+# releases when the process dies, so a crash never leaves it stuck (a screen-name
+# check would). The guard lives here, in the worker, not in the launcher: the
+# launcher detaches via screen and exits 0 regardless, so a lock there would be
+# released the instant it daemonized. (The launcher probes this same lock before
+# detaching so the common refusal reaches the API; this one stays authoritative.)
+#
+# Neither refusal below touches the progress marker: refusal means another worker
+# probably owns the marker right now, and writing it would corrupt that run.
+exec 9>/run/format_node_disk.lock || {
+    # bash does not abort on a failed exec redirection — it continues with status
+    # 1 — and flock on the dead fd would then land in the "already running" branch
+    # below: the opposite of the truth. Name the real failure instead.
+    echo "format_node_disk: cannot open /run/format_node_disk.lock" >&2
+    exit 1
+}
+if ! flock -n 9; then
+    echo "format_node_disk: a format is already running; not starting another" >&2
+    # Non-zero: losing the race is not a success. screen hides this exit from the
+    # API (the launcher's probe reports the common case there), but the journal
+    # and a manual run must not claim a format happened.
+    exit 1
 fi
 
+PROGRESS=/tmp/format_node_disk_c_done
+DEVICE=/dev/nvme0n1
+PARTITION=/dev/nvme0n1p1
+MOUNTPOINT=/media/nvme
+
+progress() { echo "$1" > "$PROGRESS"; }
+
+# `mountpoint`, not `findmnt --target`: the latter resolves to the *enclosing*
+# mount, so it answers "yes" for a directory that is not a mountpoint at all —
+# and a node drive that failed to mount is the main reason to format in the first
+# place. That made the guard abort exactly the case it was meant to serve.
+is_mounted() {
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$1"
+    else
+        findmnt -rn --mountpoint "$1" >/dev/null 2>&1
+    fi
+}
+
+# The units are stopped up front, so every exit has to put them back. Otherwise a
+# format that gave up halfway leaves bitcoind and swap down until someone reboots.
+#
+# Only with the disk actually mounted, though: the swap unit creates its 3G
+# swapfile at /media/nvme/swapfile, and with nothing mounted there that lands on
+# the eMMC root — filling it, and becoming unreclaimable the moment the disk is
+# mounted over it. bitcoind's datadir is on the same path.
+restore_services() {
+    if is_mounted "$MOUNTPOINT"; then
+        systemctl start swap 2>/dev/null
+        systemctl start node 2>/dev/null
+    else
+        echo "format_node_disk: $MOUNTPOINT not mounted; leaving node and swap stopped" >&2
+    fi
+}
+
+# Two different failures, because they need two different reactions: -1 means
+# nothing was touched and a retry is safe, -2 means the disk has already been
+# wiped and the node will not come back until it is formatted successfully.
+FAILED_UNTOUCHED=-1
+FAILED_MODIFIED=-2
+DISK_MODIFIED=0
+
+fail() {
+    echo "format_node_disk: $1" >&2
+    restore_services
+    if [ "$DISK_MODIFIED" -eq 1 ]; then
+        progress "$FAILED_MODIFIED"
+    else
+        progress "$FAILED_UNTOUCHED"
+    fi
+    # The marker stays. A format that fails leaves the node down and, past the
+    # wipe, a disk with no filesystem — so the failure has to still be there when
+    # the user comes back, not only for whoever happened to be watching. The next
+    # format overwrites it, and /tmp clears on reboot.
+    exit 1
+}
+
+progress 10
+
+# Neither unit has to be running, so their failure is not fatal — but the umount
+# below is, since wiping a mounted disk corrupts it.
+systemctl stop node
+swapoff "${MOUNTPOINT}/swapfile" 2>/dev/null
+sleep 10
+
+if is_mounted "$MOUNTPOINT"; then
+    umount "$MOUNTPOINT" || fail "could not unmount $MOUNTPOINT; refusing to wipe a mounted disk"
+fi
+
+DISK_MODIFIED=1
+wipefs -af "$DEVICE" || fail "could not wipe $DEVICE"
+
+progress 30
+
+parted "$DEVICE" mklabel gpt -s || fail "could not write a partition table to $DEVICE"
+parted -a opt "$DEVICE" mkpart primary ext4 0% 100% -s || fail "could not partition $DEVICE"
+# The kernel may still be re-reading the partition table when mkfs starts.
+udevadm settle 2>/dev/null || sleep 2
+mkfs.ext4 "$PARTITION" -F || fail "could not create a filesystem on $PARTITION"
+
+progress 70
+
+# mkdir -p, not mkdir: the mountpoint is normally created at first boot, so a
+# device that never got that far had the mount fail silently here and came back
+# with a formatted disk that was not mounted anywhere.
+mkdir -p "$MOUNTPOINT" || fail "could not create $MOUNTPOINT"
+mount "$PARTITION" "$MOUNTPOINT" || fail "could not mount $PARTITION at $MOUNTPOINT"
+tune2fs -m .1 "$PARTITION"
+mkdir -p "${MOUNTPOINT}/Bitcoin" || fail "could not create ${MOUNTPOINT}/Bitcoin"
+chown -R futurebit "${MOUNTPOINT}/Bitcoin/"
+
+progress 90
+
+restore_services
+
+# The 100 stays, exactly like the failure markers above: an 8-second window
+# before an rm here was only visible to a tab polling at that moment, and a
+# throttled or disconnected one concluded "failed" over a disk that formatted
+# fine. The next format's `progress 10` overwrites it.
+progress 100

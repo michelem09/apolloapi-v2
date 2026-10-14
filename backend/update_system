@@ -155,6 +155,13 @@ install -m 755 \
 install -m 755 \
     "${APOLLO_DIR}/backend/apollo-miner/bin/${arch}/apollo-miner-v2" \
     "${APOLLO_DIR}/backend/apollo-miner/futurebit-miner-v2"
+# Apollo III miner: shipped for aarch64 only. Guarded because this script runs
+# under set -e and an x86_64 dev box has no such binary.
+if [ -f "${APOLLO_DIR}/backend/apollo-miner/bin/${arch}/apollo-miner-v3" ]; then
+    install -m 755 \
+        "${APOLLO_DIR}/backend/apollo-miner/bin/${arch}/apollo-miner-v3" \
+        "${APOLLO_DIR}/backend/apollo-miner/futurebit-miner-v3"
+fi
 install -m 755 \
     "${APOLLO_DIR}/backend/apollo-miner/bin/${arch}/apollo-helper" \
     "${APOLLO_DIR}/backend/apollo-miner/apollo-helper"
@@ -227,6 +234,10 @@ systemctl disable ckpool.service >/dev/null 2>&1 || true
 restore_solo_intent
 
 echo "100" > "$TMPFILE"
+# Long enough for the UI to poll the 100. Removing the file in the same breath
+# left the browser with no reading above zero to go on, so a successful update
+# was reported as one that gave up before finishing.
+sleep 8
 rm -f "$TMPFILE"
 echo -e "${YELLOW} ---> Rebooting${NC}"
 systemctl reboot

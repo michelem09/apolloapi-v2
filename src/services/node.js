@@ -56,7 +56,7 @@ class NodeService {
         .update({
           status: 'pending',
           requested_status: 'online',
-          requested_at: new Date()
+          requested_at: Date.now()
         });
 
       this._notifyServicesStatus();
@@ -74,7 +74,7 @@ class NodeService {
         .update({
           status: 'pending',
           requested_status: 'offline',
-          requested_at: new Date()
+          requested_at: Date.now()
         });
 
       this._notifyServicesStatus();
@@ -180,6 +180,9 @@ class NodeService {
       } catch (error) {
         if (error.code === 'ENOENT') {
           // File doesn't exist
+          // No marker file is the normal state — nothing is running. The UI polls
+          // this continuously, so this stays at debug: at info it wrote thousands
+          // of lines a day into the persistent journal.
           log.debug('format_node_disk_c_done file not found, returning default progress');
           fileExists = false;
         } else {
@@ -202,12 +205,114 @@ class NodeService {
     }
   }
 
+  // Where the node would live, and whether it can. Read from the same script the
+  // launcher uses, so "the node will not start" and "here is why" can never
+  // disagree — the UI used to infer the reason from a refused RPC connection,
+  // which said the node was not running without ever saying that some devices
+  // ship with no drive to run it on.
+  //
+  // Cached briefly: every stats push would otherwise spawn a shell for something
+  // that changes when hardware is added, not between polls.
+  async getStorage() {
+    // A laptop has no NVMe, and every other Node call here is faked. Probing for
+    // real would answer no-drive and take the node, solo and format screens off
+    // the very build they are being developed on.
+    if (devNodeService) {
+      return {
+        state: 'ready',
+        disk: '/dev/nvme0n1',
+        partition: '/dev/nvme0n1p1',
+        mountpoint: '/media/nvme',
+        size: 1000204886016,
+        // Set NODE_STORAGE_FAKE_LOW=1 to see the low-space notice on a laptop.
+        free: process.env.NODE_STORAGE_FAKE_LOW ? 5368709120 : 400000000000,
+        low: !!process.env.NODE_STORAGE_FAKE_LOW,
+      };
+    }
+
+    // Held for a while once the drive is ready — that is the steady state, and
+    // it changes when hardware is added, not between polls. Anything else is a
+    // state the user is actively working on: a format finishing, a disk being
+    // seated. Holding those is how a drive that came good a second ago keeps
+    // reporting 'unformatted' long enough to look like the format failed.
+    const now = Date.now();
+    const ttl = this._storageCache?.value?.state === 'ready' ? 15000 : 2000;
+    if (this._storageCache && now - this._storageCache.at < ttl) {
+      return this._storageCache.value;
+    }
+
+    const script = path.join(__dirname, '../../backend/lib/node_storage.sh');
+    const value = await new Promise((resolve) => {
+      const child = spawn('bash', [script, '--json'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      // The disk this asks about is also the one that hangs lsblk in
+      // uninterruptible I/O when it is failing, and SIGKILL does not reap a
+      // process stuck there. So the answer is given on the timeout, not on the
+      // death: waiting for a close that never comes left the query — and every
+      // 60s poll behind it — hanging, with nothing cached to throttle them.
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        resolve({ state: 'unknown' });
+      }, 10000);
+      child.stdout.on('data', (d) => {
+        out += d;
+      });
+      child.on('error', () => {
+        clearTimeout(timer);
+        // Unknown is not "no drive": claiming a device has no disk because a
+        // script would not run is how a working node gets told to buy hardware.
+        resolve({ state: 'unknown' });
+      });
+      child.on('close', () => {
+        clearTimeout(timer);
+        try {
+          resolve(JSON.parse(out.trim()));
+        } catch {
+          resolve({ state: 'unknown' });
+        }
+      });
+    });
+
+    this._storageCache = { at: now, value };
+    return value;
+  }
+
   // Format the Bitcoin node disk
   async format() {
     try {
       await this._formatDisk();
     } catch (error) {
+      // Dropped on the failure path too: a format that gave up halfway may well
+      // have unmounted or wiped the partition the cached answer describes.
+      this._storageCache = null;
       throw new GraphQLError(`Failed to format disk: ${error.message}`);
+    }
+
+    // The one operation that changes the answer getStorage() caches. Left in
+    // place it reports 'unformatted' for another 15s after the disk was
+    // partitioned and mounted, and the UI keeps that stale reply for its whole
+    // poll interval on top — long enough to look like the format failed.
+    this._storageCache = null;
+
+    // The worker stops the node itself, outside the monitor's knowledge: without
+    // this record that stop reads as unrequested — logged as a manual stop, and
+    // a stop that degrades to 'failed' (bitcoind slow to flush) meets
+    // requested=online + autoStart and gets restarted over the disk being wiped.
+    // Mirrors stop(), but only after a confirmed launch, so a refused format
+    // cannot touch the running one's bookkeeping; when the worker restarts the
+    // node at the end, the monitor's manual-start adoption swings requested back
+    // to online. Never fails the format over it — the worker is already running.
+    try {
+      await this.knex('service_status')
+        .where({ service_name: 'node' })
+        .update({
+          status: 'pending',
+          requested_status: 'offline',
+          requested_at: Date.now()
+        });
+      this._notifyServicesStatus();
+    } catch (error) {
+      log.error({ err: error }, 'failed to record the format stop request');
     }
   }
 
@@ -538,16 +643,19 @@ class NodeService {
         ? spawn('sudo', ['bash', scriptPath])
         : spawn('bash', [scriptPath]);
 
-      // Outcome is decided by the exit code, not by the first byte on stderr:
-      // mkfs writes progress and warnings there, and rejecting on those aborted the
-      // caller (with a raw Buffer, so `error.message` was undefined and the UI showed
-      // an empty failure) while the format actually ran to completion.
       let stderr = '';
 
       cmd.stdout.on('data', (data) => {
         log.debug({ output: data.toString().trim() }, 'format_node_disk stdout');
       });
 
+      // The launcher detaches (screen -dmS) and exits 0 once it starts the
+      // format; a non-zero exit means it could not even launch — screen missing,
+      // sudo denied — and its stderr says why. So collect stderr and reject only
+      // on a non-zero exit, not on the first byte: rejecting on any stderr byte
+      // turned a mere warning into "Failed to format disk: undefined" (the reject
+      // value was a Buffer, which has no .message). The format's own outcome is
+      // not seen here — it runs detached — the UI polls the progress marker for it.
       cmd.stderr.on('data', (data) => {
         const chunk = data.toString();
         stderr += chunk;
@@ -562,7 +670,8 @@ class NodeService {
           resolve();
         } else {
           log.error({ code }, 'format_node_disk exited non-zero');
-          reject(new Error(`format_node_disk exited with code ${code}: ${stderr.trim()}`));
+          // The launcher's own stderr is what the user is shown; the code is in the log.
+          reject(new Error(stderr.trim() || `format launcher exited with code ${code}`));
         }
       });
     });

@@ -59,6 +59,9 @@ jest.mock('fs', () => {
     },
     promises: {
       access: jest.fn().mockImplementation(() => Promise.resolve()),
+      // Epoch by default: nothing was changed after boot, so no code under test
+      // finds itself asking for a reboot it never meant to ask for.
+      lstat: jest.fn().mockResolvedValue({ mtimeMs: 0 }),
       readdir: jest.fn().mockImplementation((path) => {
         if (path.includes('apollo-miner')) {
           return Promise.resolve(['apollo-miner-v2.123456']);
@@ -289,12 +292,23 @@ beforeAll(async () => {
     if (!exists) {
       return knex.schema.createTable('settings', table => {
         table.increments('id');
-        table.string('miner_mode').defaultTo('balanced');
+        // Same CHECK the initial migration creates (table.enum on SQLite), plus
+        // super_eco: without it the constraint that migration 20260728120000
+        // exists to rewrite is unrepresented here, and the super_eco write path
+        // passes in CI whether or not that migration actually works.
+        table
+          .enu('miner_mode', ['super_eco', 'eco', 'balanced', 'turbo', 'custom'])
+          .notNullable()
+          .defaultTo('balanced');
         table.float('voltage').defaultTo(12.0);
         table.integer('frequency').defaultTo(650);
         table.integer('fan').defaultTo(null);
         table.integer('fan_low').defaultTo(40);
         table.integer('fan_high').defaultTo(60);
+        // Apollo III tuning (see migrations/20260728000000_apollo3_miner_settings.js)
+        table.integer('miner_hashrate').defaultTo(null);
+        table.integer('fan_temp').defaultTo(null);
+        table.integer('fan_pwm').defaultTo(null);
         table.boolean('api_allow').defaultTo(false);
         table.boolean('custom_approval').defaultTo(false);
         table.string('connected_wifi');
@@ -330,6 +344,19 @@ beforeAll(async () => {
         table.string('proxy');
         table.integer('index').notNullable();
         table.timestamps(true, true);
+      });
+    }
+  });
+
+  await knex.schema.hasTable('pool_profiles').then(exists => {
+    if (!exists) {
+      return knex.schema.createTable('pool_profiles', table => {
+        table.increments('id');
+        table.timestamps(false, true);
+        table.text('name').notNullable().unique();
+        table.text('url').notNullable();
+        table.text('username');
+        table.text('password');
       });
     }
   });
@@ -432,6 +459,19 @@ beforeAll(async () => {
       }).then(() => knex('mqtt_config').insert({ id: 1 }));
     }
   });
+
+  await knex.schema.hasTable('solo_best_share').then(exists => {
+    if (!exists) {
+      return knex.schema.createTable('solo_best_share', table => {
+        table.integer('id').primary();
+        table.float('best_share').notNullable().defaultTo(0);
+        table.datetime('found_at');
+      });
+    }
+  });
+
+  const bestShareRow = await knex('solo_best_share').where({ id: 1 }).first();
+  if (!bestShareRow) await knex('solo_best_share').insert({ id: 1, best_share: 0 });
 
   // Inserisci dati di default per le impostazioni
   const settingsCount = await knex('settings').count('* as count').first();

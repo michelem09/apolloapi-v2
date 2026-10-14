@@ -32,13 +32,20 @@ async function setupApolloServer(app, httpServer) {
     {
       schema,
       // Authenticate the WS connection using the JWT passed in connectionParams.
-      // Throwing here rejects the connection before any subscription can be opened.
+      //
+      // Returning false rather than throwing, and the difference is visible to the
+      // user: a throw is caught by graphql-ws and closed as 4500 "Internal server
+      // error", which the client can only read as "the backend is broken" — so a
+      // refused token produced a full-screen "backend offline" on a device that was
+      // answering perfectly well. `false` closes with 4403 Forbidden, which says
+      // what actually happened and which the client turns into a trip to sign in.
       onConnect: async (ctx) => {
         const authHeader = ctx.connectionParams?.authorization || '';
         const token = authHeader.replace('Bearer ', '').trim();
 
         if (!token) {
-          throw new Error('Unauthorized: missing token');
+          log.warn('WS connection refused: no token');
+          return false;
         }
 
         try {
@@ -48,10 +55,16 @@ async function setupApolloServer(app, httpServer) {
 
           log.debug({ user: user.username || user.sub || 'unknown' }, 'WS client connected');
 
-          // Trigger an immediate data push ~1s after connection so the client
-          // gets data right away without waiting for the next scheduler tick.
-          // The delay lets all 6 subscription async iterators register before the first publish.
-          const initialPushTimer = setTimeout(() => {
+          // Fill the client without waiting for the next scheduler tick.
+          //
+          // Twice, not once. The single push waited a second so that all six
+          // subscription iterators would have registered — but a client that
+          // registered sooner then sat for that whole second with a dashboard
+          // and no service status, which is the window where the navbar badges
+          // have nothing to show. The early push serves whoever is ready; the
+          // one at a second is the safety net for whoever was not, and a
+          // duplicate publish costs a DB read and is idempotent at the client.
+          const fillClient = () => {
             try {
               // Import lazily to avoid circular dependency at module load time
               const { pushAllStats } = require('./scheduler');
@@ -62,22 +75,32 @@ async function setupApolloServer(app, httpServer) {
             } catch (error) {
               log.error({ err: error }, 'WS could not start initial stats push');
             }
-          }, 1000);
+          };
+
+          // Held on the socket so a client that drops in between does not make
+          // the device pay for them. A sweep is five publishes, one of them a
+          // batch RPC to bitcoind and one an os_stats spawn — and the client's
+          // own silence watchdog makes reconnects deliberately frequent on a
+          // flapping link, so an uncancelled pair would be charged per retry.
+          const fillTimers = [
+            setTimeout(fillClient, 150),
+            setTimeout(fillClient, 1000),
+          ];
           if (ctx.extra) {
-            ctx.extra.apolloInitialPushTimer = initialPushTimer;
+            ctx.extra.fillTimers = fillTimers;
           }
 
           return { user };
         } catch (err) {
-          log.warn({ err }, 'WS auth failed');
-          throw new Error('Unauthorized: invalid token');
+          // Refuse the connection (graphql-ws closes with 4403) instead of
+          // throwing: the client tells a refused token apart from a dead backend
+          // and sends the user to sign in rather than retrying forever.
+          log.warn({ err }, 'WS connection refused: invalid token');
+          return false;
         }
       },
       onDisconnect: (ctx) => {
-        if (ctx.extra?.apolloInitialPushTimer) {
-          clearTimeout(ctx.extra.apolloInitialPushTimer);
-          ctx.extra.apolloInitialPushTimer = null;
-        }
+        (ctx.extra?.fillTimers || []).forEach(clearTimeout);
         log.debug('WS client disconnected');
       },
       // Build the GraphQL execution context for each subscription operation

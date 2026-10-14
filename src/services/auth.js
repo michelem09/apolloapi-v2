@@ -94,8 +94,10 @@ class AuthService {
         password: hashedPassword
       });
     } catch (err) {
-      // This is a Knex error whose bindings include the password hash; the
-      // logger's redaction censors `bindings` so it can't reach the journal.
+      // The error OBJECT carries `bindings` (the password hash on the insert
+      // above); the logger's redaction censors `bindings`, so it cannot reach
+      // the journal. This block also wraps changeSystemPassword, whose failures
+      // are plain Errors with no `code`.
       log.error({ err }, 'setup failed');
       throw err;
     }
