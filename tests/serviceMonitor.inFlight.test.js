@@ -44,7 +44,8 @@ const readSolo = () =>
 const run = async ({ autoStart = true } = {}) => {
   const monitor = monitorFactory(knex, {});
   monitor.config = { ...monitor.config, autoStart };
-  return monitor.checkServiceStatus('ckpool', 'solo');
+  // The second argument is `updateInProgress` (required): no update is running.
+  return monitor.checkServiceStatus('ckpool', false);
 };
 
 // Milliseconds, as the services write them — a Date lands in this column as

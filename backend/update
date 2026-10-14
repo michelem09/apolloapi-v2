@@ -1,132 +1,1244 @@
 #!/bin/bash
+# Apollo updater — installs a signed, pre-built release over the checkout.
+#
+# Replaces "git pull + yarn install + next build on the device", which took
+# 10–20 minutes and peaked enough RAM to take the box down. The release is built
+# and signed by CI; the device only verifies and unpacks it.
+#
+# Not yet the release-layout OTA (releases/<v> + current symlink), and first on
+# purpose: the update mechanism itself never changes here, so a bad release is
+# corrected by the next one through the same still-working path. That property is
+# also what makes the layout crossing safe to attempt later — it arrives as an
+# ordinary signed release, verified and health-gated, instead of being pushed to
+# the fleet blind. Download, verification and rollback carry over unchanged; only
+# what happens to the verified staging directory differs.
+# See OTA_UPDATE_REDESIGN.md §5.2.
+#
+# The directories the release owns are replaced wholesale, so a file deleted
+# upstream really disappears. bitcoind under backend/node/bin is the single
+# documented exception, carried across the swap to keep the artifact ~40 MB
+# instead of ~150 MB.
 set -Eeuo pipefail
 
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 TMPFILE='/tmp/update_progress'
 SOLO_REQUEST_FILE='/run/apollo-update-solo-requested-status'
-APOLLO_DIR='/opt/apolloapi'
+APOLLO_DIR="${APOLLO_ROOT_DIR:-/opt/apolloapi}"
 UI_DIR="${APOLLO_DIR}/apolloui-v2"
 STATE_DIR="${APOLLO_STATE_DIR:-/var/lib/apollo}"
+TRUST_CONF="${APOLLO_TRUST_CONF:-/etc/apollo/update.conf}"
+DL_DIR="${STATE_DIR}/cache/dl"
+BACKUP_DIR="${STATE_DIR}/backups"
+OFFICIAL_OWNER='jstefanop'
+OFFICIAL_REPO='apolloapi-v2'
+HEALTH_URL="${APOLLO_HEALTH_URL:-http://localhost:5000/health}"
+UI_HEALTH_URL="${APOLLO_UI_HEALTH_URL:-http://localhost:3000/}"
+HEALTH_TIMEOUT="${APOLLO_HEALTH_TIMEOUT:-90}"
+# Overridable so the unit backup/restore path can be exercised against a sandbox
+# instead of only asserted on as text. Same reasoning as APOLLO_ROOT_DIR.
+SYSTEMD_DIR="${APOLLO_SYSTEMD_DIR:-/etc/systemd/system}"
+RC_LOCAL="${APOLLO_RC_LOCAL:-/etc/rc.local}"
+# A hard runtime dependency, checked rather than assumed: this is sourced before
+# the ERR trap is armed, so a missing file aborted the script with no record, no
+# progress file removed and no rollback — the client could only wait out the
+# 30-minute backstop. A release that lost backend/lib/ to a staging regression
+# installs cleanly and passes the health check, after which every FUTURE update
+# on that device dies here before it can say why.
+VERSION_LIB="$(dirname "${BASH_SOURCE[0]}")/lib/version.sh"
+if [ ! -r "$VERSION_LIB" ]; then
+  msg="FATAL: $VERSION_LIB is missing — this install is incomplete"
+  echo "$msg" >&2
+  # Also to the log the detach machinery exists to produce: this runs before
+  # stdout is redirected there, so stderr alone would put the only explanation in
+  # the transient unit's journal, where nobody looks.
+  { mkdir -p "$STATE_DIR" 2>/dev/null \
+    && echo "$msg" >> "$STATE_DIR/update.log"; } 2>/dev/null || true
+  # `return` when sourced: this check runs before the APOLLO_UPDATE_LIB guard, so
+  # `exit` here would kill the test harness that sources this file as a library
+  # rather than letting it report.
+  [ "${BASH_SOURCE[0]}" != "$0" ] && return 1
+  exit 1
+fi
+# shellcheck disable=SC1091
+. "$VERSION_LIB"
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Update script must be run by root or with sudo${NC}"
-    exit 1
+# One definition of what a version is, from version.sh — the constant that
+# decides what is acceptable belongs with the code that orders it. Two copies
+# under two names could drift into accepting a manifest version that version_gt
+# then refuses to order, which surfaces as "Refusing to move from … to
+# older/equal" — an Update button that fails every press with a message that does
+# not describe the cause.
+VERSION_RE="$VERSION_ORDER_RE"
+
+# What the last update did, for the UI to report once the API is back. It lives in
+# the state dir and not /tmp because the whole point is surviving the window where
+# apollo-api is stopped — and a reboot with it.
+#
+# Progress alone cannot carry this: it is polled through apollo-api, which the
+# updater stops, so the UI is disconnected for exactly the minutes that matter and
+# reconnects with no memory. A failed update and its rollback were indistinguishable
+# from a random blackout.
+LAST_UPDATE_FILE="${STATE_DIR}/last-update.json"
+STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Identity for this run. It is what lets a client say "this record is about the
+# update I started" — the question the system previously could not express, and
+# which was answered instead by comparing the browser's clock against the
+# device's. These boards have no RTC and their clock is known to ship wrong, so
+# that comparison rejected genuine records and accepted stale ones. A client now
+# remembers the run_id it saw when it pressed, and waits for a different one.
+#
+# od, not `tr </dev/urandom | head -c`: /dev/urandom never ends, so head exits
+# first and tr dies of SIGPIPE — which under `set -o pipefail` makes the whole
+# pipeline fail, so the `|| echo $$` fallback fired on EVERY run and its output
+# was appended to the random part rather than replacing it. Observed on hardware
+# as a 13-character suffix (6 hex + the PID) where 6 were intended, and on a
+# developer machine as the PID alone, tr having refused the input under a UTF-8
+# locale. Uniqueness survived by accident; the randomness the id is supposed to
+# rest on did not. od reads exactly 6 bytes and exits, so nothing is signalled.
+RUN_RAND="$(od -An -N6 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"
+[ -n "$RUN_RAND" ] || RUN_RAND="$$"
+RUN_ID="${STARTED_AT}-${RUN_RAND}"
+
+STAGING=''; TARBALL=''
+# MUTATED is armed BEFORE the first destructive step, not after the last one: it
+# answers "might /opt/apolloapi be half-dismantled?", and a flag set afterwards
+# was still 0 during the exact window it exists to cover.
+MUTATED=0; STOPPED=0; UNITS_SAVED=0; COMPLETED=0
+
+# The reason the update stopped, captured so the outcome record can tell the user
+# something better than "it failed". Only `die` sets it: `err` is used for warnings
+# the update survives, and attributing one of those as the cause would be worse
+# than the generic message.
+FAIL_REASON=''
+
+log()  { echo -e "${YELLOW} ---> $*${NC}"; }
+err()  { echo -e "${RED}$*${NC}" >&2; }
+die()  { FAIL_REASON="$*"; err "$*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# The single record of what this run is doing and what it did. Written on every
+# transition, atomically (temp + mv) so a reader never sees half a file.
+#
+# It replaces a split where /tmp/update_progress carried both "how far along" and
+# "how it ended", and four consumers each inferred something different from the
+# same number. Keeping a terminal value in that file so the outcome would survive
+# the API restart is what made a leftover 100 look like a fresh success — the
+# modal replaced the Update button with "Reload App" and the device could never be
+# updated from the UI again. Progress stays transient; the outcome lives here.
+#
+# state:
+#   running          — this run is in flight
+#   succeeded        — installed and healthy
+#   rolled-back      — the device was modified and PUT BACK; it is fine
+#   recovery-failed  — modified and NOT put back. The only state that means SSH,
+#                      and the one the previous vocabulary could not express, so a
+#                      half-failed rollback told the user they had been restored
+#   aborted          — nothing was modified (bad checksum, no space, no deps)
+#
+# jq, not string interpolation: a version or a reason containing a quote must not
+# turn the one file whose job is to explain a failure into a second failure.
+#
+# jq is the preferred writer, but it CANNOT be a precondition. Devices in the
+# field ship without it — the updater installs it — so gating on it made the
+# record unavailable during exactly the window it exists to explain: a first OTA
+# whose dependency install fails (apt mirror down, sigstore unreachable, apt lock
+# held) changed nothing on the device and reported nothing either, leaving the
+# client with no record, no progress file and no unit to observe.
+json_escape() {  # arbitrary text -> a JSON string body
+  # A WHITELIST, not an escape chain: keep printable ASCII except " and \, drop
+  # everything else. By construction this cannot emit a character that would make
+  # the file invalid, which an escape chain has to get right case by case — and
+  # did not. The previous version ended in `sed 's/[[:cntrl:]]/ /g'` and claimed
+  # to fold every control character; sed is line-oriented, so it strips the
+  # newline before matching and puts it back afterwards, and a two-line reason
+  # produced a record the API rejected as malformed. The caller then reads that
+  # as "no update has ever run" — the record turning into a second failure, which
+  # is the one thing this function exists not to do.
+  #
+  # tr is byte-oriented, so it has no such blind spot. Losing an accent from a
+  # locale-translated error string is an acceptable price for a file that always
+  # parses.
+  printf '%s' "$1" | tr -cd '\40-\41\43-\133\135-\176'
+}
+
+write_state() {  # state phase progress [reason]
+  local dir tmp progress
+  dir="$(dirname "$LAST_UPDATE_FILE")"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  tmp="$(mktemp "${LAST_UPDATE_FILE}.XXXXXX" 2>/dev/null)" || return 0
+  # Not %d: an unset or non-numeric argument must not make this abort.
+  progress="${3:-0}"; case "$progress" in ''|*[!0-9-]*) progress=0 ;; esac
+
+  # `if <writer>; then wrote=1; fi`, and not `<writer> && wrote=1`, for two
+  # reasons that both bit.
+  #
+  # set -e: a bare failing command as the last statement of an `if` BODY takes
+  # the shell down with it — and every call from cleanup() runs with ERR/EXIT
+  # already cleared, so the abort was silent and skipped the two statements
+  # after it: the progress file was never removed (leaving the terminal value
+  # this redesign exists to eliminate) and `exit "$status"` never ran, so the
+  # unit reported the writer's exit code instead of the run's. Only an `if`
+  # CONDITION is exempt from set -e, so the writer has to be one.
+  #
+  # And the outcome has to gate the install. `[ -s "$tmp" ]` alone cannot tell
+  # complete JSON from half a line: on a full filesystem a truncated write
+  # replaced a valid record, write_state returned 0, and JSON.parse then failed
+  # in the API — so the client was told "no update has ever run" instead of "not
+  # enough disk space", with the last good record destroyed. The run most likely
+  # to be out of space is exactly the one that most needs to explain itself.
+  local wrote=0
+  if have jq; then
+    if jq -n --arg run_id "$RUN_ID" --arg state "$1" --arg phase "$2" \
+          --argjson progress "$progress" --arg reason "${4:-}" \
+          --arg from "${CURRENT:-}" --arg to "${VERSION:-}" \
+          --arg started "$STARTED_AT" --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       '{run_id: $run_id, state: $state, phase: $phase, progress: $progress,
+         from: $from, to: $to, reason: $reason,
+         started_at: $started, updated_at: $updated}' > "$tmp" 2>/dev/null
+    then wrote=1
+    fi
+  else
+    if printf '{"run_id":"%s","state":"%s","phase":"%s","progress":%s,"from":"%s","to":"%s","reason":"%s","started_at":"%s","updated_at":"%s"}\n' \
+      "$(json_escape "$RUN_ID")" "$(json_escape "$1")" "$(json_escape "$2")" \
+      "$progress" "$(json_escape "${CURRENT:-}")" "$(json_escape "${VERSION:-}")" \
+      "$(json_escape "${4:-}")" "$(json_escape "$STARTED_AT")" \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" 2>/dev/null
+    then wrote=1
+    fi
+  fi
+
+  if [ "$wrote" -eq 1 ] && [ -s "$tmp" ]; then
+    mv -f "$tmp" "$LAST_UPDATE_FILE" 2>/dev/null || rm -f "$tmp"
+    chown futurebit:futurebit "$LAST_UPDATE_FILE" 2>/dev/null || true
+  else
+    # Leave the previous record in place: a stale but valid explanation beats a
+    # truncated one, and beats none.
+    rm -f "$tmp"
+  fi
+  return 0
+}
+
+# Progress is still written for clients running an older UI bundle, which poll
+# Mcu.updateProgress and know nothing about the record. It is transient again —
+# deleted when the run ends — because nothing new depends on it.
+progress() {  # phase percent
+  echo "$2" > "$TMPFILE"
+  write_state running "$1" "$2"
+}
+
+# Sourced with APOLLO_UPDATE_LIB=1 by tests/ota/rollback.test.sh, which drives the
+# backup and restore functions directly under injected failures. The update itself
+# never sets it, and sudo's env_reset means it cannot arrive from outside.
+if [ -z "${APOLLO_UPDATE_LIB:-}" ]; then
+
+[ "$EUID" -eq 0 ] || die "Update script must be run by root or with sudo"
+
+# --- detach from the caller entirely -----------------------------------------
+# The UI spawns this script as a child of apollo-api (src/services/mcu.js uses a
+# plain spawn, with no setsid or detached), so it runs inside that unit's cgroup
+# — and one of the first things it does is stop apollo-api.service. systemd's
+# default KillMode=control-group makes that a SIGTERM to ourselves, in the middle
+# of the swap, leaving every service stopped and nothing to start them again.
+#
+# A transient SERVICE, not `--scope`. A scope was the first attempt and it was not
+# enough: it moves us out of the cgroup but leaves us a child of the `sudo` that
+# started us, and sudo IS in apollo-api's cgroup. When that cgroup is terminated
+# sudo takes the SIGTERM and relays it to its child, so escaping the cgroup buys
+# nothing against a signal delivered by our own parent. Observed on hardware
+# twice, as an update that died at "Stopping services" with no error message at
+# all. A transient service is parented by systemd, so sudo exits with nobody left
+# to signal.
+#
+# A run started by hand over SSH lives in the session scope and was never at risk
+# either way, which is exactly why testing it that way did not reveal any of this.
+#
+# Output goes to a log file rather than staying on the inherited stdout: that pipe
+# belongs to the process we are about to stop, and writing to it afterwards would
+# fail under `set -e` — trading one self-inflicted abort for another.
+LOG_FILE="${APOLLO_UPDATE_LOG:-$STATE_DIR/update.log}"
+if [ -z "${APOLLO_UPDATE_DETACHED:-}" ] && [ -d /run/systemd/system ] && have systemd-run; then
+  mkdir -p "$STATE_DIR"
+  # A leftover failed unit from an earlier run would make systemd-run refuse.
+  systemctl reset-failed apollo-update.service >/dev/null 2>&1 || true
+  echo "Update started. Follow it with: tail -f $LOG_FILE"
+  # --setenv and not export: systemd gives a transient service a fresh
+  # environment, so nothing from here is inherited.
+  #
+  # EVERY override is forwarded, not just these two. Forwarding a subset meant
+  # the detached run — the one that actually does the work — silently reverted to
+  # the defaults: `APOLLO_ROOT_DIR=/tmp/sandbox backend/update`, the whole point
+  # of which is to touch nothing real, swapped /opt/apolloapi for real, while its
+  # log obediently went to the sandbox. APOLLO_CHANNEL_URL pointing at a dev
+  # channel would likewise have installed the official stable release.
+  setenv_args=(
+    --setenv=APOLLO_UPDATE_DETACHED=1
+    --setenv="APOLLO_UPDATE_LOG=$LOG_FILE"
+  )
+  # Enumerated, not listed by hand. The hand-written list was a parallel copy of
+  # the `${APOLLO_*:-}` reads scattered through this file, with nothing keeping
+  # the two in step — so APOLLO_RESTART_TIMEOUT, added to let an operator give a
+  # slow device longer before start_services declares recovery-failed, was a
+  # silent no-op in the detached run that does the work. That is the same defect
+  # already fixed once for the other overrides, reintroduced by adding a knob.
+  #
+  # APOLLO_UPDATE_DETACHED and APOLLO_UPDATE_LOG are set above; APOLLO_UPDATE_LIB
+  # is excluded on purpose, since it makes this script define and return without
+  # doing anything.
+  # `-e`, not `-v`: exported variables only. An override arrives in the
+  # ENVIRONMENT — and it needs `sudo -E` to survive: Debian ships
+  # `Defaults env_reset`, and nothing here adds an env_keep for APOLLO_*, so
+  # `APOLLO_ROOT_DIR=/tmp/sandbox sudo bash backend/update` silently drops the
+  # variable and swaps the REAL /opt/apolloapi. Verified on a device. Use
+  # `sudo -E env APOLLO_ROOT_DIR=/tmp/sandbox bash backend/update`, and read the
+  # "Updating <dir>" line the run prints before believing it. Values this
+  # script derives for itself — APOLLO_DIR among them — are plain shell
+  # variables. Enumerating all of them swept the script's own state into the
+  # child's environment, harmless only because the child re-derives it anyway,
+  # and it made the exclusion list read as "inputs, minus what we set, minus
+  # whatever we happen to compute". This asks the question that was actually
+  # meant: what did the operator put in the environment.
+  for override in $(compgen -e APOLLO_ || true); do
+    case "$override" in
+      APOLLO_UPDATE_DETACHED|APOLLO_UPDATE_LOG|APOLLO_UPDATE_LIB) continue ;;
+    esac
+    [ -n "${!override:-}" ] && setenv_args+=(--setenv="$override=${!override}")
+  done
+  # TimeoutStopSec=infinity, because ignoring SIGTERM is not enough. systemd's
+  # default is 90 s, and the rollback's first act is stop_services, whose
+  # node.service declares TimeoutStopSec=700 for bitcoind's dbcache flush. On a
+  # reboot mid-update the ignored SIGTERM would be followed by a SIGKILL of the
+  # whole cgroup before restore_code had touched a single file, leaving the
+  # half-installed release, the new units enabled and the database migrated
+  # forward — with an intact backup nothing would ever read.
+  exec systemd-run --quiet --collect --unit=apollo-update \
+    --property=TimeoutStopSec=infinity \
+    "${setenv_args[@]}" -- "$0" "$@"
+fi
+if [ -n "${APOLLO_UPDATE_DETACHED:-}" ]; then
+  mkdir -p "$STATE_DIR"
+  exec >>"$LOG_FILE" 2>&1
+  echo "=== update started $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 fi
 
-# The API relocates the DB out of the checkout into the state dir (src/paths.js),
-# and that can happen while this script runs, so resolve the path at each use
-# instead of once at startup. .env is the source of truth, with the managed and
-# legacy locations as fallbacks.
+fi  # end of the non-library preamble
+
+# --- config, parsed and never executed --------------------------------------
+# source.conf is writable by the app user, so sourcing it would be code
+# execution as root. Read the keys instead.
+conf_get() {  # file key
+  [ -r "$1" ] || return 0
+  sed -n "s/^[[:space:]]*$2=//p" "$1" | tail -n 1 \
+    | sed -e 's/[[:space:]]*#.*$//' -e 's/\r$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//"
+}
+
+SOURCE_CONF="${APOLLO_SOURCE_CONF:-$STATE_DIR/source.conf}"
+GIT_BASE="$(conf_get "$SOURCE_CONF" APOLLO_GIT_BASE)"; GIT_BASE="${GIT_BASE:-https://github.com/$OFFICIAL_OWNER}"
+API_REPO="$(conf_get "$SOURCE_CONF" APOLLO_API_REPO)"; API_REPO="${API_REPO:-$OFFICIAL_REPO}"
+CHANNEL="$(conf_get "$SOURCE_CONF" APOLLO_CHANNEL)";   CHANNEL="${CHANNEL:-stable}"
+CHANNEL_URL="${APOLLO_CHANNEL_URL:-${GIT_BASE}/${API_REPO}/releases/download/channel-${CHANNEL}/${CHANNEL}.json}"
+
+# Which identity to trust is a root-only decision: source.conf only says where to
+# fetch, and a wrong value there must not be able to change what we accept.
+default_identity="^https://github\\.com/${OFFICIAL_OWNER}/${OFFICIAL_REPO}/\\.github/workflows/release\\.yml@refs/tags/v"
+TRUST_IDENTITY="$(conf_get "$TRUST_CONF" APOLLO_TRUST_IDENTITY)"; TRUST_IDENTITY="${TRUST_IDENTITY:-$default_identity}"
+TRUST_ISSUER="$(conf_get "$TRUST_CONF" APOLLO_TRUST_ISSUER)";     TRUST_ISSUER="${TRUST_ISSUER:-https://token.actions.githubusercontent.com}"
+
+# --- helpers -----------------------------------------------------------------
+sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# Semver-aware. `sort -V` is not: it orders 2.2.0-rc1 ABOVE 2.2.0, which would
+# leave every beta device thinking it is already up to date.
+# Version ordering lives in backend/lib/version.sh, shared verbatim with the
+# release workflow so the thing that decides what may be OFFERED and the thing
+# that decides what may be INSTALLED cannot drift apart.
+
+# grep tests each LINE, so a multi-line value passes as long as ONE of its lines
+# matches — which defeated the numeric check on the manifest's size field: a value
+# of $'x[$(cmd)]\n40000000' cleared the guard on its second line and then reached
+# an arithmetic expansion, where bash executed the first one as root, before the
+# checksum and signature were ever checked. Every manifest field is single-line by
+# definition, so an embedded newline is rejected outright, ahead of any pattern.
+single_line() { [[ "$1" != *$'\n'* ]]; }
+
+# Whole-value numeric test. `case` is used rather than a pattern match because it
+# cannot be fooled the way a line-oriented tool can.
+valid_number() {
+  single_line "$1" || return 1
+  case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac
+}
+
+valid_version() { single_line "$1" && printf '%s' "$1" | grep -qE "$VERSION_RE"; }
+# A field starting with '-' would be read by curl as an option (e.g. -K reads a
+# config file), so every URL is schema-checked and passed after --url.
+valid_url() { single_line "$1" && printf '%s' "$1" | grep -qE '^https://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$'; }
+
+fetch() { curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 --url "$1"; }
+
+current_version() {
+  if [ -f "$APOLLO_DIR/version.json" ]; then jq -r '.version // empty' "$APOLLO_DIR/version.json"
+  elif [ -f "$APOLLO_DIR/package.json" ]; then jq -r '.version // empty' "$APOLLO_DIR/package.json"
+  fi
+}
+
 resolve_database_url() {
-    local from_env='' candidate
-    if [ -r "${APOLLO_DIR}/.env" ]; then
-        from_env=$(sed -n 's/^DATABASE_URL=//p' "${APOLLO_DIR}/.env" | tail -n 1)
-    fi
-    for candidate in "$from_env" "${STATE_DIR}/db/futurebit.sqlite" "${APOLLO_DIR}/futurebit.sqlite"; do
-        if [ -n "$candidate" ] && [ -f "$candidate" ]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-    return 1
+  local from_env candidate
+  from_env="$(conf_get "$APOLLO_DIR/.env" DATABASE_URL)"
+  for candidate in "$from_env" "$STATE_DIR/db/futurebit.sqlite" "$APOLLO_DIR/futurebit.sqlite"; do
+    [ -n "$candidate" ] && [ -f "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
 }
 
 restore_solo_intent() {
-    [ -f "$SOLO_REQUEST_FILE" ] || return 0
+  [ -f "$SOLO_REQUEST_FILE" ] || return 0
+  local db requested
+  if ! db="$(resolve_database_url)"; then
+    err "Could not locate the database; keeping preserved solo intent"; return 0
+  fi
+  requested="$(<"$SOLO_REQUEST_FILE")"
+  case "$requested" in
+    online|offline) sqlite3 "$db" "UPDATE service_status SET status='pending', requested_status='${requested}', requested_at=CURRENT_TIMESTAMP WHERE service_name='solo';" ;;
+    '')             sqlite3 "$db" "UPDATE service_status SET requested_status=NULL, requested_at=NULL WHERE service_name='solo';" ;;
+  esac
+  rm -f "$SOLO_REQUEST_FILE"
+}
 
-    local database_url
-    if ! database_url=$(resolve_database_url); then
-        # Keep the marker so a later run can still restore the user's intent
-        # instead of silently dropping their solo-mining setting.
-        echo -e "${YELLOW}Could not locate the database; keeping preserved solo intent${NC}" >&2
-        return 0
+# Any abort must leave the device on working code and no debris behind — the
+# previous design leaked a half-extracted tree and a partial tarball.
+#
+# Success is tracked with an explicit flag rather than inferred from $?. When the
+# shell dies on a signal the EXIT trap can run with $? == 0, which took the
+# success branch and skipped the rollback entirely — on the one path where the
+# rollback is the whole point.
+cleanup() {
+  local status=$?
+  # ERR and EXIT are cleared so this cannot re-enter. TERM/INT/HUP are IGNORED
+  # rather than reset to their default: resetting them left the rollback — the
+  # one part that must not be interrupted — unprotected from exactly the signals
+  # the main body had just been hardened against. A shutdown, or the transient
+  # unit hitting its stop timeout, killed the restore halfway: old code under the
+  # new release's units, nothing restarted, and progress left at 95, which the UI
+  # reads as success.
+  trap - ERR EXIT
+  trap '' TERM INT HUP
+
+  # `|| true` on every cleanup rm: the traps are already gone, so a failing rm
+  # (EIO or a read-only remount on a dying eMMC — precisely when the rollback
+  # matters) would abort cleanup here, before restoring anything, silently.
+  if [ -n "$STAGING" ]; then rm -rf "$STAGING" || true; fi
+
+  if [ "$COMPLETED" -eq 1 ]; then exit 0; fi
+  [ "$status" -eq 0 ] && status=1
+
+  if [ -n "$TARBALL" ]; then rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem" || true; fi
+  # Nothing was modified unless MUTATED says so, and if it was, the outcome
+  # depends on whether putting it back actually worked. That status used to be
+  # discarded — `restore_code || err …` throws it away — so a rollback that half
+  # failed still recorded "rolled-back", and the banner told the user their
+  # device had been restored when it needed SSH.
+  local restored=1
+  if [ "$MUTATED" -eq 1 ]; then
+    # Stop first. On the `health_ok || die` path everything has already been
+    # started again against the half-installed release, and apollo-api holds the
+    # database open — restoring it underneath a live writer would corrupt exactly
+    # the file the rollback exists to save.
+    stop_services
+    if restore_code; then restored=1; else restored=0; fi
+    STOPPED=1
+  fi
+  # Restarting is unconditional once anything has been stopped: an explicit `die`
+  # between the stop and the end used to leave the API, UI, node and ckpool all
+  # down, with no Restart= recovery because the stop was deliberate.
+  local serving=1
+  if [ "$STOPPED" -eq 1 ]; then
+    err "Restarting services"
+    start_services || serving=0
+  fi
+  restore_solo_intent || true
+
+  local result reason
+  reason="${FAIL_REASON:-The update stopped unexpectedly}"
+  if [ "$MUTATED" -eq 0 ] && [ "$serving" -eq 1 ]; then
+    result='aborted'
+  elif [ "$serving" -eq 0 ]; then
+    # Nothing was installed, or it was put back — but the device is not serving,
+    # so neither "untouched" nor "restored" is true. This is the state that needs
+    # a human, and saying anything softer sends the user to look at a device that
+    # cannot answer.
+    result='recovery-failed'
+    reason="$reason — and the services could not be started again"
+    err "SERVICES DID NOT COME BACK — this device needs manual recovery over SSH"
+  elif [ "$restored" -eq 1 ]; then
+    result='rolled-back'
+  else
+    result='recovery-failed'
+    reason="$reason — and the previous version could not be restored"
+    err "ROLLBACK FAILED — this device needs manual recovery over SSH"
+  fi
+  write_state "$result" "failed" 0 "$reason"
+
+  # Transient again: the outcome lives in the record, so nothing needs a value
+  # left behind here. Keeping one is what made a leftover read as a fresh result.
+  rm -f "$TMPFILE"
+  err "Update failed; the previous version is still installed"
+  exit "$status"
+}
+if [ -z "${APOLLO_UPDATE_LIB:-}" ]; then
+  trap cleanup ERR EXIT
+  # Without these the shell dies on the signal and the EXIT trap misreads it as
+  # success. The self-SIGTERM this used to cause is fixed above, but a manual
+  # `kill`, an SSH hangup or a shutdown mid-update are all still real.
+  trap 'exit 143' TERM INT HUP
+fi
+
+# --- code swap ---------------------------------------------------------------
+# Directories the release fully owns. Replaced wholesale — never merged — so a
+# file deleted upstream actually disappears from the device. Merging would make
+# a deletion silently ineffective, including one that IS the security fix.
+OWNED='src config migrations node_modules backend'
+
+# Root-level files the release owns. version.json matters most: it is what the
+# device believes it is running, so a rollback that leaves the new one behind
+# makes every later update exit "Already on <version>" against old code — an OTA
+# dead end that only SSH can undo.
+ROOT_FILES='knexfile.js package.json version.json'
+
+# systemd units the release installs. Named once so the backup and the install
+# cannot drift apart and leave a unit un-revertable.
+UNITS='apollo-bootstrap apollo-api apollo-ui-v2 apollo-miner node ckpool rc-local swap'
+
+# backend/ is replaced wholesale, bitcoind included. It used to be the single
+# carried-across exception — excluded from the artifact to keep it small, and
+# moved aside and back around the swap. That machinery is gone: the release now
+# ships the six aarch64 flavours, so the binaries and the code that lists them
+# travel together, and a device can never be offered a flavour it does not have.
+#
+# It also removes the window the exception created, in which the device's ONLY
+# copy of bitcoind lived in a temporary directory that a crash could orphan and
+# the next run could delete.
+
+# Claims the backup directory for this run. Called BEFORE any mutation, because
+# the window between "we started changing things" and "we know where the old copy
+# went" is the one the rollback cannot survive.
+#
+# The pointer carries the run id. Without it, a failure in that window left
+# BACKUP_CODE empty and the rollback fell back to the pointer from the PREVIOUS
+# run — which prune_backups deliberately keeps valid — restoring a tree two
+# releases old, and its database with it, while recording a normal rollback.
+claim_backup() {
+  BACKUP_CODE="$BACKUP_DIR/code-pre-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$BACKUP_CODE"
+  printf '%s\n' "$RUN_ID" > "$BACKUP_CODE/.run-id"
+  printf '%s\n' "$BACKUP_CODE" > "$BACKUP_DIR/.last-code-backup"
+  return 0
+}
+
+# Same filesystem? Decides whether `mv` is an atomic rename or a copy followed by
+# a delete, which is the difference between "no partial state can exist" and "two
+# opposite partial states can, and look alike from outside".
+# df, not stat: -c and -f mean different things on GNU and BSD, and the tests run
+# on macOS while the device runs Linux.
+same_fs() {
+  local a b
+  a="$(df -P "$1" 2>/dev/null | awk 'NR==2{print $1}')"
+  b="$(df -P "$2" 2>/dev/null | awk 'NR==2{print $1}')"
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+
+saved_marker() { printf '%s/.saved-%s' "$1" "$(printf '%s' "$2" | tr '/' '_')"; }
+
+# Put one entry in the backup, and record that it is THERE — not that we started
+# putting it there.
+#
+# Across filesystems `mv` is copy-then-delete, so an interruption leaves either a
+# half-written backup with the original intact, or a complete backup with the
+# original half-deleted. On disk those look the same, and the correct response is
+# opposite in each case: restoring the first destroys a good tree, skipping the
+# second leaves a truncated one. Guessing from "is the live copy still there"
+# gets exactly one of them right, which is what shipped.
+#
+# So the copy and the delete are done separately, with the marker written between
+# them. A marker means the backup is complete and usable, whatever happened next.
+# On one filesystem `mv` is a rename, which cannot be interrupted halfway, so the
+# copy is skipped entirely and only the marker is written.
+save_entry() {  # relative path under APOLLO_DIR
+  local rel="$1" src dst mark
+  src="$APOLLO_DIR/$rel"; dst="$BACKUP_CODE/$rel"
+  mark="$(saved_marker "$BACKUP_CODE" "$rel")"
+  [ -e "$src" ] || return 0
+  mkdir -p "$(dirname "$dst")" || return 1
+  if [ "${SAME_FS:-}" = 1 ]; then
+    mv "$src" "$dst" || return 1
+    : > "$mark"
+  else
+    cp -a "$src" "$dst" || return 1
+    : > "$mark"
+    rm -rf "$src" || return 1
+  fi
+  return 0
+}
+
+backup_code() {
+  [ -n "${BACKUP_CODE:-}" ] || claim_backup
+  # Once per run, not once per entry: APOLLO_DIR and BACKUP_CODE are fixed for
+  # the life of the run, and same_fs forks two `df` and an `awk` each time — 24
+  # processes for one invariant answer, on an aarch64 SBC, inside the window
+  # where every service is stopped.
+  same_fs "$APOLLO_DIR" "$BACKUP_CODE" && SAME_FS=1 || SAME_FS=0
+  local d f
+  for d in $OWNED; do save_entry "$d" || return 1; done
+  save_entry "apolloui-v2/.next" || return 1
+  for f in $ROOT_FILES; do [ -e "$APOLLO_DIR/$f" ] && cp -p "$APOLLO_DIR/$f" "$BACKUP_CODE/$f"; done
+  backup_database || return 1
+  # Written last. Its presence is what lets restore_code read an ABSENCE as
+  # meaningful ("this did not exist before the update") rather than as "the
+  # backup never got that far" — two situations that look identical on disk and
+  # call for opposite behaviour.
+  : > "$BACKUP_CODE/.complete"
+  return 0
+}
+
+# The database has to travel with the code, because a release can carry knex
+# migrations and apollo-bootstrap applies them before the health check decides
+# whether to keep the release at all.
+#
+# Restoring only migrations/ leaves the DB migrated FORWARD past files that no
+# longer exist, and knex refuses to run at all in that state ("the migration
+# directory is corrupt, the following files are missing"). bootstrap.js then
+# exits non-zero, its oneshot unit fails, and apollo-api, node and apollo-miner
+# all declare Requires= on it — so none of them start, at rollback time and on
+# every boot afterwards. The health check, which exists to protect the device,
+# would be the thing that bricks it. Recovery would need SSH.
+#
+# A rollback therefore also rolls the database back, losing anything written
+# during the update window (minutes): settings changes, time-series samples,
+# automation events. That is the intended trade against an unbootable device.
+backup_database() {
+  local db
+  if ! db="$(resolve_database_url)"; then
+    err "No database found; a rollback will not be able to revert migrations"
+    return 0
+  fi
+  # `.backup`, not cp: the database runs in WAL mode, so a plain copy can miss
+  # committed transactions still sitting in the -wal file. The timeout covers a
+  # writer holding the lock as the services wind down.
+  if ! sqlite3 "$db" ".timeout 10000" ".backup '$BACKUP_CODE/futurebit.sqlite'" 2>/dev/null; then
+    err "Could not back up the database; refusing to continue"
+    return 1
+  fi
+  return 0
+}
+
+restore_database() {
+  local b db
+  b="${BACKUP_CODE:-$(cat "$BACKUP_DIR/.last-code-backup" 2>/dev/null || true)}"
+  [ -n "$b" ] && [ -f "$b/futurebit.sqlite" ] || return 0
+  if ! db="$(resolve_database_url)"; then return 0; fi
+  err "Restoring the database from $b"
+  # The -wal and -shm belong to the forward-migrated database; leaving them beside
+  # a restored file would reintroduce exactly what is being rolled back. Callers
+  # must have stopped everything first.
+  rm -f "$db-wal" "$db-shm"
+  # Reported, not swallowed. This used to end in an unconditional `return 0`, so a
+  # cp that failed on a full or dying eMMC left the database migrated FORWARD while
+  # migrations/ was rolled back — the exact unbootable state this function exists
+  # to prevent — and the run still recorded a successful rollback.
+  if ! cp -p "$b/futurebit.sqlite" "$db"; then
+    err "Could not restore the database from $b"
+    return 1
+  fi
+  chown futurebit:futurebit "$db" 2>/dev/null || true
+  return 0
+}
+
+backup_units() {
+  UNIT_BACKUP="$BACKUP_DIR/units-pre-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$UNIT_BACKUP"
+  local unit
+  for unit in $UNITS; do
+    [ -f "$SYSTEMD_DIR/$unit.service" ] \
+      && cp -p "$SYSTEMD_DIR/$unit.service" "$UNIT_BACKUP/$unit.service"
+  done
+  [ -f "$RC_LOCAL" ] && cp -p "$RC_LOCAL" "$UNIT_BACKUP/rc.local"
+  UNITS_SAVED=1
+  return 0
+}
+
+restore_units() {
+  [ "$UNITS_SAVED" -eq 1 ] && [ -d "${UNIT_BACKUP:-}" ] || return 0
+  err "Restoring the previous systemd units"
+  local unit rc=0
+  for unit in $UNITS; do
+    if [ -f "$UNIT_BACKUP/$unit.service" ]; then
+      install -m 644 "$UNIT_BACKUP/$unit.service" "$SYSTEMD_DIR/$unit.service" || rc=1
+    elif [ -f "$SYSTEMD_DIR/$unit.service" ]; then
+      # Absent from the backup means the unit did not exist before this update —
+      # the release introduced it, and the code it runs has just been rolled
+      # back. Left installed and enabled, it points at an ExecStart the restored
+      # tree does not contain and fails on every boot. This asymmetry was fixed
+      # for the root files and missed here.
+      systemctl disable "$unit.service" >/dev/null 2>&1 || true
+      rm -f "$SYSTEMD_DIR/$unit.service" || rc=1
     fi
-
-    local requested_status
-    requested_status=$(<"$SOLO_REQUEST_FILE")
-    case "$requested_status" in
-        online|offline)
-            sqlite3 "$database_url" \
-                "UPDATE service_status
-                    SET status = 'pending',
-                        requested_status = '${requested_status}',
-                        requested_at = CURRENT_TIMESTAMP
-                  WHERE service_name = 'solo';"
-            ;;
-        '')
-            sqlite3 "$database_url" \
-                "UPDATE service_status
-                    SET requested_status = NULL,
-                        requested_at = NULL
-                  WHERE service_name = 'solo';"
-            ;;
-    esac
-
-    rm -f "$SOLO_REQUEST_FILE"
+  done
+  if [ -f "$UNIT_BACKUP/rc.local" ]; then
+    install -m 755 "$UNIT_BACKUP/rc.local" "$RC_LOCAL" || rc=1
+  fi
+  systemctl daemon-reload || true
+  return "$rc"
 }
 
-on_error() {
-    local status=$?
-    trap - ERR
-    restore_solo_intent || true
-    rm -f "$TMPFILE"
-    echo -e "${RED}Update failed; the system was not rebooted${NC}" >&2
-    exit "$status"
+# Nothing pruned these, so every update left a full copy of the tree it replaced
+# (~160 MB) plus its 40 MB tarball on a small eMMC. After a handful of updates the
+# disk preflight starts refusing every run, and the device silently stops being
+# able to take security fixes — the exact failure this mechanism exists to prevent.
+# Called only after a successful install, so the rollback target is never the one
+# being deleted.
+prune_backups() {
+  local d n=0
+  # One previous tree is kept: it is what a later manual recovery would use.
+  for d in $(ls -1dt "$BACKUP_DIR"/code-pre-* 2>/dev/null); do
+    n=$((n+1)); [ "$n" -le 1 ] && continue
+    rm -rf "$d"
+  done
+  n=0
+  for d in $(ls -1dt "$BACKUP_DIR"/units-pre-* 2>/dev/null); do
+    n=$((n+1)); [ "$n" -le 3 ] && continue
+    rm -rf "$d"
+  done
+  return 0
 }
-trap on_error ERR
+
+# Verifies the outcome of the stop, because the aggregate exit code of
+# `systemctl stop` reports unit *state* and not whether the shutdown did its job:
+# a perfectly clean bitcoind shutdown can still leave node.service "failed",
+# purely because it runs under a `screen` wrapper that exits non-zero.
+#
+# A function with explicit `if`s rather than `cmd && die` one-liners: it is the
+# form whose behaviour under `set -e` is obvious at a glance, and it is directly
+# exercised by tests/ota/rollback.test.sh for both the all-stopped and the
+# still-running case. (`cmd && die` turns out to be safe here — bash exempts the
+# left side of `&&` — but proving that took an experiment, which is reason enough
+# not to make the next reader repeat it.)
+verify_all_stopped() {
+  local u
+  for u in ckpool node apollo-miner apollo-ui-v2 apollo-api apollo-bootstrap; do
+    if systemctl is-active --quiet "$u.service"; then
+      die "$u.service did not stop; aborting update"
+    fi
+  done
+  # A unit can report inactive while its daemon survives: ckpool_stop.sh ends in
+  # `|| true` and ckpool_start.sh daemonises with -B, so the stop reports success
+  # with the process alive. An orphan holds the stratum port and its pre-update
+  # config, and the new instance then cannot bind.
+  if pgrep -u futurebit -x bitcoind >/dev/null 2>&1; then
+    die "Bitcoin node did not stop cleanly; aborting update"
+  fi
+  if pgrep -u futurebit -x ckpool >/dev/null 2>&1; then
+    die "ckpool did not stop cleanly; aborting update"
+  fi
+  return 0
+}
+
+# Order matters: node and apollo-miner have Requires=apollo-bootstrap, so
+# bootstrap goes last on the way down and first on the way up. It is stopped on
+# its own because everything above declares Requires= on it, and doing it in one
+# transaction makes systemd tear those units down while their own ExecStop is
+# still running — which left node.service "failed" on hardware.
+stop_services() {
+  systemctl stop ckpool.service node.service apollo-miner.service \
+    apollo-ui-v2.service apollo-api.service || true
+  systemctl stop apollo-bootstrap.service || true
+  return 0
+}
+
+# Same set the success path starts, and in the same order: bootstrap first,
+# because node and apollo-miner Require it. ckpool is deliberately absent — its
+# intent lives in the database and serviceMonitor acts on it.
+# Returns non-zero if the device is not serving afterwards.
+#
+# Every start is still `|| true` — a miner that will not come up must not stop
+# the UI from coming up — but the OUTCOME is checked, because the verdict depends
+# on it. Silence here let cleanup record `aborted`, whose banner says "your
+# device is untouched and still running v2.2.0", on a box whose API, UI, node and
+# miner were all down: the window between stopping the services and the first
+# mutation is real (verify_all_stopped has four separate `die`s in it), and
+# "we stopped your services and could not start them again" was a state the
+# vocabulary had no way to say.
+start_services() {
+  systemctl start apollo-bootstrap.service || true
+  systemctl start apollo-api.service apollo-ui-v2.service || true
+  systemctl start node.service apollo-miner.service || true
+  # The API is the one that decides whether this device can be reached at all —
+  # including to retry the update. But it cannot become active until
+  # apollo-bootstrap has, because it declares Requires= on it, and bootstrap is a
+  # oneshot that runs the knex migrations. On the rollback path the database has
+  # just been restored and those migrations re-run against it; on a device with
+  # thirty days of time-series on eMMC that is comfortably more than the twenty
+  # seconds this first waited — which turned a device that was fine a moment
+  # later into "SERVICES DID NOT COME BACK, this needs manual recovery over SSH".
+  #
+  # Same budget as the health check, for the same reason.
+  local waited=0 limit="${APOLLO_RESTART_TIMEOUT:-$HEALTH_TIMEOUT}"
+  while [ "$waited" -lt "$limit" ]; do
+    systemctl is-active --quiet apollo-api.service && return 0
+    # A bootstrap still running is progress, not a stall: say so rather than
+    # letting the log look like nothing is happening.
+    if [ $(( waited % 20 )) -eq 0 ] && systemctl is-active --quiet apollo-bootstrap.service; then
+      err "Waiting for apollo-bootstrap (migrations) before the API can start"
+    fi
+    sleep 2; waited=$(( waited + 2 ))
+  done
+  err "apollo-api did not come back within ${limit}s after restarting services"
+  return 1
+}
+
+# Put one entry back, deciding from the marker rather than from the mere presence
+# of a directory — and never deleting the only copy that exists.
+#
+# Taking b and complete as parameters, not reading them from an enclosing frame:
+# this used to be nested inside restore_code, so it leaked into the shell after
+# that returned while its two most important inputs resolved through bash's
+# dynamic scope. The test suite sources this file and drives these functions
+# directly, which is exactly the caller that reaches it without the frame — with
+# `b` empty, `rm -rf "${b:?}/$rel"` is the only thing between that and disaster.
+restore_entry() {  # backup_dir complete relative_path
+  local b="$1" complete="$2" rel="$3" live mark
+  live="$APOLLO_DIR/$rel"
+  mark="$(saved_marker "$b" "$rel")"
+
+  if [ -e "$b/$rel" ]; then
+    # Marked, or the last copy standing. The second case is what the marker alone
+    # got wrong: on ONE filesystem `mv` is an atomic rename, so an interruption
+    # between the rename and the marker leaves the tree complete in the backup,
+    # unmarked, and gone from the device — and the previous version's first act
+    # on the no-marker path was to delete the backup, destroying it from both
+    # places. That is the device's real configuration, not an edge case, and it
+    # was a regression against the `[ -e ]` test it replaced.
+    if [ -f "$mark" ] || [ ! -e "$live" ]; then
+      [ -f "$mark" ] || err "Backup of $rel is unverified, but it is the only copy left"
+      rm -rf "$live" || return 1
+      mkdir -p "$(dirname "$live")" || return 1
+      mv "$b/$rel" "$live" || return 1
+      return 0
+    fi
+    # Unmarked with the live copy still present: across filesystems `mv` is
+    # copy-then-delete, so this is a half-written copy made while the original
+    # stayed intact. The live one is already the previous version.
+    err "No complete backup of $rel; keeping the live copy"
+    rm -rf "${b:?}/$rel" 2>/dev/null || true
+    return 0
+  fi
+
+  # Nothing in the backup. With a COMPLETE backup that means the entry did not
+  # exist before the update, so whatever is there now came from the release and
+  # goes — the same rule ROOT_FILES and the units already used. With an
+  # incomplete one it means the save never reached it, so the live copy stands.
+  if [ "$complete" -eq 1 ]; then
+    rm -rf "$live" 2>/dev/null || true
+  fi
+  return 0
+}
+
+restore_code() {
+  local b; b="${BACKUP_CODE:-$(cat "$BACKUP_DIR/.last-code-backup" 2>/dev/null || true)}"
+  [ -n "$b" ] && [ -d "$b" ] || { err "No code backup to restore from"; return 1; }
+  # Only this run's backup. A pointer left by an earlier run resolves to a real,
+  # complete tree — prune_backups keeps one — so without this check a failure
+  # before backup_code ran would restore a release two versions old and overwrite
+  # the database with its snapshot, while reporting an ordinary rollback.
+  if [ "$(cat "$b/.run-id" 2>/dev/null || true)" != "$RUN_ID" ]; then
+    err "Refusing to restore $b: it belongs to a different update run"
+    return 1
+  fi
+  err "Restoring the previous code from $b"
+
+  # Did backup_code finish? If it aborted partway — ENOSPC, EIO, a signal — then
+  # some directories were moved into the backup and the rest are still live and
+  # intact. Deleting a live directory that the backup cannot replace destroys the
+  # good copy: a failure at `migrations` used to take out node_modules and
+  # backend/ too, leaving the device without even backend/update to retry with.
+  local complete=0
+  [ -f "$b/.complete" ] && complete=1
+
+  local rc=0 d f
+  restore_database || rc=1
+
+  for d in $OWNED; do restore_entry "$b" "$complete" "$d" || rc=1; done
+  restore_entry "$b" "$complete" "apolloui-v2/.next" || rc=1
+
+  for f in $ROOT_FILES; do
+    if [ -e "$b/$f" ]; then
+      cp -p "$b/$f" "$APOLLO_DIR/$f" || rc=1
+    elif [ "$complete" -eq 1 ]; then
+      # Only a COMPLETE backup lets an absence mean "it did not exist before" —
+      # which is how a first-ever version.json gets removed on rollback.
+      rm -f "$APOLLO_DIR/$f" || rc=1
+    fi
+  done
+
+  chown -R futurebit:futurebit "$APOLLO_DIR" || true
+  restore_units || rc=1
+  return "$rc"
+}
+
+health_ok() {
+  local deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    # -L: the UI answers / with a 308 to /overview, which -fsS alone would accept
+    # even from a server that cannot serve a page.
+    if curl -fsS --max-time 5 --url "$HEALTH_URL" >/dev/null 2>&1 \
+       && curl -fsSL --max-time 5 --url "$UI_HEALTH_URL" >/dev/null 2>&1; then return 0; fi
+    sleep 3
+  done
+  return 1
+}
+
+# --- run ---------------------------------------------------------------------
+# Everything above is definitions; the tests source the file to here and stop.
+[ -n "${APOLLO_UPDATE_LIB:-}" ] && return 0
 
 rm -f "$TMPFILE"
-echo "10" > "$TMPFILE"
+progress "starting" 5
 
-# Preserve solo intent across the first update to a monitor version that
-# understands the update marker. /run is root-owned and cleared on reboot.
-if [ ! -e "$SOLO_REQUEST_FILE" ] && preserve_db=$(resolve_database_url); then
-    requested_status=$(sqlite3 "$preserve_db" \
-        "SELECT COALESCE(requested_status, '')
-           FROM service_status
-          WHERE service_name = 'solo'
-          ORDER BY id DESC
-          LIMIT 1;" 2>/dev/null || true)
-    (umask 077; printf '%s\n' "$requested_status" > "$SOLO_REQUEST_FILE")
+# Self-provision rather than refuse. Devices already in the field have none of
+# jq, zstd or cosign — nothing ever installed them — so a hard gate here left the
+# whole fleet unable to take a single OTA update without someone SSHing in.
+if ! have jq || ! have zstd || ! have cosign; then
+  log "Installing update dependencies"
+  DEPS_SCRIPT="$APOLLO_DIR/backend/utils/install-update-deps.sh"
+  [ -x "$DEPS_SCRIPT" ] && "$DEPS_SCRIPT" || err "Could not install update dependencies"
+fi
+for t in curl jq zstd sha256sum sqlite3 cosign; do
+  have "$t" || die "Missing dependency: $t (install it before updating)"
+done
+
+# The channel URL is assembled from source.conf, which the app user can write, so
+# it gets the same schema check as the URLs inside the manifest. Without it an
+# APOLLO_GIT_BASE of http://… downgrades the fetch and makes the manifest — the
+# input to everything below — trivially MITM-able.
+valid_url "$CHANNEL_URL" || die "Update channel is not a plain https URL"
+
+# Said out loud, first thing, because the sandbox override is easy to lose:
+# `sudo` strips APOLLO_* without -E, and the run then silently targets the real
+# install. One line in the log is what turns that into something an operator can
+# notice before it matters.
+log "Updating $APOLLO_DIR (state in $STATE_DIR)"
+log "Checking ${CHANNEL} channel"
+MANIFEST="$(fetch "$CHANNEL_URL")" || die "Cannot reach the update channel"
+VERSION="$(jq -r '.version // empty' <<<"$MANIFEST")"
+URL="$(jq -r '.url // empty' <<<"$MANIFEST")"
+SIG_URL="$(jq -r '.signature_url // empty' <<<"$MANIFEST")"
+CERT_URL="$(jq -r '.certificate_url // empty' <<<"$MANIFEST")"
+SHA="$(jq -r '.sha256 // empty' <<<"$MANIFEST")"
+SIZE="$(jq -r '.size // 0' <<<"$MANIFEST")"
+
+valid_version "$VERSION" || die "Manifest version '$VERSION' is not a valid version"
+for u in "$URL" "$SIG_URL" "$CERT_URL"; do
+  valid_url "$u" || die "Manifest contains a URL that is not a plain https URL"
+done
+single_line "$SHA" && printf '%s' "$SHA" | grep -qE '^[0-9a-f]{64}$' || die "Manifest sha256 is malformed"
+# SIZE is used in an arithmetic expansion below, and bash re-evaluates a variable's
+# value there as an expression — array subscripts inside it undergo full expansion,
+# so an unvalidated size of the form `x[$(cmd)]` runs cmd as root. That happens
+# BEFORE the checksum and cosign checks, which would bypass signing entirely.
+valid_number "$SIZE" || die "Manifest size is malformed"
+
+CURRENT="$(current_version || true)"
+if [ -n "$CURRENT" ] && valid_version "$CURRENT"; then
+  # COMPLETED first: without it this `exit 0` runs the EXIT trap with the flag
+  # still 0, so cleanup took the failure branch — a device that is simply up to
+  # date wrote -1, printed "Update failed" and exited 1. It is also the most
+  # easily reached path in the script.
+  if [ "$CURRENT" = "$VERSION" ]; then
+    log "Already on $VERSION"
+    COMPLETED=1
+    # A terminal outcome for the run the user started, so a client waiting on it
+    # stops waiting instead of timing out on an update that was never needed.
+    write_state succeeded "already up to date" 100 "Already on $VERSION"
+    rm -f "$TMPFILE"
+    exit 0
+  fi
+  version_gt "$VERSION" "$CURRENT" || die "Refusing to move from $CURRENT to older/equal $VERSION"
 fi
 
-# The node executes binaries and configuration selected from this checkout.
-# Stop it before replacing either repository; systemd will start it after reboot.
-systemctl stop ckpool.service
-systemctl stop node.service
+# Peak usage is the tarball plus the unpacked tree plus the backup of what it
+# replaces; ask for a generous multiple of the artifact size.
+NEED_KB=$(( (SIZE / 1024) * 4 + 262144 ))
+# Both filesystems: the tree is unpacked under APOLLO_DIR but the backup and the
+# download land under STATE_DIR, which is not necessarily the same mount. Created
+# first, because df on a path that does not exist reports nothing.
+mkdir -p "$STATE_DIR"
+for target in "$APOLLO_DIR" "$STATE_DIR"; do
+  FREE_KB=$(df -Pk "$target" | awk 'NR==2 {print $4}')
+  [ "$FREE_KB" -ge "$NEED_KB" ] \
+    || die "Not enough disk space on $target: need ~$((NEED_KB/1024)) MB, have $((FREE_KB/1024)) MB"
+done
 
-if systemctl is-active --quiet ckpool.service ||
-   pgrep -u futurebit -x ckpool >/dev/null 2>&1; then
-    echo -e "${RED}CKPool did not stop cleanly; aborting update${NC}" >&2
-    false
+# Staging dirs from a run that was killed before its trap could fire; each holds
+# a full unpacked release and nothing else ever removes them.
+rm -rf "$APOLLO_DIR"/.staging.* 2>/dev/null || true
+
+log "Downloading $VERSION"
+progress "downloading" 15
+mkdir -p "$DL_DIR" "$BACKUP_DIR"
+TARBALL="$DL_DIR/apollo-${VERSION}-aarch64.tar.zst"
+# Never resume onto a complete-but-wrong file: verify a cached copy, else refetch.
+if [ -f "$TARBALL" ] && [ "$(sha256_of "$TARBALL")" = "$SHA" ]; then
+  log "Using verified cached download"
+else
+  rm -f "$TARBALL"
+  curl -fL --retry 3 --connect-timeout 15 --max-time 1800 -o "$TARBALL" --url "$URL"
 fi
-if systemctl is-active --quiet node.service ||
-   pgrep -u futurebit -x bitcoind >/dev/null 2>&1; then
-    echo -e "${RED}Bitcoin node did not stop cleanly; aborting update${NC}" >&2
-    false
+curl -fsSL --max-time 120 -o "$TARBALL.sig"  --url "$SIG_URL"
+curl -fsSL --max-time 120 -o "$TARBALL.pem"  --url "$CERT_URL"
+
+progress "verifying" 35
+log "Verifying"
+GOT="$(sha256_of "$TARBALL")"
+[ "$GOT" = "$SHA" ] || die "Checksum mismatch (expected $SHA, got $GOT)"
+cosign verify-blob --certificate "$TARBALL.pem" --signature "$TARBALL.sig" \
+  --certificate-identity-regexp "$TRUST_IDENTITY" \
+  --certificate-oidc-issuer "$TRUST_ISSUER" "$TARBALL" >/dev/null 2>&1 \
+  || die "Signature verification failed — refusing to install"
+
+progress "unpacking" 45
+log "Unpacking"
+STAGING="$(mktemp -d "${APOLLO_DIR}/.staging.XXXXXX")"
+tar -C "$STAGING" --zstd --no-same-owner -xf "$TARBALL"
+STAGED_VERSION="$(jq -r '.version // empty' "$STAGING/version.json" 2>/dev/null || true)"
+[ "$STAGED_VERSION" = "$VERSION" ] || die "Artifact is version '$STAGED_VERSION', manifest said '$VERSION'"
+[ -f "$STAGING/apolloui-v2/.next/standalone/server.js" ] || die "Artifact has no standalone UI server"
+
+# Everything the swap will move must be here BEFORE the device's copy is taken
+# away. The install loop skipped anything missing, so an artifact built without
+# backend/ (a staging regression, a truncated pipe in the release workflow)
+# completed "successfully" with backend/ simply gone: node, miner and ckpool dead
+# pointing at scripts that no longer existed, and all eight unit installs quietly
+# skipped — while the health probe passed, because the API and UI start fine.
+for d in $OWNED; do
+  [ -e "$STAGING/$d" ] || die "Artifact is missing $d — refusing to install"
+done
+# The same guard for the units. Installed "if present", a release that lost
+# node.service would install cleanly, leave the PREVIOUS unit definition in place
+# pointing at an ExecStart the new backend/ no longer contains, and still pass the
+# health check — which only probes the API and the UI.
+for unit in $UNITS; do
+  [ -e "$STAGING/backend/systemd/$unit.service" ] \
+    || die "Artifact is missing the $unit unit — refusing to install"
+done
+# The updater's own runtime dependencies, which the `backend/` existence test
+# above cannot see. version.sh is sourced before the ERR trap is armed, so a
+# release that lost it installs cleanly, passes the health check, and then kills
+# every FUTURE update on that device with no record of why.
+for f in backend/lib/version.sh backend/utils/install-update-deps.sh; do
+  [ -e "$STAGING/$f" ] || die "Artifact is missing $f — refusing to install"
+done
+# bitcoind now travels in the release, so its absence is a broken artifact and
+# not a device that simply never had it. Checked BEFORE the swap, because
+# backend/ is replaced wholesale: installing an artifact without it would leave
+# the device with no node at all.
+#
+# The invariant is the flavour this device is CONFIGURED to run, not every
+# flavour that happens to be on its disk. Demanding a superset of the disk made
+# each release a permanent, SSH-only dead end the moment a flavour was retired:
+# a device on release N would refuse release N+1 forever, and the only thing that
+# could fix it is the release it refuses. A stray `core-29.2.bak` left by an SSH
+# session became a phantom flavour with the same effect, and the unquoted $(ls)
+# word-split and glob-expanded on the way there. It also contradicted the plan
+# already written into release.yml — bitcoind as its own on-demand package builds
+# an artifact with no backend/node/bin/*/aarch64/bitcoind at all.
+#
+# Skipped entirely when the artifact ships no bin/ directory: that is what step 6
+# looks like, and this check must not be the thing that blocks it.
+if [ -d "$STAGING/backend/node/bin" ]; then
+  NODE_FLAVOUR=''
+  if db="$(resolve_database_url)"; then
+    NODE_FLAVOUR="$(sqlite3 "$db" "SELECT COALESCE(node_software,'') FROM settings ORDER BY created_at DESC, id DESC LIMIT 1;" 2>/dev/null || true)"
+  fi
+  single_line "$NODE_FLAVOUR" || NODE_FLAVOUR=''
+  if [ -n "$NODE_FLAVOUR" ]; then
+    [ -x "$STAGING/backend/node/bin/$NODE_FLAVOUR/aarch64/bitcoind" ] \
+      || die "Artifact is missing bitcoind for $NODE_FLAVOUR, the flavour this device runs — refusing to install"
+  else
+    # Settings unreadable — a DB being migrated, a fresh device. We cannot name
+    # the flavour, but an artifact carrying a bin/ directory with no bitcoind in
+    # it at all is broken whatever the device runs.
+    err "Could not read the configured node flavour; checking the artifact carries at least one"
+    ls "$STAGING"/backend/node/bin/*/aarch64/bitcoind >/dev/null 2>&1 \
+      || die "Artifact carries no bitcoind at all — refusing to install"
+  fi
+fi
+for f in $ROOT_FILES; do
+  [ -e "$STAGING/$f" ] || die "Artifact is missing $f — refusing to install"
+done
+
+# Preserve solo intent before anything stops. /run is cleared on reboot.
+if [ ! -e "$SOLO_REQUEST_FILE" ] && db="$(resolve_database_url)"; then
+  requested="$(sqlite3 "$db" "SELECT COALESCE(requested_status,'') FROM service_status WHERE service_name='solo' ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)"
+  (umask 077; printf '%s\n' "$requested" > "$SOLO_REQUEST_FILE")
 fi
 
-git config --global --add safe.directory "$APOLLO_DIR"
-git config --global --add safe.directory "$UI_DIR"
+progress "stopping services" 60
+log "Stopping services"
+# Armed before the stop, so a failure during it still restarts what went down.
+STOPPED=1
+# Everything the release owns is stopped, not just what reads from the checkout.
+# `systemctl start` on an already-active unit is a no-op, so a unit left running
+# here is a unit that never picks up the new release — the v2.2 script got away
+# with a partial list only because it ended in a reboot. apollo-miner kept running
+# the old binary out of the backup directory; apollo-bootstrap is Type=oneshot
+# with RemainAfterExit=yes, so leaving it active meant its migrations never ran.
+#
+# Order matters: node and apollo-miner have Requires=apollo-bootstrap, so
+# bootstrap goes last on the way down and first on the way up.
+stop_services
 
-# Where to pull from. source.conf is authoritative: a device installed from one
-# source can be pointed at another, but its checkout keeps the remote it was
-# cloned with until we reconcile it here.
-. "${APOLLO_DIR}/backend/lib/source-config.sh"
-echo -e "${YELLOW} ---> Code source: ${APOLLO_GIT_BASE}${NC}"
-git -C "$APOLLO_DIR" remote set-url origin "$APOLLO_API_URL"
-git -C "$UI_DIR" remote set-url origin "$APOLLO_UI_URL"
+# The aggregate exit code of `systemctl stop` is deliberately ignored, because it
+# reports unit *state* and not whether the shutdown did its job: the same clean
+# bitcoind shutdown can leave node.service "failed" purely through that screen
+# wrapper. What actually matters is verified here instead — nothing still running.
+verify_all_stopped
+
+progress "installing" 70
+log "Installing $VERSION"
+# Claimed before MUTATED, so the pointer this run will be restored from exists
+# before anything can go wrong.
+claim_backup
+MUTATED=1
+backup_code
+for d in $OWNED; do [ -e "$STAGING/$d" ] && mv "$STAGING/$d" "$APOLLO_DIR/$d"; done
+mkdir -p "$UI_DIR/.next"
+mv "$STAGING/apolloui-v2/.next/standalone" "$UI_DIR/.next/standalone"
+for f in $ROOT_FILES; do
+  [ -e "$STAGING/$f" ] && cp "$STAGING/$f" "$APOLLO_DIR/$f"
+done
+# Device state lives outside the release and is never touched: .env,
+# apolloui-v2/.env, and everything under the state dir.
 chown -R futurebit:futurebit "$APOLLO_DIR"
 
-git -C "$APOLLO_DIR" reset --hard
-git -C "$APOLLO_DIR" pull --ff-only
-git -C "$UI_DIR" reset --hard
-git -C "$UI_DIR" pull --ff-only
+progress "applying units" 85
+log "Applying units and configuration"
+# Snapshot the live units first: they are overwritten and enabled below, and a
+# rollback that restores only the code leaves the device booting old code under
+# the new release's units.
+backup_units
+for unit in $UNITS; do
+  [ -f "$APOLLO_DIR/backend/systemd/$unit.service" ] \
+    && install -m 644 "$APOLLO_DIR/backend/systemd/$unit.service" "$SYSTEMD_DIR/$unit.service"
+done
+[ -f "$APOLLO_DIR/backend/rc.local" ] && install -m 755 "$APOLLO_DIR/backend/rc.local" "$RC_LOCAL"
+systemctl daemon-reload
+# Every installed unit, and failures are reported. The old updater enabled seven
+# unconditionally; this had dropped swap.service — silently removing swap at the
+# next boot on a 4 GB board — and swallowed every error with `|| true`, so an
+# enable that failed still recorded a successful update and the device came back
+# from its next power cycle with no API, no UI and no mining.
+#
+# ckpool is deliberately absent: its enablement is the user's solo-mining choice,
+# held in the database and acted on by serviceMonitor.
+for unit in $UNITS; do
+  [ "$unit" = ckpool ] && continue
+  [ -f "$SYSTEMD_DIR/$unit.service" ] || continue
+  # A failure here is a failed update, not a warning. The comment above names the
+  # consequence exactly — the device comes back from its next power cycle with no
+  # API, no UI and no mining — and `err` deliberately does not set FAIL_REASON,
+  # so the run went on to record `succeeded` and the banner turned green over a
+  # device that would never boot properly again. The pre-tarball updater aborted
+  # on this; downgrading it to a log line was a regression.
+  #
+  # This runs before the health gate, so `die` takes the ordinary rollback path
+  # and the device keeps the release it was already running.
+  systemctl enable "$unit.service" >/dev/null 2>&1 \
+    || die "Could not enable $unit.service — the device would not start it at boot"
+done
 
-chown -R futurebit:futurebit "$APOLLO_DIR"
-echo "20" > "$TMPFILE"
+# The firewall is applied directly rather than by restarting rc-local.service:
+# rc.local also runs backend/first_run, which partitions, mounts and resizes
+# storage — not something to repeat mid-update. backend/firewall is safe to
+# re-run on its own because it opens by flushing every chain.
+if [ -x "$APOLLO_DIR/backend/firewall" ]; then
+  "$APOLLO_DIR/backend/firewall" >/dev/null 2>&1 || err "Firewall rules were not applied"
+fi
 
-echo -e "${YELLOW} ---> Running update_system script${NC}"
-bash "${APOLLO_DIR}/backend/update_system"
+restore_solo_intent
+
+# Below 90, the threshold an older UI bundle reads as "done". Two gates that can
+# still trigger a full rollback come AFTER this point — the node failing to start,
+# and the health check timing out — so anything here that reads as success tells
+# the user the update worked while the device is reverting.
+progress "starting services" 88
+log "Starting services"
+# bootstrap first: it owns the migrations, and node/miner Require it, so starting
+# it later would bounce them right after they came up.
+systemctl start apollo-bootstrap.service
+systemctl start apollo-api.service apollo-ui-v2.service
+# What the user asked for, for the two services they can turn off from the UI.
+#
+# Only `solo` had its intent preserved. node and apollo-miner were started
+# unconditionally, and the old updater got away with it because it ended in a
+# reboot, where boot-time reconciliation re-applied requested_status. This one
+# never reboots: the updater exits, apollo-update.service disappears, and on the
+# next 10-second poll serviceMonitor sees a unit active while the database says
+# offline, outside every grace period — which it reads as the user having started
+# it by hand, and writes requested_status='online'. So every update silently
+# turned a deliberately stopped miner back on, permanently, in a way nothing can
+# tell apart from a real manual start.
+wanted() {  # service name in service_status -> 0 if the user wants it running
+  local db requested
+  db="$(resolve_database_url)" || return 0   # unknown: start it, as before
+  requested="$(sqlite3 "$db" "SELECT COALESCE(requested_status,'') FROM service_status WHERE service_name='$1' ORDER BY id DESC LIMIT 1;" 2>/dev/null || true)"
+  [ "$requested" != "offline" ]
+}
+
+# A node that will not start is a failed update — health_ok only probes the API
+# and the UI, so without this a device with a dead Bitcoin node reported success.
+# ExecCondition (node_storage_ready.sh) declining is not a failure, so a device
+# whose disk is not ready still passes here.
+if wanted node; then
+  systemctl start node.service || die "Bitcoin node did not start after installing $VERSION"
+else
+  err "Leaving node.service stopped: it was turned off before the update"
+fi
+# The miner stays a warning: solo-node devices have no miner hardware at all.
+if wanted miner; then
+  systemctl start apollo-miner.service || err "The miner did not start cleanly"
+else
+  err "Leaving apollo-miner.service stopped: it was turned off before the update"
+fi
+health_ok || die "Health check failed after installing $VERSION"
+
+COMPLETED=1
+write_state succeeded "done" 100
+
+# The verified download is only useful for retrying a failed install, so it goes
+# once the install has succeeded.
+rm -f "$TARBALL" "$TARBALL.sig" "$TARBALL.pem"
+prune_backups
+
+# The one thing the pre-update UI bundle can act on.
+#
+# That bundle polls Mcu.updateProgress and completes on `value >= 90`; the run
+# deliberately stops at 88 because two gates that can still roll everything back
+# come after it. Without this it reads 0 after reconnecting and sits on
+# "Updating... 0%" with its close button hidden, after a SUCCESSFUL update, and
+# the modal tells the user not to power off — so the natural response is to keep
+# waiting rather than to reload.
+#
+# Four attempts were made to synthesise this in the API, from the record. Every
+# one traded a defect for another, because they inferred a browser's signal from
+# device state that browser never touches. Here it is not an inference: the
+# updater is the only thing that knows the run finished and that the release was
+# kept, and it says so in the file that bundle is already reading.
+#
+# Left behind on purpose, and safe now in a way it was not: the next run
+# truncates it before doing anything, and the two consumers that made a leftover
+# dangerous are gone — serviceMonitor asks systemd, and the current bundle reads
+# the record. What remains is a tab still running the PRE-update bundle, for
+# which "the update finished" is true.
+#
+# Only on success. A rollback leaves it removed by cleanup, because that bundle
+# has no way to render a failure and 100 would render as "Done!".
+echo 100 > "$TMPFILE"
+log "Updated to $VERSION"

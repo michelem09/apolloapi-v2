@@ -222,8 +222,8 @@ module.exports = {
 
     version: async (_, __, { services }) => {
       try {
-        const result = await services.mcu.getVersion();
-        return { result, error: null };
+        const { result, installed, available } = await services.mcu.getVersion();
+        return { result, installed, available, error: null };
       } catch (error) {
         return { result: null, error: { message: error.message } };
       }
@@ -232,6 +232,15 @@ module.exports = {
     updateProgress: async (_, __, { services }) => {
       try {
         const result = await services.mcu.getUpdateProgress();
+        return { result, error: null };
+      } catch (error) {
+        return { result: null, error: { message: error.message } };
+      }
+    },
+
+    updateStatus: async (_, __, { services }) => {
+      try {
+        const result = await services.mcu.getUpdateStatus();
         return { result, error: null };
       } catch (error) {
         return { result: null, error: { message: error.message } };

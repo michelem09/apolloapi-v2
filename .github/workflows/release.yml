@@ -18,6 +18,27 @@ permissions:
   contents: write   # create the Release and upload assets
   id-token: write   # OIDC token for cosign keyless signing
 
+# One release at a time, PER TAG — not one release at a time overall.
+#
+# A shared group does not serialise: GitHub keeps at most one pending run per
+# group and cancels the previous pending one when a new run arrives, and
+# cancel-in-progress only protects the run already executing. Three tags pushed
+# within a few minutes — shipping a fix on top of a fix, which is this branch's
+# actual working pattern — meant the middle one was cancelled outright: no
+# tarball, no signature, no manifest, no Release, and no alert either, because a
+# cancelled run is not a failed run. The tag existed in git with nothing behind
+# it.
+#
+# Keyed on the ref, every release runs. What the shared group was reaching for —
+# the channel pointer is uploaded with --clobber, so two releases finishing out
+# of order could leave the channel pointing BACKWARDS, and a device on the newer
+# release then refuses to install it ("refusing to move to older/equal") — is
+# handled where it belongs, in the pointer step itself, which now refuses to
+# move the channel to an older version.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   # The one place that decides what counts as an official build.
   OFFICIAL_OWNER: jstefanop
@@ -160,12 +181,37 @@ jobs:
           # copying them again would nest them a second time.
           cp -r apolloui-v2/.next/standalone "$STAGE/apolloui-v2/.next/standalone"
 
-          # backend/ carries the launch scripts, systemd units and the small
-          # miner/ckpool binaries. bitcoind (backend/node/bin, ~214 MB across four
-          # flavours) is deliberately excluded: it ships as its own package, which
-          # is the whole reason the tarball can stay small.
+          # backend/ carries the launch scripts, systemd units, the small
+          # miner/ckpool binaries — and bitcoind.
+          #
+          # bitcoind used to be excluded to keep the tarball small, and carried
+          # across the swap from whatever the device already had. But the LIST of
+          # selectable flavours travels in the release (the GraphQL enum, the UI
+          # picker, node_start.sh), so a device imaged before core-31.0 existed
+          # would take an update, be offered Core 31.0 in Settings, and get a
+          # node.service that crash-loops on "executable not found" with no way
+          # out from the UI. Only step 6 — bitcoind as its own on-demand package —
+          # makes excluding it safe, and shipping the updater before that would
+          # leave customers exactly there.
+          #
+          # x86_64 is dropped: devices are aarch64, and it is more than half the
+          # weight (111 MB of 214 MB).
           mkdir -p "$STAGE/backend"
-          tar -C backend --exclude='node/bin' -cf - . | tar -C "$STAGE/backend" -xf -
+          tar -C backend --exclude='node/bin/*/x86_64' -cf - . | tar -C "$STAGE/backend" -xf -
+
+          # Materialize the miner/ckpool runtime binaries the launch scripts call.
+          # They are install-time artifacts copied from bin/<arch>/, not tracked
+          # files, so without this the artifact ships the scripts without the
+          # binaries. They are small (~6 MB), so shipping them keeps the device's
+          # backend/ fully owned by the release — only bitcoind is inherited.
+          m="$STAGE/backend/apollo-miner"
+          install -m 755 "$m/bin/aarch64/apollo-miner"    "$m/futurebit-miner"
+          install -m 755 "$m/bin/aarch64/apollo-miner-v2" "$m/futurebit-miner-v2"
+          # Apollo III: miner_start.sh launches futurebit-miner-v3, and backend/ is
+          # replaced wholesale, so leaving it out stops the III's internal miner.
+          install -m 755 "$m/bin/aarch64/apollo-miner-v3" "$m/futurebit-miner-v3"
+          install -m 755 "$m/bin/aarch64/apollo-helper"   "$m/apollo-helper"
+          install -m 755 "$STAGE/backend/ckpool/bin/aarch64/ckpool" "$STAGE/backend/ckpool/ckpool"
 
           # These arrive with steps 4 and 5; included automatically once they exist.
           [ -f bin/apollo-update ] && install -Dm755 bin/apollo-update "$STAGE/bin/apollo-update" || true
@@ -198,7 +244,12 @@ jobs:
           echo "size=$SIZE"   >> "$GITHUB_OUTPUT"
           echo "$TARBALL: $((SIZE/1024/1024)) MB, sha256 $SHA"
 
+      # Pinned, and deliberately the same version devices install via
+      # backend/utils/install-update-deps.sh. Left floating, the signing side
+      # drifts while the verifying side stays fixed on hardware nobody upgrades.
       - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.5.2
 
       - name: Sign the artifact (keyless)
         env:
@@ -265,6 +316,15 @@ jobs:
           cat "apollo-${VERSION}-manifest.json"
 
       - name: Publish the Release
+        # Tag pushes only, exactly like the channel step below. Without this a
+        # workflow_dispatch dry run created the git tag at the branch head plus a
+        # public Release — and `gh release create` is not idempotent, so the real
+        # `git push origin v<version>` was then rejected, and forcing it made the
+        # workflow die here with "release already exists". The same
+        # non-idempotency broke "Re-run failed jobs": a transient failure in the
+        # final upload restarted from step one and died here, leaving a fully
+        # signed release the channel permanently did not point at.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.meta.outputs.version }}
@@ -283,7 +343,8 @@ jobs:
             if [ "$CHANNEL" = "dev" ]; then
               printf '\n> **Development build.** Built outside the official repository, so its\n'
               printf '> signing identity differs and production devices reject it by design.\n'
-              printf '> `bitcoind` is not bundled — it ships as a separate package.\n'
+              printf '> `bitcoind` IS bundled (six aarch64 flavours) until it moves\n'
+              printf '> to separate on-demand packages.\n'
             fi
           } > "$NOTES"
 
@@ -298,6 +359,14 @@ jobs:
             "apollo-${VERSION}-manifest.json"
 
       - name: Point the channel at this release
+        # Tag pushes only. On a workflow_dispatch the cosign certificate carries
+        # …/release.yml@refs/heads/<branch>, while a device's trust regexp — root
+        # owned, deliberately not overridable from source.conf — requires
+        # @refs/tags/v. So a dry run that moved the pointer would give the whole
+        # fleet a 40 MB download that every device is guaranteed to reject at
+        # signature verification, and the channel would stay poisoned until
+        # someone pushed a real tag.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
           CHANNEL: ${{ steps.meta.outputs.channel }}
@@ -317,5 +386,85 @@ jobs:
               --notes "Moving pointer to the latest ${CHANNEL} build. Not a release: the assets here are replaced on every build."
           fi
 
-          gh release upload "$POINTER" "${CHANNEL}.json" --clobber
-          echo "channel manifest now points at ${VERSION}"
+          # THE comparison, not a second one written to agree with it.
+          #
+          # This guard shipped comparing with `sort -V`, under a comment claiming
+          # parity with the updater. sort -V ranks 2.3.0-rc1 ABOVE 2.3.0 — the
+          # trap version_gt's own comment opens by warning about, and which
+          # semver.js repeats — so the first rc→final sequence would have frozen
+          # the channel: workflow green, artifact signed, pointer never moved, no
+          # device ever offered it. Sourcing the updater makes agreement
+          # structural instead of aspirational.
+          # The comparison and nothing else. Sourcing backend/update itself also
+          # applied `set -Eeuo pipefail` to the rest of this step and ran that
+          # script's top-level code — /dev/urandom, /etc/apollo/update.conf, a
+          # state dir the runner does not have — so any future addition to it
+          # would have silently changed how releases are published.
+          # shellcheck disable=SC1091
+          source backend/lib/version.sh
+
+          # stderr, and never called from inside a command substitution: `$( )`
+          # captures stdout, so an `::error::` written there landed in the
+          # variable instead of the log and the step failed with nothing said
+          # about why — on a transient 5xx during a release, which is precisely
+          # when the maintainer needs to be told.
+          die_step() { echo "::error::$*" >&2; exit 1; }
+
+          read_pointer() {
+            # Absent is not the same as unreadable. A first release legitimately
+            # has no pointer; a rate limit or a 5xx must not be read as one, or
+            # the guard silently disables itself on exactly the runs where two
+            # releases are in flight.
+            if ! gh release view "$POINTER" >/dev/null 2>&1; then
+              printf ''
+              return 0
+            fi
+            rm -f current-channel.json
+            # An unreadable pointer is not an absent one: swallowing the failure
+            # disabled the guard on exactly the runs where two releases are in
+            # flight. Reported through the exit status, because the caller reads
+            # this function's stdout.
+            gh release download "$POINTER" --pattern "${CHANNEL}.json" \
+              --output current-channel.json || return 1
+            jq -r '.version // empty' current-channel.json
+          }
+
+          # Compare-and-set, retried, because releases are only serialised per
+          # tag: two tags pushed a minute apart — the working pattern this branch
+          # was built with — run concurrently, and `--clobber` is last-writer-
+          # wins. A single check before the upload cannot prevent an older run
+          # overwriting a newer one afterwards. Re-reading after the write does:
+          # whoever is newest keeps re-uploading until it sticks, and whoever is
+          # older stops as soon as it sees something newer.
+          for attempt in 1 2 3; do
+            CURRENT_POINTER="$(read_pointer)" \
+              || die_step "could not read the current ${CHANNEL} pointer"
+            # An unparseable EXISTING pointer is a data fault, not a reason to
+            # stand down. version_gt refuses to order anything it cannot parse,
+            # so garbage in the pointer — a hand-edited file, a partial upload, a
+            # "version": "latest" someone tried — made every future release take
+            # the "leave it alone" branch and exit 0. The channel froze
+            # permanently while the workflow stayed green, the artifact signed,
+            # and no device was ever offered it. ::notice:: is the least visible
+            # annotation GitHub has and never reaches the run summary.
+            if [ -n "$CURRENT_POINTER" ] && ! version_parsable "$CURRENT_POINTER"; then
+              die_step "channel ${CHANNEL} points at '${CURRENT_POINTER}', which is not a version — fix the pointer by hand"
+            fi
+            if [ -n "$CURRENT_POINTER" ] && [ "$CURRENT_POINTER" != "$VERSION" ] \
+               && ! version_gt "$VERSION" "$CURRENT_POINTER"; then
+              echo "::warning::channel ${CHANNEL} points at ${CURRENT_POINTER}, which is not older than ${VERSION} — leaving it alone"
+              exit 0
+            fi
+
+            gh release upload "$POINTER" "${CHANNEL}.json" --clobber
+            sleep 5
+
+            SETTLED="$(read_pointer)" \
+              || die_step "could not re-read the ${CHANNEL} pointer after writing"
+            if [ "$SETTLED" = "$VERSION" ]; then
+              echo "channel manifest now points at ${VERSION}"
+              exit 0
+            fi
+            echo "::warning::pointer became ${SETTLED} after our write (attempt ${attempt})"
+          done
+          die_step "could not settle the ${CHANNEL} pointer on ${VERSION}"

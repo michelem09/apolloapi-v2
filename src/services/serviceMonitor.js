@@ -10,6 +10,19 @@ const log = require('../logger')('service-monitor');
 
 const execAsync = promisify(exec);
 
+const UPDATE_UNIT = 'apollo-update.service';
+
+// Whether an update is running, asked of systemd rather than inferred from a file.
+//
+// This used to read /tmp/update_progress: first its existence, then its value.
+// Both latch. Nothing clears that file except the NEXT run of backend/update, and
+// devices do not reboot on their own — so an updater killed during the health
+// check (an up-to-90-second window in which everything is already running and the
+// box stays online) left a mid-range value behind forever. From then on this
+// returned true on every poll, and the block it guards — manual start/stop
+// reconciliation AND the auto-restart of a crashed bitcoind or miner — was
+// skipped for good, on a device that had just been through a failed update and
+// needed that recovery most.
 class ServiceMonitor {
   constructor(knex, services) {
     this.knex = knex;
@@ -145,20 +158,36 @@ class ServiceMonitor {
   }
 
   // Read a unit's systemd activation state, normalizing is-active exit codes.
+  // The unit's state, or null when we could not ask.
+  //
+  // `is-active` exits 3 for inactive and 4 for no-such-unit, so the catch is the
+  // NORMAL path — and collapsing everything else into 'unknown' hid the case
+  // that matters. A fork failing for another reason (EAGAIN or ENOMEM while the
+  // updater unpacks and backs up hundreds of megabytes, which is the memory
+  // pressure this redesign exists to remove; a hung dbus) is not information
+  // about the unit, and treating it as such is how a deliberate stop becomes a
+  // recorded user decision. Same fix mcu._updateUnitActive got — this file asks
+  // the identical question of the identical unit and was left behind.
   async _systemctlStatus(serviceName) {
     try {
       const { stdout } = await execAsync(`systemctl is-active ${serviceName}`);
       return stdout.trim();
     } catch (error) {
-      // is-active exits 0=active, 3=inactive, 4=failed
+      // What systemd said first, then the exit code: an activating unit also
+      // exits 3, and it is running.
+      const said = error && error.stdout ? String(error.stdout).trim() : '';
+      if (said) return said;
       if (error.code === 3) return 'inactive';
       if (error.code === 4) return 'failed';
-      return error.stdout ? error.stdout.trim() : 'unknown';
+      return null;
     }
   }
 
+  // true | false | null — null is "we could not ask", never "no".
   async _isSystemdActive(serviceName) {
-    return (await this._systemctlStatus(serviceName)) === 'active';
+    const status = await this._systemctlStatus(serviceName);
+    if (status === null) return null;
+    return status === 'active' || status === 'activating';
   }
 
   // Check if Bitcoin node is remote (not localhost)
@@ -217,7 +246,27 @@ class ServiceMonitor {
   // This method now respects manual actions (CLI starts/stops) by detecting
   // discrepancies between actual status and requested_status, and updating
   // requested_status to reflect reality instead of fighting user actions.
-  async checkServiceStatus(serviceName) {
+  // `updateInProgress` is passed in, not asked for here.
+  //
+  // This runs once per monitored service — five on a miner, six with solo — and
+  // the answer is identical for all of them within a cycle. Asking per service
+  // meant one `/bin/sh -c` plus one `systemctl` each, every 10 seconds: about
+  // 86,000 process creations a day on an aarch64 SBC, replacing what used to be
+  // a single existsSync. The caller asks once and hands the answer down.
+  // `updateInProgress` is REQUIRED, with no default.
+  //
+  // A default makes "the caller forgot" indistinguishable from an answer, and
+  // the two candidates are both wrong in their own direction: `false` silently
+  // re-enables the manual-action block — the one that persists
+  // requested_status='offline' for node and the miner when it sees them stopped,
+  // which is precisely the state the updater creates for minutes — while `null`
+  // skips that block entirely and takes the grace-period handling with it,
+  // including the guard that stops ckpool's intent being poisoned while the node
+  // starts. Both were tried in this branch; the second was caught by a test.
+  //
+  // Requiring it makes a forgotten argument a visible error instead of a silent
+  // misclassification.
+  async checkServiceStatus(serviceName, updateInProgress) {
     try {
       // Get database service name
       const dbServiceName = this.getDatabaseServiceName(serviceName);
@@ -266,7 +315,7 @@ class ServiceMonitor {
       }
 
       // Standard systemctl check for local services
-      const status = await this._systemctlStatus(serviceName);
+      const status = (await this._systemctlStatus(serviceName)) ?? 'unknown';
 
       // Get current requested status from database (needed for both status mapping and auto-start)
       const existing = await this.knex('service_status')
@@ -307,12 +356,33 @@ class ServiceMonitor {
       // Detect manual actions FIRST using systemd status (source of truth for manual actions)
       // This ensures the UI reflects reality instead of fighting user actions
       let isWithinGracePeriod = false;
-
-      // The updater intentionally stops services while /tmp/update_progress
-      // exists. Preserve the user's requested state instead of classifying
-      // those stops as manual actions.
-      const updateInProgress = fs.existsSync('/tmp/update_progress');
-      if (existing && !updateInProgress) {
+      
+      // The updater intentionally stops services while an update is running, so
+      // those stops must not be read as manual actions.
+      //
+      // Asked of systemd, through the class's own helper. Both earlier versions
+      // read the progress file and latched: on its EXISTENCE, one failed update
+      // suppressed this whole block for good — including the auto-restart of a
+      // crashed bitcoind or miner — and on its VALUE, an updater killed during
+      // the health check left a mid-range number behind and did the same.
+      // Nothing clears that file but the next update, and these devices do not
+      // reboot on their own. A transient unit is self-clearing however the
+      // process dies.
+      //
+      // There was briefly a second, module-level copy of this two-liner, and the
+      // tests exercised THAT one while production ran this line — four green
+      // assertions against code no device executes.
+      // `=== false`, not `!updateInProgress`: null means systemd could not be
+      // asked, and that must not be read as "no update is running". The updater
+      // deliberately stops node and the miner for MINUTES — far outside the 90 s
+      // grace period, and with `wasStarting` false because they were online
+      // before — so one failed fork sends this straight into the MANUAL STOP
+      // branch, which persists requested_status='offline' for both. That is
+      // indistinguishable from a real manual stop, and it now compounds with the
+      // updater's own `wanted()` check: every later update reads that intent and
+      // deliberately leaves them stopped. The user's miner would never come back
+      // and nothing would say why.
+      if (existing && updateInProgress === false) {
         // Get time since last request (if any)
         const currentTime = Date.now();
         const requestedAtTime = existing.requested_at
@@ -369,8 +439,18 @@ class ServiceMonitor {
           // its requested_status to offline — that would poison the ExecCondition
           // and keep ckpool from ever starting again. Node startup can exceed
           // the start grace period, so this is checked independently of it.
-          const blockedOnNode =
-            dbServiceName === 'solo' && !(await this._isSystemdActive('node'));
+          // Strictly `active`, deliberately not via _isSystemdActive.
+          //
+          // That helper was broadened to count `activating` as running, which is
+          // right for the update unit and wrong here: node.service's
+          // ExecCondition window is exactly when it is activating, and reading
+          // that as "the node is up" removes the protection this branch exists
+          // for — flipping ckpool's requested_status to offline, which poisons
+          // its own ExecCondition and keeps it from ever starting again. `null`
+          // (systemd unreachable) also lands here as "not active", which is the
+          // conservative direction: do not touch the user's intent.
+          const nodeStatus = await this._systemctlStatus('node');
+          const blockedOnNode = dbServiceName === 'solo' && nodeStatus !== 'active';
 
           if ((isWithinStartGracePeriod && wasStarting) || blockedOnNode) {
             // Still starting, or waiting on the node - don't interfere.
@@ -640,8 +720,10 @@ class ServiceMonitor {
   // Check all services
   async checkAllServices() {
     try {
+      // Once per cycle, for every service in it.
+      const updateInProgress = await this._isSystemdActive(UPDATE_UNIT);
       const promises = this.systemdServices.map((service) =>
-        this.checkServiceStatus(service)
+        this.checkServiceStatus(service, updateInProgress)
       );
       const results = await Promise.all(promises);
 
@@ -795,18 +877,7 @@ class ServiceMonitor {
     }
   }
 
-  // Get current status of all services
-  async getCurrentStatuses() {
-    try {
-      const promises = this.systemdServices.map((service) =>
-        this.checkServiceStatus(service)
-      );
-      return await Promise.all(promises);
-    } catch (error) {
-      log.error({ err: error }, 'error getting current statuses');
-      return [];
-    }
-  }
+
 
   // Force immediate check
   async forceCheck() {
@@ -856,3 +927,4 @@ class ServiceMonitor {
 }
 
 module.exports = (knex, services) => new ServiceMonitor(knex, services);
+module.exports.UPDATE_UNIT = UPDATE_UNIT;

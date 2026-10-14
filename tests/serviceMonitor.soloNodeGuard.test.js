@@ -58,7 +58,7 @@ describe('ServiceMonitor.checkServiceStatus — solo waits on node.service', () 
     });
 
     const monitor = buildMonitor({ ckpool: 'inactive', node: 'inactive' });
-    await monitor.checkServiceStatus('ckpool');
+    await monitor.checkServiceStatus('ckpool', false);
 
     const row = await getSolo();
     expect(row.requested_status).toBe('online'); // NOT poisoned to offline
@@ -73,7 +73,7 @@ describe('ServiceMonitor.checkServiceStatus — solo waits on node.service', () 
     });
 
     const monitor = buildMonitor({ ckpool: 'inactive', node: 'active' });
-    await monitor.checkServiceStatus('ckpool');
+    await monitor.checkServiceStatus('ckpool', false);
 
     const row = await getSolo();
     expect(row.requested_status).toBe('offline');

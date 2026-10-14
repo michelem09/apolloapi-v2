@@ -57,6 +57,7 @@ module.exports = gql`
         reason: "update is a Mutation (Mutation.Mcu.update); this query alias only serves pre-2.1.4 UI bundles"
       )
     updateProgress: McuUpdateProgressOutput! @auth
+    updateStatus: McuUpdateStatusOutput! @auth
   }
 
   # Side-effectful actions must not be queries — Apollo Client re-executes
@@ -306,7 +307,16 @@ module.exports = gql`
   }
 
   type McuAppVersionOutput {
+    """
+    The version available to install, from the signed update channel. Keeps the
+    name 'result' so a browser still running an older UI bundle goes on working
+    while the two halves are swapped.
+    """
     result: String
+    "What this device is actually running, from the release it installed."
+    installed: String
+    "What the update channel offers, or null when it cannot be reached."
+    available: String
     error: Error
   }
 
@@ -317,5 +327,49 @@ module.exports = gql`
 
   type McuUpdateProgressResult {
     value: Int
+  }
+
+  type McuUpdateStatusOutput {
+    result: McuUpdateStatusResult
+    error: Error
+  }
+
+  """
+  What the last update run is doing, or did. Two facts together, because either
+  alone lies: the record says what the updater believes, and running says whether
+  it is still there to believe it.
+  """
+  type McuUpdateStatusResult {
+    "True while the updater's transient unit is active. Asked of systemd, so it clears however the process dies."
+    running: Boolean!
+    "Null when no update has ever run on this device."
+    record: McuUpdateRecord
+  }
+
+  type McuUpdateRecord {
+    """
+    Identifies one update run. A client remembers the id it saw when it pressed
+    Update and waits for a different one — which is how it recognises its own
+    outcome without comparing its clock to the device's.
+    """
+    runId: String
+    """
+    running | succeeded | rolled-back | recovery-failed | aborted | interrupted
+
+    rolled-back means the device was modified and PUT BACK, and is fine.
+    recovery-failed means modified and NOT put back — the only state that means
+    SSH is required. aborted means nothing was touched. interrupted means the
+    updater died without recording an outcome.
+    """
+    state: String!
+    "What it was doing, e.g. 'downloading', 'stopping services'."
+    phase: String
+    progress: Int
+    from: String
+    to: String
+    "Why it stopped, empty on success."
+    reason: String
+    startedAt: String
+    updatedAt: String
   }
 `;
