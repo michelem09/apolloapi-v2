@@ -111,9 +111,22 @@ function evaluateCondition(condition, { signals, descriptors, config, isActiveRu
   return { ok: fn(value, threshold) };
 }
 
+// True when the target is a mode this device cannot run. With no `availableModes`
+// in the context nothing is restricted (the pure-engine tests, unknown device).
+function modeUnavailable(target, availableModes) {
+  return !!(availableModes && target && target.type === 'mode' && !availableModes.includes(target.mode));
+}
+
 function evaluateRule(rule, ctx) {
   const conditions = rule.conditions || [];
   if (!conditions.length) return { matched: false, unevaluable: true, why: 'no_conditions' };
+
+  // A rule saved with a mode this device cannot run (super_eco on Apollo I/II,
+  // e.g. restored from another device) must not match: applying it would silently
+  // run a different mode than the one the rule names. It stays visible as invalid.
+  if (modeUnavailable(parseAction(rule.action), ctx.availableModes)) {
+    return { matched: false, unevaluable: true, why: 'mode_unavailable' };
+  }
 
   const isActiveRule = ctx.state.activeRuleId === rule.id;
   const results = conditions.map((c) =>
@@ -147,8 +160,8 @@ function parseAction(action) {
   return null;
 }
 
-function decide({ signals, rules, config, state, now, descriptors }) {
-  const ctx = { signals, descriptors, config, state, now };
+function decide({ signals, rules, config, state, now, descriptors, availableModes }) {
+  const ctx = { signals, descriptors, config, state, now, availableModes };
   const evaluated = [];
 
   const enabled = (rules || []).filter((r) => r.enabled);
@@ -201,9 +214,11 @@ function decide({ signals, rules, config, state, now, descriptors }) {
     }
   }
 
-  // 4. Nothing matched: fall back (default 'keep' = do not touch the miner).
+  // 4. Nothing matched: fall back (default 'keep' = do not touch the miner). A
+  // fallback naming a mode this device cannot run degrades to 'keep'.
+  const fallback = parseAction(config.fallbackAction);
   return {
-    target: parseAction(config.fallbackAction),
+    target: modeUnavailable(fallback, availableModes) ? null : fallback,
     ruleId: null,
     ruleName: null,
     reason: 'fallback',

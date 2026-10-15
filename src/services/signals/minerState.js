@@ -6,23 +6,27 @@
  * running and temperature > 80"), and the engine also uses them as its state.
  */
 
-const { MINER_MODES } = require('../../constants/minerModes');
+const { availableMinerModes } = require('../../constants/minerModes');
 
 module.exports = {
   namespace: 'miner',
 
-  descriptors: [
-    { id: 'miner.running', type: 'boolean', widget: 'boolean', ops: ['==', '!='], supportsHysteresis: false },
-    {
-      id: 'miner.mode',
-      type: 'string',
-      widget: 'enum',
-      // The single source of truth for the mode list — the UI reads it from here.
-      options: MINER_MODES,
-      ops: ['==', '!='],
-      supportsHysteresis: false,
-    },
-  ],
+  // A function, not a static list: the mode options depend on the device
+  // (super_eco is Apollo III only), so they are resolved when asked.
+  describe() {
+    return [
+      { id: 'miner.running', type: 'boolean', widget: 'boolean', ops: ['==', '!='], supportsHysteresis: false },
+      {
+        id: 'miner.mode',
+        type: 'string',
+        widget: 'enum',
+        // The single source of truth for the mode list — the UI reads it from here.
+        options: availableMinerModes(),
+        ops: ['==', '!='],
+        supportsHysteresis: false,
+      },
+    ];
+  },
 
   async read({ knex, deps }) {
     const [status, settings] = await Promise.all([

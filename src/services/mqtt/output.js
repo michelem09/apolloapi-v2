@@ -21,7 +21,8 @@
 const os = require('os');
 const fs = require('fs');
 const client = require('./client');
-const { MINER_MODES } = require('../../constants/minerModes');
+const logger = require('../../logger')('mqtt');
+const { availableMinerModes } = require('../../constants/minerModes');
 
 let pkgVersion = '2';
 try {
@@ -168,7 +169,7 @@ class MqttOutput {
             name: 'Miner mode',
             value_template: '{{ value_json.mode }}',
             command_topic: this.modeCmdTopic,
-            options: [...MINER_MODES],
+            options: availableMinerModes(),
             icon: 'mdi:tune',
           })
         );
@@ -400,7 +401,10 @@ class MqttOutput {
       else if (value.toUpperCase() === 'OFF') await this.deps.miner.stop({ source: 'user' });
       else return;
     } else if (topic === this.modeCmdTopic) {
-      if (!MINER_MODES.includes(value)) return;
+      if (!availableMinerModes().includes(value)) {
+        logger.warn({ mode: value }, 'ignoring MQTT miner mode command: not available on this device');
+        return;
+      }
       await this.deps.settings.update({ minerMode: value });
       const row = await this.knex('service_status').select('status').where({ service_name: 'miner' }).first();
       if (row?.status === 'online') await this.deps.miner.restart({ source: 'user' });

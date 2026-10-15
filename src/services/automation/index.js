@@ -17,7 +17,7 @@ const { canApply } = require('./guards');
 const { apply } = require('./apply');
 const { parseDbTime, toDbTime } = require('./time');
 
-const { MINER_MODES } = require('../../constants/minerModes');
+const { MINER_MODES, availableMinerModes } = require('../../constants/minerModes');
 
 const EVENTS_CAP = 500;
 
@@ -244,6 +244,18 @@ class AutomationService {
     if (action.type === 'mode' && !MINER_MODES.includes(action.mode)) {
       throw new GraphQLError(`Unknown miner mode: ${action.mode}`);
     }
+    // A known mode this device cannot run (super_eco on Apollo I/II). Only
+    // enforced while the rule is enabled, so a rule saved before this check, or
+    // restored from another device, can still be switched off, renamed-and-disabled
+    // or deleted; the engine skips it meanwhile (see engine.js).
+    if (action.type === 'mode' && rule.enabled !== false) {
+      const available = availableMinerModes();
+      if (!available.includes(action.mode)) {
+        throw new GraphQLError(
+          `Miner mode "${action.mode}" is not available on this device (available: ${available.join(', ')})`
+        );
+      }
+    }
 
     // A rule that turns the miner on must be evaluable while it is off. A signal
     // like board temperature is unreadable then (the sensor lives on the miner),
@@ -424,6 +436,7 @@ class AutomationService {
       state,
       now,
       descriptors: signals.descriptorsById(config),
+      availableModes: availableMinerModes(),
     });
 
     const guard = canApply({ decision, state, config, now });
