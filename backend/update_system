@@ -105,6 +105,10 @@ on_error() {
     # stop_runtime_services took the API down; bring it back so a failed update
     # leaves a device that answers (its service monitor restores node/ckpool).
     systemctl start apollo-api.service >/dev/null 2>&1 || true
+    # node is stopped by stop_runtime_services too, and nothing else restarts it
+    # (the API's service monitor only follows the user's requested status).
+    # ckpool is left to the API's own lifecycle.
+    systemctl start node.service >/dev/null 2>&1 || true
     rm -f "$TMPFILE"
     echo "Update failed; the system was not rebooted" >&2
     exit "$status"
@@ -132,6 +136,14 @@ stop_runtime_services() {
     fi
 }
 
+# State dir first, before anything that can fail. If an early step dies (yarn
+# network timeout, seen on apollo3), on_error restarts apollo-api, which is
+# already the new code and runs as futurebit: a root-owned or missing state dir
+# makes it die with EACCES on mkdir /var/lib/apollo/db. The pre-bootstrap chown
+# below stays (harmless, and repairs anything created in between).
+install -d -o futurebit -g futurebit -m 700 "$STATE_DIR"
+chown -R futurebit:futurebit "$STATE_DIR"
+
 preserve_solo_intent
 
 # The updater that launched this script may be from the pre-refactor release.
@@ -148,10 +160,20 @@ done
 systemctl daemon-reload
 stop_runtime_services
 
+# yarn on the eMMC is I/O bound (iowait 70-90% on apollo3). When an NVMe/SSD is
+# mounted and writable, keep the yarn cache there. Otherwise yarn's default.
+select_yarn_cache() {
+    local base="${APOLLO_YARN_CACHE_BASE:-/media/nvme}"
+    if [ -d "$base" ] && [ -w "$base" ] && mkdir -p "${base}/.yarn-cache" 2>/dev/null; then
+        export YARN_CACHE_FOLDER="${base}/.yarn-cache"
+    fi
+}
+
 set +u
 . /usr/local/nvm/nvm.sh
 nvm use 21
 set -u
+select_yarn_cache
 
 echo "30" > "$TMPFILE"
 echo -e "${YELLOW} ---> Updating API modules${NC}"

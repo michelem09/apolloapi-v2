@@ -45,10 +45,37 @@ check "apollo-api is stopped"                          "1" "$( [ -n "$stop_api" 
 check "…before node is stopped"                        "1" "$( [ -n "$stop_api" ] && [ -n "$stop_node" ] && [ "$stop_api" -lt "$stop_node" ] && echo 1 || echo 0 )"
 check "a failed update starts apollo-api again"        "1" "$( [ -n "$start_api" ] && [ -n "$stop_api" ] && [ "$start_api" -gt "$stop_api" ] && echo 1 || echo 0 )"
 
+# --- 1b. early failure: state dir owned first, node comes back --------------------
+first_install=$(grep -n '^install -d -o futurebit -g futurebit -m 700 '"$tmp/state" <<<"$calls" | head -1 | cut -d: -f1)
+first_chown=$(grep -n '^chown -R futurebit:futurebit '"$tmp/state" <<<"$calls" | head -1 | cut -d: -f1)
+first_stop=$(grep -n '^systemctl ' <<<"$calls" | head -1 | cut -d: -f1)
+start_node=$(grep -n 'systemctl start node.service' <<<"$calls" | tail -1 | cut -d: -f1)
+check "state dir is created futurebit-owned 0700 first" "1" "$( [ -n "$first_install" ] && [ -n "$first_stop" ] && [ "$first_install" -lt "$first_stop" ] && echo 1 || echo 0 )"
+check "…and chowned recursively before any service call" "1" "$( [ -n "$first_chown" ] && [ "$first_chown" -lt "$first_stop" ] && echo 1 || echo 0 )"
+check "a failed update starts node again"              "1" "$( [ -n "$start_node" ] && [ "$start_node" -gt "$stop_node" ] && echo 1 || echo 0 )"
+check "ckpool is not started by the error path"        "0" "$(grep -c 'systemctl start ckpool' <<<"$calls")"
+
+# --- 1c. yarn cache goes to the NVMe only when it is mounted and writable ---------
+eval "$(sed -n '/^select_yarn_cache()/,/^}/p' "$SCRIPT")"
+unset YARN_CACHE_FOLDER
+APOLLO_YARN_CACHE_BASE="$tmp/no-such-mount" select_yarn_cache
+check "no NVMe mount: yarn default cache"        "" "${YARN_CACHE_FOLDER:-}"
+mkdir -p "$tmp/nvme"
+APOLLO_YARN_CACHE_BASE="$tmp/nvme" select_yarn_cache
+check "writable NVMe mount: cache on the NVMe"   "$tmp/nvme/.yarn-cache" "${YARN_CACHE_FOLDER:-}"
+check "…and the folder exists"                    "1" "$( [ -d "$tmp/nvme/.yarn-cache" ] && echo 1 || echo 0 )"
+if [ "$(id -u)" -ne 0 ]; then
+    unset YARN_CACHE_FOLDER; mkdir -p "$tmp/ro"; chmod 555 "$tmp/ro"
+    APOLLO_YARN_CACHE_BASE="$tmp/ro" select_yarn_cache
+    check "read-only NVMe mount: yarn default cache" "" "${YARN_CACHE_FOLDER:-}"
+    chmod 755 "$tmp/ro"
+fi
+unset YARN_CACHE_FOLDER
+
 # --- 2. order of the bootstrap steps (static: the stubs cannot reach them) -------
 line() { grep -n -- "$1" "$SCRIPT" | head -1 | cut -d: -f1; }
 l_stop=$(line '^stop_runtime_services$')
-l_chown=$(line 'chown -R futurebit:futurebit "\$STATE_DIR"')
+l_chown=$(grep -n 'chown -R futurebit:futurebit "\$STATE_DIR"' "$SCRIPT" | tail -1 | cut -d: -f1)
 l_boot=$(line 'src/bootstrap.js')
 check "state dir is chowned before the bootstrap runs" "1" "$( [ -n "$l_chown" ] && [ "$l_chown" -lt "$l_boot" ] && echo 1 || echo 0 )"
 check "services are stopped before the bootstrap runs" "1" "$( [ -n "$l_stop" ] && [ "$l_stop" -lt "$l_boot" ] && echo 1 || echo 0 )"
