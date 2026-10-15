@@ -5,6 +5,12 @@ module.exports = gql`
     Settings: SettingsActions
   }
 
+  # Anything that changes state is a mutation: Apollo Client re-executes queries on
+  # a re-render, and a phantom re-fire must never rewrite the device settings.
+  extend type Mutation {
+    Settings: SettingsMutations
+  }
+
   # super_eco is Apollo III only; the USB miners fall back to eco.
   enum MinerMode { super_eco, eco, balanced, turbo, custom }
   enum TemperatureUnit { f, c }
@@ -13,6 +19,9 @@ module.exports = gql`
   type SettingsActions {
     list: SettingListOutput! @auth
     read: SettingsUpdateOutput! @auth
+  }
+
+  type SettingsMutations {
     update(input: SettingsUpdateInput!): SettingsUpdateOutput! @auth
   }
 

@@ -1,0 +1,70 @@
+const { graphql } = require('graphql');
+const schema = require('../src/graphql/schema');
+
+const hasAuth = (field) => field.astNode.directives.some((d) => d.name.value === 'auth');
+const names = (type) => Object.keys(schema.getType(type).getFields()).sort();
+
+// Actions that change state live under Mutation, never under Query: Apollo Client
+// re-executes queries on a re-render.
+describe('Auth / Pool / Settings keep their writes on the Mutation side', () => {
+  it('leaves only reads under Query', () => {
+    expect(names('AuthActions')).toEqual(['login', 'status']);
+    expect(names('PoolActions')).toEqual(['list']);
+    expect(names('SettingsActions')).toEqual(['list', 'read']);
+  });
+
+  it('exposes the writes under Mutation', () => {
+    expect(names('AuthMutations')).toEqual(['changePassword', 'setup']);
+    expect(names('PoolMutations')).toEqual(['create', 'delete', 'update', 'updateAll']);
+    expect(names('SettingsMutations')).toEqual(['update']);
+    ['Auth', 'Pool', 'Settings'].forEach((ns) => expect(schema.getMutationType().getFields()[ns]).toBeDefined());
+  });
+
+  it('keeps @auth on every write except Auth.setup, the one open action', () => {
+    const open = [];
+    ['AuthMutations', 'PoolMutations', 'SettingsMutations'].forEach((t) =>
+      Object.entries(schema.getType(t).getFields()).forEach(([n, f]) => {
+        if (!hasAuth(f)) open.push(`${t}.${n}`);
+      })
+    );
+    expect(open).toEqual(['AuthMutations.setup']);
+  });
+
+  const SOURCES = {
+    changePassword: 'mutation { Auth { changePassword(input: { password: "x" }) { error { message } } } }',
+    'pools.create': 'mutation { Pool { create(input: { enabled: true, url: "u" }) { error { message } } } }',
+    'pools.update': 'mutation { Pool { update(input: { id: 1 }) { error { message } } } }',
+    'pools.updateAll': 'mutation { Pool { updateAll(input: { pools: [] }) { error { message } } } }',
+    'pools.delete': 'mutation { Pool { delete(input: { id: 1 }) { error { message } } } }',
+    'settings.update': 'mutation { Settings { update(input: { agree: true }) { error { message } } } }',
+  };
+
+  it.each(Object.entries(SOURCES))('%s is rejected without a token, before the resolver runs', async (_, source) => {
+    const spy = jest.fn();
+    const services = new Proxy({}, { get: () => new Proxy({}, { get: () => spy }) });
+    const res = await graphql({ schema, source, contextValue: { services } });
+    expect(res.errors?.[0].message).toMatch(/auth/i);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('Auth.setup still runs without a token (it refuses by itself once setup is done)', async () => {
+    const setup = jest.fn().mockResolvedValue(undefined);
+    const res = await graphql({
+      schema,
+      source: 'mutation { Auth { setup(input: { password: "pw" }) { error { message } } } }',
+      contextValue: { services: { auth: { setup } } },
+    });
+    expect(res.errors).toBeUndefined();
+    expect(setup).toHaveBeenCalledWith({ password: 'pw' });
+    expect(res.data.Auth.setup.error).toBeNull();
+  });
+
+  it('the old query forms are gone', async () => {
+    const res = await graphql({
+      schema,
+      source: 'query { Settings { update(input: { agree: true }) { error { message } } } }',
+      contextValue: { services: {} },
+    });
+    expect(res.errors?.[0].message).toMatch(/Cannot query field "update"/);
+  });
+});

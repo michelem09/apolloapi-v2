@@ -4,6 +4,10 @@ module.exports = {
     Pool: () => ({})
   },
 
+  Mutation: {
+    Pool: () => ({})
+  },
+
   PoolActions: {
     list: async (_, __, { services }) => {
       try {
@@ -12,8 +16,10 @@ module.exports = {
       } catch (error) {
         return { result: null, error: { message: error.message } };
       }
-    },
+    }
+  },
 
+  PoolMutations: {
     create: async (_, { input }, { services }) => {
       try {
         const result = await services.pools.create(input);

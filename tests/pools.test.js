@@ -84,7 +84,7 @@ describe('Pools API', () => {
       };
 
       // Test resolver directly
-      const result = await poolsResolver.PoolActions.create(
+      const result = await poolsResolver.PoolMutations.create(
         null,
         { input: mockPoolInput },
         { services: { pools: mockPoolsService } }
@@ -107,7 +107,7 @@ describe('Pools API', () => {
       };
 
       // Test resolver directly
-      const result = await poolsResolver.PoolActions.create(
+      const result = await poolsResolver.PoolMutations.create(
         null,
         { input: mockPoolInput },
         { services: { pools: mockPoolsService } }
@@ -139,7 +139,7 @@ describe('Pools API', () => {
       };
 
       // Test resolver directly
-      const result = await poolsResolver.PoolActions.update(
+      const result = await poolsResolver.PoolMutations.update(
         null,
         { input: mockPoolUpdateInput },
         { services: { pools: mockPoolsService } }
@@ -162,7 +162,7 @@ describe('Pools API', () => {
       };
 
       // Test resolver directly
-      const result = await poolsResolver.PoolActions.update(
+      const result = await poolsResolver.PoolMutations.update(
         null,
         { input: mockPoolUpdateInput },
         { services: { pools: mockPoolsService } }
@@ -204,7 +204,7 @@ describe('Pools API', () => {
       };
 
       // Test resolver directly
-      const result = await poolsResolver.PoolActions.updateAll(
+      const result = await poolsResolver.PoolMutations.updateAll(
         null,
         { input: mockPoolsInput },
         { services: { pools: mockPoolsService } }
@@ -233,7 +233,7 @@ describe('Pools API', () => {
       };
 
       // Test resolver directly
-      const result = await poolsResolver.PoolActions.updateAll(
+      const result = await poolsResolver.PoolMutations.updateAll(
         null,
         { input: mockPoolsInput },
         { services: { pools: mockPoolsService } }
@@ -255,7 +255,7 @@ describe('Pools API', () => {
       };
 
       // Test resolver directly
-      const result = await poolsResolver.PoolActions.delete(
+      const result = await poolsResolver.PoolMutations.delete(
         null,
         { input: mockPoolDeleteInput },
         { services: { pools: mockPoolsService } }
@@ -274,7 +274,7 @@ describe('Pools API', () => {
       };
 
       // Test resolver directly
-      const result = await poolsResolver.PoolActions.delete(
+      const result = await poolsResolver.PoolMutations.delete(
         null,
         { input: mockPoolDeleteInput },
         { services: { pools: mockPoolsService } }

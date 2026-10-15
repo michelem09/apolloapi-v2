@@ -24,7 +24,7 @@ module.exports = async () => {
   // 1. Create the initial account (idempotent — ignore "already done").
   await gql(
     api,
-    `query($input: AuthSetupInput!) { Auth { setup(input: $input) { error { message } } } }`,
+    `mutation($input: AuthSetupInput!) { Auth { setup(input: $input) { error { message } } } }`,
     { input: { password: PASSWORD } }
   );
 
@@ -39,7 +39,7 @@ module.exports = async () => {
 
   await gql(
     api,
-    `query($input: PoolUpdateAllInput!) { Pool { updateAll(input: $input) { result { pools { id } } error { message } } } }`,
+    `mutation($input: PoolUpdateAllInput!) { Pool { updateAll(input: $input) { result { pools { id } } error { message } } } }`,
     { input: { pools: [{ index: 0, enabled: true, url: 'stratum+tcp://pool.example.com:3333', username: 'e2ewallet', password: 'x' }] } },
     token
   );

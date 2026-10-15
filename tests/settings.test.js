@@ -181,7 +181,7 @@ describe('Settings API', () => {
       };
 
       // Test resolver directly
-      const result = await settingsResolver.SettingsActions.update(
+      const result = await settingsResolver.SettingsMutations.update(
         null,
         { input: mockSettingsInput },
         { services: { settings: mockSettingsService } }
@@ -204,7 +204,7 @@ describe('Settings API', () => {
       };
 
       // Test resolver directly
-      const result = await settingsResolver.SettingsActions.update(
+      const result = await settingsResolver.SettingsMutations.update(
         null,
         { input: mockSettingsInput },
         { services: { settings: mockSettingsService } }

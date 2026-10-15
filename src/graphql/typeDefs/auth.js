@@ -7,12 +7,22 @@ module.exports = gql`
     Auth: AuthActions
   }
 
+  # Anything that changes state is a mutation: Apollo Client re-executes queries on
+  # a re-render, and a phantom re-fire must never change the system password.
+  extend type Mutation {
+    Auth: AuthMutations
+  }
+
   enum AuthStatus { pending, done }
 
   type AuthActions {
     login(input: AuthLoginInput!): AuthLoginOutput!
     status: AuthStatusOutput! 
+  }
+
+  type AuthMutations {
     changePassword(input: AuthChangePasswordInput!): AuthChangePasswordOutput! @auth
+    "The one action open to anyone: first-boot password, refused once setup is done."
     setup(input: AuthSetupInput!): AuthSetupOutput!
   }
 

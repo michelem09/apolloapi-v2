@@ -3,7 +3,7 @@ const { run, services, knex } = require('./harness');
 // T1 integration tests for the release-critical UI↔backend flows.
 
 describe('T1 — node software selection (Settings.update nodeSoftware)', () => {
-  const UPDATE = `query($in: SettingsUpdateInput!) {
+  const UPDATE = `mutation($in: SettingsUpdateInput!) {
     Settings { update(input: $in) {
       result { settings { nodeSoftware mindiff startdiff } }
       error { message }
@@ -63,7 +63,7 @@ describe('T1 — node start/stop (Node.start / Node.stop)', () => {
 describe('T1 — node connection credentials', () => {
   it('returns LAN credentials only through the authenticated node action', async () => {
     await run(
-      `query($in: SettingsUpdateInput!) { Settings { update(input: $in) {
+      `mutation($in: SettingsUpdateInput!) { Settings { update(input: $in) {
         error { message } } } }`,
       { variables: { in: { nodeAllowLan: true } } }
     );
@@ -149,7 +149,7 @@ describe('T1 — solo start/stop (Solo.*)', () => {
 describe('T1 — node parameters (Settings.update)', () => {
   it('persists nodeMaxConnections and LAN access together', async () => {
     const res = await run(
-      `query($in: SettingsUpdateInput!) { Settings { update(input: $in) {
+      `mutation($in: SettingsUpdateInput!) { Settings { update(input: $in) {
         result { settings { nodeMaxConnections nodeAllowLan } } error { message } } } }`,
       { variables: { in: { nodeMaxConnections: 128, nodeAllowLan: true } } }
     );
@@ -160,7 +160,7 @@ describe('T1 — node parameters (Settings.update)', () => {
 
   it('persists Tor and user options together', async () => {
     const res = await run(
-      `query($in: SettingsUpdateInput!) { Settings { update(input: $in) {
+      `mutation($in: SettingsUpdateInput!) { Settings { update(input: $in) {
         result { settings { nodeEnableTor nodeUserConf } } error { message } } } }`,
       { variables: { in: { nodeEnableTor: true, nodeUserConf: 'maxmempool=300' } } }
     );
@@ -184,7 +184,7 @@ describe('T1 — pool change (Pool.updateAll) reconfigures the miner', () => {
     const fs = require('fs');
     fs.promises.writeFile.mockClear();
     const res = await run(
-      `query($in: PoolUpdateAllInput!) { Pool { updateAll(input: $in) {
+      `mutation($in: PoolUpdateAllInput!) { Pool { updateAll(input: $in) {
         result { pools { url username index enabled } } error { message } } } }`,
       {
         variables: {

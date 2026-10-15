@@ -6,6 +6,10 @@ module.exports = {
     Settings: () => ({})
   },
 
+  Mutation: {
+    Settings: () => ({})
+  },
+
   SettingsActions: {
     list: async (_, __, { services }) => {
       try {
@@ -23,8 +27,10 @@ module.exports = {
       } catch (error) {
         return { result: null, error: { message: error.message } };
       }
-    },
+    }
+  },
 
+  SettingsMutations: {
     update: async (_, { input }, { services }) => {
       try {
         const settings = await services.settings.update(input);

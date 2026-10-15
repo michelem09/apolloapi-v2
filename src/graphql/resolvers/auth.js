@@ -3,6 +3,10 @@ module.exports = {
     Auth: () => ({})
   },
 
+  Mutation: {
+    Auth: () => ({})
+  },
+
   AuthActions: {
     login: async (_, { input }, { services }) => {
       try {
@@ -20,8 +24,10 @@ module.exports = {
       } catch (error) {
         return { result: null, error: { message: error.message } };
       }
-    },
+    }
+  },
 
+  AuthMutations: {
     changePassword: async (_, { input }, { services }) => {
       try {
         await services.auth.changePassword(input);

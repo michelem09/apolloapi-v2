@@ -5,8 +5,17 @@ module.exports = gql`
     Pool: PoolActions
   }
 
+  # Anything that changes state is a mutation: Apollo Client re-executes queries on
+  # a re-render, and a phantom re-fire must never rewrite the pool list.
+  extend type Mutation {
+    Pool: PoolMutations
+  }
+
   type PoolActions {
     list: PoolListOutput! @auth
+  }
+
+  type PoolMutations {
     create(input: PoolCreateInput!): PoolCreateOutput! @auth
     update(input: PoolUpdateInput!): PoolUpdateOutput! @auth
     updateAll(input: PoolUpdateAllInput!): PoolsUpdateOutput! @auth

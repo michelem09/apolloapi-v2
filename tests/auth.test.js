@@ -59,7 +59,7 @@ describe('Auth API', () => {
       };
 
       // Test resolver directly
-      const result = await authResolver.AuthActions.setup(
+      const result = await authResolver.AuthMutations.setup(
         null,
         { input: { password: "testpassword" } },
         { services: { auth: mockAuthService } }
@@ -76,7 +76,7 @@ describe('Auth API', () => {
       };
 
       // Test resolver directly
-      const result = await authResolver.AuthActions.setup(
+      const result = await authResolver.AuthMutations.setup(
         null,
         { input: { password: "newpassword" } },
         { services: { auth: mockAuthService } }
@@ -141,7 +141,7 @@ describe('Auth API', () => {
       };
 
       // Test resolver directly
-      const result = await authResolver.AuthActions.changePassword(
+      const result = await authResolver.AuthMutations.changePassword(
         null,
         { input: { password: "newpassword" } },
         authenticatedContext
