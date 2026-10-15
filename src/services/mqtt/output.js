@@ -80,6 +80,7 @@ class MqttOutput {
   init() {
     client.setOutput({
       will: { topic: this.availabilityTopic, payload: 'offline' },
+      ownPrefix: this.base,
       commandTopics: [this.minerCmdTopic, this.modeCmdTopic],
       onCommand: (topic, payload) => this.handleCommand(topic, payload),
       onConnect: () => this.syncDiscovery(),

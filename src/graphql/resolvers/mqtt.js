@@ -44,5 +44,7 @@ module.exports = {
 
     discoverTopics: (_, { input, prefix, seconds }, { services }) =>
       wrap(async () => services.mqtt.discoverTopics(input, { prefix, seconds })),
+
+    cachedTopics: (_, __, { services }) => wrap(async () => services.mqtt.cachedTopics()),
   },
 };

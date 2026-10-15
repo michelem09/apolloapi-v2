@@ -16,6 +16,9 @@ module.exports = gql`
 
     "Subscribe to a wildcard for a few seconds and return the topics seen."
     discoverTopics(input: MqttConfigInput!, prefix: String, seconds: Int): MqttDiscoverOutput! @auth
+
+    "Topics the device's own broker connection has already seen (in-memory, bounded); no scan. Not ok while disconnected."
+    cachedTopics: MqttDiscoverOutput! @auth
   }
 
   type MqttConfigOutput {
@@ -102,6 +105,15 @@ module.exports = gql`
     "Home Assistant discovery: the single value path resolved from a sensor config."
     jsonPath: String
     "The current reading, if the topic has published one during the scan."
+    value: String
+    "Each entry of jsonPaths with its current value."
+    pathValues: [MqttPathValue!]
+    "When the topic (or, for an HA sensor, its value) was last seen, ISO 8601."
+    lastSeen: String
+  }
+
+  type MqttPathValue {
+    path: String!
     value: String
   }
 

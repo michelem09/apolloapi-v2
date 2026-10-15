@@ -130,6 +130,11 @@ class MqttService {
   async discoverTopics(input, opts) {
     return client.discoverTopics(await this._withPassword(input), opts);
   }
+
+  // Topics the shared connection has already seen — read from memory, no scan.
+  cachedTopics() {
+    return client.getCachedTopics();
+  }
 }
 
 module.exports = (knex) => new MqttService(knex);

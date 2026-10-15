@@ -19,6 +19,19 @@ let status = { connected: false, error: null };
 let inputs = []; // [{ name, topic, jsonPath, unit }]
 const cache = new Map(); // name -> { value, at }
 
+// Topic browse cache: every topic seen on the broker while the link is up, fed by
+// a `#` subscription, so the browse modal opens with data instead of a 60s scan.
+// Insertion order is the LRU order (a refreshed topic is re-inserted at the end);
+// when full, the least recently seen topic goes. Payloads are kept in memory only
+// and are never logged: a broker carries credentials and personal data.
+const TOPIC_CACHE_MAX = 500;
+const TOPIC_MAX_LEN = 512;
+const PAYLOAD_MAX = 4000; // whole HA discovery configs stay parseable
+const topicCache = new Map(); // topic -> { payload, at }
+let brokerKey = null; // identity of the broker the shared client points at
+let recentCommands = new Map(); // topic|payload -> ts, drops overlapping-subscription duplicates
+const COMMAND_DEDUPE_MS = 500;
+
 // The output side registers itself here (set once at boot, before the first
 // connect): { will, commandTopics, onCommand, onConnect }. Kept out of the
 // connection signature so toggling output on/off never drops the input link.
@@ -45,12 +58,33 @@ function extractValue(input, payloadStr) {
   return Number(payloadStr);
 }
 
+const isOwnTopic = (topic) => !!(output && output.ownPrefix && topic.startsWith(`${output.ownPrefix}/`));
+
+// Remember a topic for the browse cache. The device's own apollo/<id>/ topics are
+// left out (they are what we publish, not something to map), and so are HA
+// discovery definitions other than sensors (hidden from the browse anyway).
+function remember(topic, str, at = Date.now()) {
+  if (topic.length > TOPIC_MAX_LEN || isOwnTopic(topic)) return;
+  if (/^homeassistant\/.+\/config$/.test(topic) && !/^homeassistant\/sensor\//.test(topic)) return;
+  topicCache.delete(topic);
+  topicCache.set(topic, { payload: str.slice(0, PAYLOAD_MAX), at });
+  while (topicCache.size > TOPIC_CACHE_MAX) topicCache.delete(topicCache.keys().next().value);
+}
+
 function onMessage(topic, payload) {
   const str = payload.toString();
+  remember(topic, str);
 
   // A command topic (miner/mode set from Home Assistant) — route it and stop; a
-  // command topic is never also an input topic.
+  // command topic is never also an input topic. The `#` browse subscription
+  // overlaps the explicit command subscription, and a broker may deliver both
+  // copies: drop an identical command arriving twice within a moment.
   if (output && output.commandTopics && output.commandTopics.includes(topic)) {
+    const key = `${topic}|${str}`;
+    const now = Date.now();
+    for (const [k, t] of recentCommands) if (now - t > COMMAND_DEDUPE_MS) recentCommands.delete(k);
+    if (recentCommands.has(key)) return;
+    recentCommands.set(key, now);
     if (output.onCommand) Promise.resolve(output.onCommand(topic, str)).catch(() => {});
     return;
   }
@@ -91,6 +125,8 @@ function disconnect() {
     }
   }
   status = { connected: false, error: null };
+  topicCache.clear();
+  recentCommands = new Map();
 }
 
 /**
@@ -132,6 +168,7 @@ function configure(mqttConfig) {
 
   disconnect();
   cache.clear();
+  brokerKey = enabled ? `${cfg.host}:${cfg.port || 1883}:${cfg.tls ? 1 : 0}:${cfg.username || ''}` : null;
   if (!enabled) return;
 
   const url = `${cfg.tls ? 'mqtts' : 'mqtt'}://${cfg.host}:${cfg.port || 1883}`;
@@ -151,6 +188,10 @@ function configure(mqttConfig) {
     status = { connected: true, error: null };
     const subs = [...topics, ...((output && output.commandTopics) || [])];
     if (subs.length) client.subscribe(subs, () => {});
+    // The browse cache: everything on the broker. Kept apart from the explicit
+    // subscriptions above, which must keep working if a restrictive broker ACL
+    // refuses `#`.
+    client.subscribe('#', () => {});
     // Let the output side (re)publish its discovery + availability + first state.
     if (output && output.onConnect) Promise.resolve(output.onConnect()).catch(() => {});
   });
@@ -281,6 +322,62 @@ function currentValue(payload, jsonPath) {
   }
 }
 
+
+// Turn raw topic -> { payload, at } entries into the browse list: HA sensor
+// configs resolved to named values first, then plain topics with their numeric
+// jsonPaths (each with the current value). Shared by the timed scan and the cache.
+function buildTopicList(entries) {
+  const entities = []; // resolved HA sensors — the useful, named values
+  const plain = []; // everything else
+  const iso = (at) => (at ? new Date(at).toISOString() : null);
+
+  for (const [topic, { payload: sample, at }] of [...entries.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    if (isOwnTopic(topic)) continue;
+    const ha = resolveHaSensorConfig(topic, sample);
+    if (ha) {
+      // Our own discovery entities point at apollo/<id>/… — not an input source.
+      if (isOwnTopic(ha.topic)) continue;
+      const state = entries.get(ha.topic);
+      ha.value = currentValue(state && state.payload, ha.jsonPath);
+      ha.lastSeen = iso(state ? state.at : at);
+      entities.push(ha);
+      continue;
+    }
+    // Hide the rest of the Home Assistant discovery metadata (binary_sensor,
+    // switch, select, … /config): it is definitions, not states/values.
+    if (/^homeassistant\/.+\/config$/.test(topic)) continue;
+
+    let jsonPaths = [];
+    let parsed = null;
+    try {
+      parsed = JSON.parse(sample);
+      if (parsed && typeof parsed === 'object') jsonPaths = numericPaths(parsed);
+    } catch (e) {
+      /* not JSON */
+    }
+    plain.push({
+      topic,
+      sample: sample.slice(0, 300),
+      jsonPaths,
+      pathValues: jsonPaths.map((path) => ({ path, value: String(getByPath(parsed, path)).slice(0, 80) })),
+      value: jsonPaths.length ? null : sample.slice(0, 80),
+      lastSeen: iso(at),
+    });
+  }
+
+  entities.sort((a, b) => (a.name || a.jsonPath || '').localeCompare(b.name || b.jsonPath || ''));
+  return [...entities, ...plain];
+}
+
+// What the shared connection has seen so far, in the same shape as a scan. Needs
+// no new broker connection: it is read from memory.
+function getCachedTopics() {
+  if (!client || !status.connected) {
+    return { ok: false, error: 'Not connected to the MQTT broker', topics: [] };
+  }
+  return { ok: true, error: null, topics: buildTopicList(topicCache) };
+}
+
 /**
  * Browse the broker: subscribe to a wildcard for a few seconds and collect the
  * topics that publish (retained ones arrive immediately). One-off connection,
@@ -303,7 +400,7 @@ function discoverTopics(mqttConfig, { prefix, seconds } = {}) {
       reconnectPeriod: 0,
     });
 
-    const found = new Map(); // topic -> full payload (bounded; truncated only for display)
+    const found = new Map(); // topic -> { payload, at } (bounded; truncated only for display)
     const stateSubs = new Set(); // state topics we subscribed to for current values
     let settled = false;
     const finish = (result) => {
@@ -330,7 +427,7 @@ function discoverTopics(mqttConfig, { prefix, seconds } = {}) {
       // Keep the whole payload (bounded) so HA discovery configs stay parseable;
       // they are long (the shared `device` object) and a 300-char cut broke them.
       const str = payload.toString().slice(0, 4000);
-      found.set(topic, str);
+      found.set(topic, { payload: str, at: Date.now() });
       // When a sensor config arrives, also listen to the value it points at (often
       // outside the browse prefix), so we can show the current reading.
       const ha = resolveHaSensorConfig(topic, str);
@@ -345,32 +442,13 @@ function discoverTopics(mqttConfig, { prefix, seconds } = {}) {
     });
 
     setTimeout(() => {
-      const entities = []; // resolved HA sensors — the useful, named values
-      const plain = []; // everything else
-
-      for (const [topic, sample] of [...found.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-        const ha = resolveHaSensorConfig(topic, sample);
-        if (ha) {
-          ha.value = currentValue(found.get(ha.topic), ha.jsonPath);
-          entities.push(ha);
-          continue;
-        }
-        // Hide the rest of the Home Assistant discovery metadata (binary_sensor,
-        // switch, select, … /config): it is definitions, not states/values.
-        if (/^homeassistant\/.+\/config$/.test(topic)) continue;
-
-        let jsonPaths = [];
-        try {
-          const parsed = JSON.parse(sample);
-          if (parsed && typeof parsed === 'object') jsonPaths = numericPaths(parsed);
-        } catch (e) {
-          /* not JSON */
-        }
-        plain.push({ topic, sample: sample.slice(0, 300), jsonPaths, value: jsonPaths.length ? null : sample.slice(0, 80) });
+      // The scan is also a refresh of the shared cache, when it looked at the same
+      // broker the shared client is connected to.
+      const key = `${cfg.host}:${cfg.port || 1883}:${cfg.tls ? 1 : 0}:${cfg.username || ''}`;
+      if (status.connected && key === brokerKey) {
+        for (const [t, e] of found) remember(t, e.payload, e.at);
       }
-
-      entities.sort((a, b) => (a.name || a.jsonPath || '').localeCompare(b.name || b.jsonPath || ''));
-      finish({ ok: true, error: null, topics: [...entities, ...plain] });
+      finish({ ok: true, error: null, topics: buildTopicList(found) });
     }, window * 1000);
   });
 }
@@ -406,6 +484,7 @@ module.exports = {
   disconnect,
   testConnection,
   discoverTopics,
+  getCachedTopics,
   setOutput,
   publish,
   isConnected: () => status.connected,
@@ -418,6 +497,8 @@ module.exports = {
     inputs = [];
     output = null;
     cache.clear();
+    topicCache.clear();
+    brokerKey = null;
   },
   _ingest: onMessage, // simulate an incoming message in tests
   _setStatus: (s) => {
@@ -426,4 +507,10 @@ module.exports = {
   _jsonPathFromTemplate: jsonPathFromTemplate,
   _resolveHaSensorConfig: resolveHaSensorConfig,
   _currentValue: currentValue,
+  _topicCacheSize: () => topicCache.size,
+  _topicCacheMax: TOPIC_CACHE_MAX,
+  _setClient: (c, key) => {
+    client = c;
+    brokerKey = key || null;
+  },
 };
