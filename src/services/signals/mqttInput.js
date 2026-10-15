@@ -19,7 +19,16 @@ const client = require('../mqtt/client');
 // fresh; per-input `maxAgeSeconds` overrides it.
 const DEFAULT_MAX_AGE_MS = 15 * 60 * 1000;
 
-const inputsOf = (config) => ((config && config.mqtt && config.mqtt.inputs) || []).filter((i) => i && i.name);
+// First one wins: a stored config from before duplicates were refused must not list
+// the same input.<name> twice (the rule editor would show it twice).
+const inputsOf = (config) => {
+  const seen = new Set();
+  return ((config && config.mqtt && config.mqtt.inputs) || []).filter((i) => {
+    if (!i || !i.name || seen.has(i.name)) return false;
+    seen.add(i.name);
+    return true;
+  });
+};
 
 module.exports = {
   namespace: 'input',

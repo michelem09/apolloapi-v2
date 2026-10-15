@@ -22,6 +22,24 @@ function parseJson(value, fallback) {
 
 const DEFAULT_OUTPUT = { enabled: false, control: true, exports: { miner: true, node: true, solo: true, mcu: false } };
 
+// Two inputs with the same name would be the same input.<name> signal twice, and
+// two with the same topic + field the same reading under two names: refuse both
+// at save time, with a message that says which one.
+function validateInputs(inputs) {
+  const names = new Set();
+  const sources = new Set();
+  for (const i of inputs || []) {
+    if (!i) continue;
+    if (names.has(i.name)) throw new Error(`Duplicate input name "${i.name}": each input needs its own name`);
+    names.add(i.name);
+    const source = `${i.topic}\u0000${i.jsonPath || ''}`;
+    if (sources.has(source)) {
+      throw new Error(`Topic "${i.topic}"${i.jsonPath ? ` (${i.jsonPath})` : ''} is mapped twice: remove one of the inputs`);
+    }
+    sources.add(source);
+  }
+}
+
 class MqttService {
   constructor(knex) {
     this.knex = knex;
@@ -45,6 +63,7 @@ class MqttService {
   }
 
   async updateConfig(input = {}) {
+    validateInputs(input.inputs);
     const update = {};
     if (input.enabled !== undefined) update.enabled = input.enabled;
     if (input.host !== undefined) update.host = input.host;

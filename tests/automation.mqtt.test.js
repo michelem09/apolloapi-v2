@@ -141,6 +141,9 @@ describe('MQTT input signals', () => {
   it('appears in the registry descriptors when configured', () => {
     const ids = signals.descriptors(config).map((d) => d.id);
     expect(ids).toContain('input.surplus');
+    // A stored config with the same name twice lists the signal once.
+    const dup = { mqtt: { inputs: [{ name: 'surplus', topic: 'a' }, { name: 'surplus', topic: 'b' }] } };
+    expect(signals.descriptors(dup).filter((d) => d.id === 'input.surplus')).toHaveLength(1);
     // …and is absent without config.
     expect(signals.descriptors({}).map((d) => d.id)).not.toContain('input.surplus');
   });
@@ -190,6 +193,25 @@ describe('MQTT config (system service)', () => {
     // Blank password + a different host must NOT merge the saved credential.
     expect(spy.mock.calls[0][0].password).not.toBe('stored');
     spy.mockRestore();
+  });
+
+  it('rejects duplicate input names and duplicate topic+field pairs, storing nothing', async () => {
+    await mqttService.updateConfig({ enabled: false, host: 'h', inputs: [{ name: 'keep', topic: 't/keep' }] });
+
+    await expect(
+      mqttService.updateConfig({ inputs: [{ name: 'soc', topic: 'a' }, { name: 'soc', topic: 'b' }] })
+    ).rejects.toThrow(/Duplicate input name "soc"/);
+    await expect(
+      mqttService.updateConfig({
+        inputs: [{ name: 'x', topic: 'sun2000/state', jsonPath: 'battery.soc' }, { name: 'y', topic: 'sun2000/state', jsonPath: 'battery.soc' }],
+      })
+    ).rejects.toThrow(/mapped twice/);
+
+    // The same topic with different fields is fine.
+    await mqttService.updateConfig({ inputs: [{ name: 'p', topic: 's', jsonPath: 'a' }, { name: 'q', topic: 's', jsonPath: 'b' }] });
+    // A refused save left the stored config alone.
+    await expect(mqttService.updateConfig({ inputs: [{ name: 'z', topic: 't' }, { name: 'z', topic: 't2' }] })).rejects.toThrow();
+    expect((await mqttService.getConfig()).inputs.map((i) => i.name)).toEqual(['p', 'q']);
   });
 
   it('browses topics, passing the prefix and the stored password through', async () => {
