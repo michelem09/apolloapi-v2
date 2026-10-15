@@ -36,9 +36,16 @@ check "…but not deleted"                       "1" "$( [ -e "$out" ] && echo 1
 check "…under a name that says what it was"    "settings.json.corrupt-" "$(basename "$out" | cut -c1-22)"
 
 # Truncated mid-write: the other shape a full disk produces.
-d="$tmp/truncated"; mkdir -p "$d"; printf '{"rpcport": 83' > "$d/settings.json"
-out="$(node_datadir_heal_settings "$d")"
-check "a truncated file is moved aside" "1" "$( [ -n "$out" ] && echo 1 || echo 0 )"
+# Only provable with python3, which every device image ships; a bare container
+# (debian:bookworm in scripts/test-shell-bash5.sh) has none, and the library then
+# takes non-empty files on trust by design.
+if command -v python3 >/dev/null 2>&1; then
+    d="$tmp/truncated"; mkdir -p "$d"; printf '{"rpcport": 83' > "$d/settings.json"
+    out="$(node_datadir_heal_settings "$d")"
+    check "a truncated file is moved aside" "1" "$( [ -n "$out" ] && echo 1 || echo 0 )"
+else
+    echo "  skip a truncated file is moved aside (no python3)"
+fi
 
 # The two shapes that must be left alone.
 d="$tmp/valid"; mkdir -p "$d"; printf '{"prune": 0}\n' > "$d/settings.json"
