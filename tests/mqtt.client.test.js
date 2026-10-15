@@ -131,26 +131,39 @@ describe('mqtt client — topic cache and browse session', () => {
       expect(subscribedTopics(c).sort()).toEqual(['apollo/x/miner/set', 'sun/a']);
     });
 
-    it('starts with the first cachedTopics lease, once, and stops with endBrowse', () => {
+    it('starts with the first renewBrowse, once, and stops with endBrowse', () => {
       const c = connected();
-      client.getCachedTopics();
-      client.getCachedTopics(); // a renew, not a second subscription
+      client.renewBrowse();
+      client.renewBrowse(); // a renew, not a second subscription
       expect(subscribedTopics(c).filter((t) => t === '#')).toHaveLength(1);
 
       msg(c, 'a/b', '1');
       client.endBrowse();
       expect(c.unsubscribe).toHaveBeenCalledWith('#', expect.any(Function));
       // The cache outlives the session…
-      expect(client.getCachedTopics({ lease: false }).topics.map((t) => t.topic)).toContain('a/b');
-      // …and a read without a lease does not reopen it.
+      expect(client.getCachedTopics().topics.map((t) => t.topic)).toContain('a/b');
+      // …and a read does not reopen it.
       expect(subscribedTopics(c).filter((t) => t === '#')).toHaveLength(1);
+    });
+
+    it('a read never starts a session: only renewBrowse does', () => {
+      const c = connected();
+      client.getCachedTopics();
+      client.getCachedTopics();
+      expect(subscribedTopics(c)).not.toContain('#');
+      expect(client.renewBrowse()).toEqual({ ok: true, error: null });
+      expect(subscribedTopics(c)).toContain('#');
+    });
+
+    it('renewBrowse is not ok while disconnected and starts nothing', () => {
+      expect(client.renewBrowse()).toMatchObject({ ok: false });
     });
 
     it('ends by itself after 5 minutes without a renew, and a renew pushes that back', () => {
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       jest.advanceTimersByTime(4 * 60 * 1000);
-      client.getCachedTopics(); // the modal's poll
+      client.renewBrowse(); // the modal's poll
       jest.advanceTimersByTime(4 * 60 * 1000);
       expect(c.unsubscribe).not.toHaveBeenCalled();
       jest.advanceTimersByTime(61 * 1000);
@@ -160,7 +173,7 @@ describe('mqtt client — topic cache and browse session', () => {
 
     it('is not repeated on a reconnect: mqtt.js resubscribes, a second one replays retained twice', () => {
       const c = connected({ inputs: [{ name: 'a', topic: 'sun/a' }] });
-      client.getCachedTopics();
+      client.renewBrowse();
       const before = c.subscribe.mock.calls.length;
       c.emit('connect'); // the reconnect
       expect(c.subscribe.mock.calls.length).toBe(before);
@@ -172,11 +185,12 @@ describe('mqtt client — topic cache and browse session', () => {
       c.refuse = ['#'];
       c.emit('connect');
 
+      client.renewBrowse();
       const r = client.getCachedTopics();
       expect(r.ok).toBe(true);
       expect(r.error).toMatch(/does not allow subscribing to all topics/);
-      client.getCachedTopics();
-      client.getCachedTopics();
+      client.renewBrowse();
+      client.renewBrowse();
       expect(subscribedTopics(c).filter((t) => t === '#')).toHaveLength(1);
       expect(mockWarn).toHaveBeenCalledTimes(1);
       expect(JSON.stringify(mockWarn.mock.calls)).not.toMatch(/password|payload/i);
@@ -184,6 +198,7 @@ describe('mqtt client — topic cache and browse session', () => {
       // A new session may try again (the user fixed the ACL).
       client.endBrowse();
       c.refuse = null;
+      client.renewBrowse();
       expect(client.getCachedTopics().error).toBeNull();
       expect(subscribedTopics(c).filter((t) => t === '#')).toHaveLength(2);
     });
@@ -192,7 +207,7 @@ describe('mqtt client — topic cache and browse session', () => {
   describe('what is cached', () => {
     it('fills from what it sees, with values per jsonPath', () => {
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(c, 'sun2000/state', JSON.stringify({ battery: { soc: 80 }, label: 'x' }));
       msg(c, 'plain/topic', '42');
 
@@ -206,7 +221,7 @@ describe('mqtt client — topic cache and browse session', () => {
 
     it('resolves a HA sensor from cached config + state', () => {
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(c, 'homeassistant/sensor/x/config', JSON.stringify({ name: 'Yield', unit_of_measurement: 'kWh', state_topic: 's/t', value_template: '{{ value_json.y }}' }));
       msg(c, 's/t', JSON.stringify({ y: 7 }));
       const e = client.getCachedTopics().topics.find((t) => t.name === 'Yield');
@@ -215,7 +230,7 @@ describe('mqtt client — topic cache and browse session', () => {
 
     it('keeps the newest topics and never exceeds the entry bound', () => {
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       const max = client._topicCacheMax;
       for (let i = 0; i < max + 50; i++) msg(c, `t/${i}`, '1');
       msg(c, 't/60', '2'); // refreshed: must survive the next eviction
@@ -229,7 +244,7 @@ describe('mqtt client — topic cache and browse session', () => {
 
     it('keeps HA sensors, config and state, however much the other topics chatter', () => {
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(c, 'homeassistant/sensor/inv/power/config', JSON.stringify({ name: 'PV power', state_topic: 'sun2000/state', value_template: '{{ value_json.p }}' }));
       msg(c, 'sun2000/state', '{"p":1234}');
       for (let i = 0; i < 2000; i++) msg(c, `zigbee2mqtt/dev${i}`, '{"linkquality":50}');
@@ -239,7 +254,7 @@ describe('mqtt client — topic cache and browse session', () => {
 
     it('also when the state arrives before its config', () => {
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(c, 'sun2000/state', '{"p":99}');
       msg(c, 'homeassistant/sensor/inv/power/config', JSON.stringify({ name: 'PV power', state_topic: 'sun2000/state', value_template: '{{ value_json.p }}' }));
       for (let i = 0; i < 2000; i++) msg(c, `zigbee2mqtt/dev${i}`, '{"linkquality":50}');
@@ -248,7 +263,7 @@ describe('mqtt client — topic cache and browse session', () => {
 
     it('keeps a long HA config whole, and lists one too long to keep instead of hiding it', () => {
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       const device = { identifiers: ['x'.repeat(9000)] };
       msg(c, 'homeassistant/sensor/a/config', JSON.stringify({ name: 'Long', state_topic: 's/a', value_template: '{{ value_json.v }}', device }));
       msg(c, 's/a', '{"v":5}');
@@ -286,7 +301,7 @@ describe('mqtt client — topic cache and browse session', () => {
 
     it('keeps at most 4000 bytes of an ordinary payload', () => {
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(c, 'big', 'x'.repeat(100000));
       const t = client.getCachedTopics().topics.find((x) => x.topic === 'big');
       expect(t.sample.length).toBeLessThanOrEqual(300);
@@ -296,7 +311,7 @@ describe('mqtt client — topic cache and browse session', () => {
     it("leaves out the device's own topics and non-sensor HA definitions", () => {
       client.setOutput({ will: { topic: 'apollo/id1/status', payload: 'offline' }, ownPrefix: 'apollo/id1', commandTopics: [] });
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(c, 'apollo/id1/state', '{"a":1}');
       msg(c, 'apollo/other/state', '{"a":1}');
       msg(c, 'homeassistant/switch/x/config', '{}');
@@ -315,7 +330,7 @@ describe('mqtt client — topic cache and browse session', () => {
     it('never logs payloads', () => {
       const spies = ['log', 'info', 'warn', 'error', 'debug'].map((m) => jest.spyOn(console, m).mockImplementation(() => {}));
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(c, 'secret/topic', 'hunter2-password');
       spies.forEach((s) => {
         expect(s).not.toHaveBeenCalled();
@@ -349,7 +364,7 @@ describe('mqtt client — topic cache and browse session', () => {
 
     it('does not disturb input signals while browsing', () => {
       const c = connected({ inputs: [{ name: 'surplus', topic: 'sun/surplus' }] });
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(c, 'sun/surplus', '850');
       expect(client.getValue('surplus').value).toBe(850);
     });
@@ -358,7 +373,7 @@ describe('mqtt client — topic cache and browse session', () => {
   describe('changing the configuration', () => {
     it('adding, changing and removing inputs subscribes on the live link and does not reconnect', () => {
       const c = connected({ inputs: [{ name: 'a', topic: 't/a' }] });
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(c, 'homeassistant/sensor/x/config', JSON.stringify({ name: 'Yield', state_topic: 's/t' }));
       msg(c, 'other/topic', '1');
       msg(c, 't/a', '5');
@@ -375,7 +390,7 @@ describe('mqtt client — topic cache and browse session', () => {
       expect(mqtt.connect).not.toHaveBeenCalled();
 
       // The browse cache, the HA rows and the session survived all of it.
-      const names = client.getCachedTopics({ lease: false }).topics.map((t) => t.topic);
+      const names = client.getCachedTopics().topics.map((t) => t.topic);
       expect(names).toContain('other/topic');
       expect(names.length).toBeGreaterThanOrEqual(2);
       expect(client._isBrowsing()).toBe(true);
@@ -391,7 +406,7 @@ describe('mqtt client — topic cache and browse session', () => {
 
     it('a broker change reconnects and clears the cache', () => {
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(c, 'a/b', '1');
       mqtt.connect.mockClear();
       client.configure({ enabled: true, host: 'other', inputs: [] });
@@ -408,7 +423,7 @@ describe('mqtt client — topic cache and browse session', () => {
 
     it('is cleared on disconnect', () => {
       const c = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(c, 'a/b', '1');
       client.disconnect();
       expect(client._topicCacheSize()).toBe(0);
@@ -417,11 +432,11 @@ describe('mqtt client — topic cache and browse session', () => {
 
     it('late messages from the old client cannot reach the new cache', () => {
       const old = connected();
-      client.getCachedTopics();
+      client.renewBrowse();
       client.configure({ enabled: true, host: 'other', inputs: [] });
       const fresh = probe(mqtt.connect.mock.calls.length - 1);
       fresh.emit('connect');
-      client.getCachedTopics();
+      client.renewBrowse();
       msg(old, 'stale/topic', '1');
       expect(client.getCachedTopics().topics.map((t) => t.topic)).not.toContain('stale/topic');
     });

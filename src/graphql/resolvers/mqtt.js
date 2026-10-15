@@ -26,15 +26,12 @@ module.exports = {
     Mqtt: () => ({}),
   },
 
+  Mutation: {
+    Mqtt: () => ({}),
+  },
+
   MqttActions: {
     config: (_, __, { services }) => wrap(async () => serializeMqttConfig(await services.mqtt.getConfig())),
-
-    updateConfig: (_, { input }, { services }) =>
-      wrap(async () => {
-        const config = serializeMqttConfig(await services.mqtt.updateConfig(input));
-        if (input.inputs !== undefined) triggerTick();
-        return config;
-      }),
 
     testConnection: (_, { input }, { services }) =>
       wrap(async () => {
@@ -45,8 +42,22 @@ module.exports = {
     discoverTopics: (_, { input, prefix, seconds }, { services }) =>
       wrap(async () => services.mqtt.discoverTopics(input, { prefix, seconds })),
 
-    cachedTopics: (_, { lease }, { services }) =>
-      wrap(async () => services.mqtt.cachedTopics({ lease: lease !== false })),
+    cachedTopics: (_, __, { services }) => wrap(async () => services.mqtt.cachedTopics()),
+  },
+
+  MqttMutations: {
+    updateConfig: (_, { input }, { services }) =>
+      wrap(async () => {
+        const config = serializeMqttConfig(await services.mqtt.updateConfig(input));
+        if (input.inputs !== undefined) triggerTick();
+        return config;
+      }),
+
+    renewBrowse: (_, __, { services }) =>
+      wrap(async () => {
+        const { ok, error } = services.mqtt.renewBrowse();
+        return { ok, message: error };
+      }),
 
     endBrowse: (_, __, { services }) =>
       wrap(async () => {

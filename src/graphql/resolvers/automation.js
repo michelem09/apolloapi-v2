@@ -33,6 +33,10 @@ module.exports = {
     Automation: () => ({}),
   },
 
+  Mutation: {
+    Automation: () => ({}),
+  },
+
   AutomationActions: {
     config: (_, __, { services }) =>
       wrap(async () => serializeConfig(await services.automation.getConfig())),
@@ -49,7 +53,9 @@ module.exports = {
     // answer "what would you do right now?" before the user commits to a rule.
     state: (_, __, { services }) =>
       wrap(async () => serializeState(await services.automation.evaluate({ preview: true }))),
+  },
 
+  AutomationMutations: {
     updateConfig: (_, { input }, { services }) =>
       wrap(async () => {
         const config = serializeConfig(await services.automation.updateConfig(input));

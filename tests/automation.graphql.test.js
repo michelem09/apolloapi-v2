@@ -20,7 +20,7 @@ const automation = require('../src/services/automation')(knex, {
 });
 
 const context = { services: { automation } };
-const actions = resolver.AutomationActions;
+const actions = { ...resolver.AutomationActions, ...resolver.AutomationMutations };
 
 beforeEach(async () => {
   await knex('automation_events').del();
@@ -39,6 +39,7 @@ describe('automation schema', () => {
     expect(schema.getType('AutomationActions')).toBeDefined();
     expect(schema.getType('AutomationConfig')).toBeDefined();
     expect(schema.getQueryType().getFields().Automation).toBeDefined();
+    expect(schema.getMutationType().getFields().Automation).toBeDefined();
     expect(schema.getSubscriptionType().getFields().automation).toBeDefined();
   });
 
@@ -50,6 +51,37 @@ describe('automation schema', () => {
     );
 
     expect(unprotected).toEqual([]);
+  });
+
+  it('puts every mutation behind @auth, and leaves no state-changing field on the query side', () => {
+    const mutations = schema.getType('AutomationMutations').getFields();
+    expect(Object.keys(mutations).sort()).toEqual(
+      ['clearOverride', 'createRule', 'deleteRule', 'setOverride', 'updateConfig', 'updateRule']
+    );
+    expect(
+      Object.values(mutations).filter((f) => !f.astNode.directives.some((d) => d.name.value === 'auth'))
+    ).toEqual([]);
+
+    const queries = Object.keys(schema.getType('AutomationActions').getFields());
+    ['updateConfig', 'createRule', 'updateRule', 'deleteRule', 'setOverride', 'clearOverride'].forEach((name) =>
+      expect(queries).not.toContain(name)
+    );
+  });
+
+  it.each([
+    'mutation { Automation { updateConfig(input: { enabled: true }) { result { enabled } } } }',
+    'mutation { Automation { createRule(input: { name: "x" }) { result { id } } } }',
+    'mutation { Automation { updateRule(id: 1, input: { name: "x" }) { result { id } } } }',
+    'mutation { Automation { deleteRule(id: 1) { error { message } } } }',
+    'mutation { Automation { setOverride(input: { minutes: 5 }) { result { enabled } } } }',
+    'mutation { Automation { clearOverride { result { enabled } } } }',
+  ])('rejects an unauthenticated mutation before the resolver runs: %s', async (source) => {
+    const spy = jest.spyOn(automation, 'updateConfig');
+    const result = await graphql({ schema, source, contextValue: { services: { automation } } });
+    expect(result.errors?.[0].message).toMatch(/auth/i);
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+    expect(await knex('automation_rules').count({ n: '*' }).first()).toEqual({ n: 0 });
   });
 
   it('rejects an unauthenticated query at the directive, not at the resolver', async () => {

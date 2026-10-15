@@ -5,6 +5,12 @@ module.exports = gql`
     Automation: AutomationActions
   }
 
+  # Anything that changes state is a mutation: Apollo Client re-executes queries on
+  # a re-render, and a phantom re-fire must never create a rule or pause the miner.
+  extend type Mutation {
+    Automation: AutomationMutations
+  }
+
   type AutomationActions {
     config: AutomationConfigOutput! @auth
     rules: AutomationRulesOutput! @auth
@@ -21,7 +27,9 @@ module.exports = gql`
     without acting and without writing to the event log.
     """
     state: AutomationStateOutput! @auth
+  }
 
+  type AutomationMutations {
     updateConfig(input: AutomationConfigInput!): AutomationConfigOutput! @auth
     createRule(input: AutomationRuleInput!): AutomationRuleOutput! @auth
     updateRule(id: Int!, input: AutomationRuleInput!): AutomationRuleOutput! @auth

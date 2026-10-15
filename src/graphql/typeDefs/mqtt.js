@@ -5,25 +5,40 @@ module.exports = gql`
     Mqtt: MqttActions
   }
 
+  # Anything that changes state is a mutation: Apollo Client re-executes queries on
+  # a re-render, and a phantom re-fire must never save a config or open a browse
+  # session on the broker.
+  extend type Mutation {
+    Mqtt: MqttMutations
+  }
+
   type MqttActions {
     "Broker connection, output settings and input mappings (password never returned)."
     config: MqttConfigOutput! @auth
 
-    updateConfig(input: MqttConfigInput!): MqttConfigOutput! @auth
-
-    "One-off probe of the MQTT broker with the given (or stored) credentials."
+    "One-off probe of the MQTT broker with the given (or stored) credentials. Persists nothing."
     testConnection(input: MqttConfigInput!): MqttTestOutput! @auth
 
-    "Subscribe to a wildcard for a few seconds and return the topics seen."
+    "Subscribe to a wildcard for a few seconds and return the topics seen. Persists nothing."
     discoverTopics(input: MqttConfigInput!, prefix: String, seconds: Int): MqttDiscoverOutput! @auth
 
     """
-    Topics the device's own broker connection has already seen (in-memory, bounded); no scan.
-    Not ok while disconnected. With lease (default) it starts or renews a browse session, during
-    which the device listens to the # wildcard on the broker; the session ends with endBrowse or after 5
-    minutes without a renewal. error set on an ok result means the broker refused #.
+    Topics the device's own broker connection has already seen (in-memory, bounded); no scan,
+    and no side effect: it does not start or renew a browse session (Mutation.Mqtt.renewBrowse
+    does). Not ok while disconnected. error set on an ok result means the broker refused #.
     """
-    cachedTopics(lease: Boolean = true): MqttDiscoverOutput! @auth
+    cachedTopics: MqttDiscoverOutput! @auth
+  }
+
+  type MqttMutations {
+    updateConfig(input: MqttConfigInput!): MqttConfigOutput! @auth
+
+    """
+    Start or renew the browse session, during which the device listens to the # wildcard on
+    the broker. It ends with endBrowse or after 5 minutes without a renewal. Not ok while
+    disconnected.
+    """
+    renewBrowse: MqttTestOutput! @auth
 
     "End the browse session (the modal closed): stop listening to #. The cache is kept."
     endBrowse: MqttTestOutput! @auth

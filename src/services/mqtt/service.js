@@ -151,8 +151,13 @@ class MqttService {
   }
 
   // Topics the shared connection has already seen — read from memory, no scan.
-  cachedTopics(opts) {
-    return client.getCachedTopics(opts);
+  cachedTopics() {
+    return client.getCachedTopics();
+  }
+
+  // Start or renew the browse session (listening to # on the broker).
+  renewBrowse() {
+    return client.renewBrowse();
   }
 
   // The browse modal closed: stop listening to everything on the broker.

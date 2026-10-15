@@ -547,15 +547,24 @@ function buildTopicList(entries) {
 }
 
 // What the shared connection has seen so far, in the same shape as a scan. Needs
-// no new broker connection: it is read from memory. `lease` starts or renews the
-// browse session, so the cache keeps filling while the modal is open.
-function getCachedTopics({ lease = true } = {}) {
+// no new broker connection: it is read from memory. A pure read — it does not
+// touch the browse session (renewBrowse does), so it is safe as a query.
+function getCachedTopics() {
   if (!client || !status.connected) {
     return { ok: false, error: 'Not connected to the MQTT broker', topics: [] };
   }
-  if (lease) startBrowse();
   const all = new Map([...topicCache.map, ...haCache.map]);
   return { ok: true, error: browse.refused, topics: buildTopicList(all) };
+}
+
+// Start or renew the browse session (the modal does this on open and every poll),
+// so the cache keeps filling while someone is looking. Not ok while disconnected.
+function renewBrowse() {
+  if (!client || !status.connected) {
+    return { ok: false, error: 'Not connected to the MQTT broker' };
+  }
+  startBrowse();
+  return { ok: true, error: null };
 }
 
 /**
@@ -665,6 +674,7 @@ module.exports = {
   testConnection,
   discoverTopics,
   getCachedTopics,
+  renewBrowse,
   startBrowse,
   endBrowse,
   setOutput,
