@@ -21,6 +21,12 @@ device through an install. See `docs-ai/ACCEPTANCE_SUITE.md`.
     node acceptance/run.js --profile acceptance/profile.json
     node acceptance/run.js --profile acceptance/profile.json --only timezone
 
+Offline tier (no device, no network): `node --test acceptance/test/*.test.js`.
+
+State-changing calls go through `gqlWrite` (`lib/api.js`): mutation first, and the
+query form of the same text only when the server's schema rejects the mutation
+(v2.1.x serves these as queries). The form that worked is cached per host.
+
 The device must declare itself disposable first, or the run refuses to start:
 
     ssh futurebit@<host> "sudo mkdir -p /var/lib/apollo && \

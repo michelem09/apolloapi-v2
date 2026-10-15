@@ -1,7 +1,8 @@
-const { gql } = require('../lib/api');
+const { gql, gqlWrite } = require('../lib/api');
 const { devicePassword, howToStore } = require('../lib/secrets');
 
-const CHANGE = `query($input: AuthChangePasswordInput!) {
+// Written as a mutation; gqlWrite falls back to the query form on a 2.1.x device.
+const CHANGE = `mutation($input: AuthChangePasswordInput!) {
   Auth { changePassword(input: $input) { error { message } } }
 }`;
 const LOGIN = `query($input: AuthLoginInput!) {
@@ -33,7 +34,7 @@ module.exports = {
       'the supplied password is the one the device currently has'
     );
 
-    const changed = await gql(profile, token, CHANGE, { input: { password: temporary } });
+    const changed = await gqlWrite(profile, token, CHANGE, { input: { password: temporary } });
     assert(changed.Auth.changePassword.error === null, 'the password was changed');
 
     // From here the device is on a generated password, so every path out of this
@@ -49,7 +50,7 @@ module.exports = {
       const fresh = await gql(profile, token, LOGIN, { input: { password: temporary } });
       assert(!!fresh.Auth.login.result?.accessToken, 'the new password logs in');
     } finally {
-      back = await gql(profile, token, CHANGE, { input: { password: original } });
+      back = await gqlWrite(profile, token, CHANGE, { input: { password: original } });
     }
     assert(back.Auth.changePassword.error === null, 'the original password was restored');
 

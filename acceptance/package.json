@@ -8,6 +8,7 @@
   },
   "scripts": {
     "run": "node run.js",
+    "test": "node --test test/*.test.js",
     "browser": "playwright test --config browser/playwright.config.js"
   },
   "dependencies": {},

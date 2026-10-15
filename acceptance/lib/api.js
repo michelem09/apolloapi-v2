@@ -48,9 +48,55 @@ const gql = async (profile, token, query, variables = {}) => {
     error.malformed = body.errors.some(
       (e) => e.extensions?.code === 'GRAPHQL_VALIDATION_FAILED'
     );
+    error.graphqlErrors = body.errors;
     throw error;
   }
   return body.data;
 };
 
-module.exports = { mintToken, gql, deviceNode };
+// The v2.2 line moved state-changing actions (Auth.changePassword, Pool writes,
+// Settings.update, ...) from Query to Mutation; 2.1.x still serves them as
+// queries. A write goes out as a mutation first and, only if the server's schema
+// does not know it there, again as the query of the same text.
+const writeForms = new Map(); // apiBase -> 'mutation' | 'query'
+
+// True only when EVERY error is a validation failure about the Mutation root: an
+// unknown field on type "Mutation", or a schema with no Mutation type at all.
+// Auth errors, network errors and business errors (other Apollo codes, or a
+// field-level `error` payload) never match, so they surface instead of being
+// retried as a query.
+const mutationUnknown = (error) => {
+  const errors = error?.graphqlErrors;
+  if (!error?.malformed || !Array.isArray(errors) || errors.length === 0) return false;
+  return errors.every(
+    (e) =>
+      e.extensions?.code === 'GRAPHQL_VALIDATION_FAILED' &&
+      (/Cannot query field "[^"]+" on type "Mutation"/.test(e.message) ||
+        /Schema is not configured for mutations/.test(e.message))
+  );
+};
+
+const asQuery = (doc) => {
+  if (!/^\s*mutation\b/.test(doc)) throw new Error('gqlWrite expects a document starting with "mutation"');
+  return doc.replace(/^(\s*)mutation\b/, '$1query');
+};
+
+// `send` is the transport, injectable so the fallback is testable without a device.
+const gqlWrite = async (profile, token, mutationDoc, variables = {}, send = gql) => {
+  const key = profile.apiBase;
+  if (writeForms.get(key) === 'query') return send(profile, token, asQuery(mutationDoc), variables);
+  try {
+    const data = await send(profile, token, mutationDoc, variables);
+    writeForms.set(key, 'mutation');
+    return data;
+  } catch (error) {
+    if (writeForms.get(key) === 'mutation' || !mutationUnknown(error)) throw error;
+    const data = await send(profile, token, asQuery(mutationDoc), variables);
+    writeForms.set(key, 'query');
+    return data;
+  }
+};
+
+const resetWriteForms = () => writeForms.clear();
+
+module.exports = { mintToken, gql, gqlWrite, resetWriteForms, deviceNode };
