@@ -124,7 +124,8 @@ run_update() {
         APOLLO_UPDATE_PROGRESS_FILE="$tmp/progress" \
         bash "$SCRIPT" >/dev/null 2>&1
 }
-expected_owned="$(printf '%s\n' "$app/apolloui-v2/.next" "$app/apolloui-v2/node_modules" "$app/node_modules" "$tmp/nvme/.yarn-cache" | sort)"
+for f in "$app/yarn-error.log" "$app/apolloui-v2/yarn-error.log"; do : > "$f"; done
+expected_owned="$(printf '%s\n' "$app/yarn-error.log" "$app/apolloui-v2/yarn-error.log" "$app/apolloui-v2/.next" "$app/apolloui-v2/node_modules" "$app/node_modules" "$tmp/nvme/.yarn-cache" | sort)"
 owned_paths() { grep '^chown -R futurebit:futurebit ' "$tmp/calls.log" | grep -v " $tmp/state\$" | sed 's/^chown -R futurebit:futurebit //' | sort; }
 
 run_update
@@ -147,6 +148,22 @@ sl=$(grep -n 'systemctl start apollo-api.service' "$tmp/calls.log" | tail -1 | c
 check "build fails: apollo-api is started exactly once"   "1" "$(grep -c 'systemctl start apollo-api.service' "$tmp/calls.log")"
 check "build fails: the recovery ran once (node)"         "1" "$(grep -c 'systemctl start node.service' "$tmp/calls.log")"
 check "build fails: apollo-api is started again after it" "1" "$( [ -n "$bl" ] && [ -n "$sl" ] && [ "$sl" -gt "$bl" ] && echo 1 || echo 0 )"
+
+# --- 5. on_error is a no-op in a subshell ------------------------------------
+# Under bash 3.2 a set -E subshell inherits the ERR trap, and bash 5 can leave it
+# unreached, so a real run does not exercise the guard reliably: call on_error
+# itself, in a subshell and in the main shell.
+eval "$(sed -n '/^on_error()/,/^}/p' "$SCRIPT")"
+restore_solo_intent() { :; }; own_build_artefacts() { :; }
+TMPFILE="$tmp/progress-sub"; : > "$TMPFILE"
+: > "$tmp/calls.log"
+( PATH="$bin:$PATH"; false || on_error ) >/dev/null 2>&1
+check "on_error in a subshell starts nothing"            "0" "$(grep -c '^systemctl start' "$tmp/calls.log")"
+check "…and leaves the progress file alone"              "1" "$( [ -e "$TMPFILE" ] && echo 1 || echo 0 )"
+PATH="$bin:$PATH" TMPFILE="$tmp/progress-main" bash -c "$(sed -n '/^on_error()/,/^}/p' "$SCRIPT")
+restore_solo_intent() { :; }; own_build_artefacts() { :; }
+false; on_error" >/dev/null 2>&1
+check "on_error in the main shell of a run starts the API" "1" "$(grep -c '^systemctl start apollo-api.service' "$tmp/calls.log")"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -1,5 +1,8 @@
 #!/bin/bash
 set -Eeuo pipefail
+# Without this, `set -e` is dropped inside $(...) on bash >= 4.4 (the device has
+# 5.2); older bash (3.2, macOS test harness) does not know the option.
+shopt -s inherit_errexit 2>/dev/null || true
 
 YELLOW='\033[1;33m'
 NC='\033[0m'
@@ -42,7 +45,8 @@ resolve_database_url() {
         fi
     done
     # Not found is an empty answer, not a failure: callers run this inside
-    # $(...), where a non-zero return would fire the inherited ERR trap.
+    # $(...), where under bash 3.2 (e.g. the macOS test harness) a non-zero
+    # return fires the inherited ERR trap. Harmless on the device's bash 5.
     return 0
 }
 
@@ -108,9 +112,11 @@ restore_solo_intent() {
 # the artefacts back with a chown afterwards rather than running the build under
 # `sudo -u futurebit`: the tree can already hold root-owned files from an earlier
 # run or a half-finished update, which would make a futurebit build fail
-# half-way here instead, with the services already stopped. Only these paths are
-# chowned, never the checkout: backend/apollo-miner, backend/ckpool and
-# backend/node hold untracked binaries that keep their owner and mode.
+# half-way here instead, with the services already stopped. The chown is narrow
+# on purpose, for the manual ssh deploy path (untracked binaries in
+# backend/apollo-miner, ckpool and node keep their owner and mode). It is not a
+# security boundary: the 2.1.4 updater and image_update/install already chown
+# the whole checkout.
 # Called on success and from on_error, so a half-run build can be retried.
 own_build_artefacts() {
     local path
@@ -118,6 +124,8 @@ own_build_artefacts() {
         "${UI_DIR}/.next" \
         "${UI_DIR}/node_modules" \
         "${APOLLO_DIR}/node_modules" \
+        "${UI_DIR}/yarn-error.log" \
+        "${APOLLO_DIR}/yarn-error.log" \
         "${YARN_CACHE_FOLDER:-}"; do
         if [ -n "$path" ] && [ -e "$path" ]; then
             chown -R futurebit:futurebit "$path" || true
@@ -127,9 +135,10 @@ own_build_artefacts() {
 
 on_error() {
     local status=$?
-    # set -E makes subshells (command substitutions) inherit the ERR trap. A
-    # failure there is the caller's to handle: running the recovery from a
-    # subshell would start services and delete the progress file mid-update.
+    # Under bash 3.2 (e.g. the macOS test harness) set -E makes subshells
+    # inherit the ERR trap and it fires there; harmless on bash 5. A failure in
+    # a subshell is the caller's to handle: running the recovery from it would
+    # start services and delete the progress file mid-update.
     if [ "$BASH_SUBSHELL" != 0 ]; then
         return "$status"
     fi
