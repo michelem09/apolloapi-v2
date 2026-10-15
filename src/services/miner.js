@@ -4,7 +4,7 @@ const { exec } = require('child_process');
 const _ = require('lodash');
 const moment = require('moment');
 const { GraphQLError } = require('graphql');
-const { getMinerRuntimeDir, getCkpoolLogsDir } = require('../paths');
+const { getMinerRuntimeDir, getApolloIIIStatsDir, getCkpoolLogsDir } = require('../paths');
 const log = require('../logger')('miner');
 
 // Import the dev miner service for development mode
@@ -282,7 +282,11 @@ class MinerService {
   // Helper method to check if miner is online
   async _isMinerOnline(dbStatus) {
     try {
-      const statsDir = getMinerRuntimeDir();
+      // USB stat files live in the runtime dir; the III stat file may live in a
+      // different one (APOLLO_III_STATS_DIR), and both count as "miner is up".
+      const statsDirs = [
+        ...new Set([getMinerRuntimeDir(), getApolloIIIStatsDir()]),
+      ];
       const statsFilePattern = /^apollo-miner.*$/;
 
       // Define thresholds
@@ -296,31 +300,25 @@ class MinerService {
         ? new Date(dbStatus.requestedAt).getTime()
         : 0;
 
-      // Check if the directory exists
-      try {
-        await fs.access(statsDir, fs.constants.F_OK);
-      } catch (err) {
-        // Directory does not exist
-        if (err.code === 'ENOENT') {
-          // If request is to start the miner and within pending threshold, return pending
-          if (
-            dbStatus.requestedStatus === 'online' &&
-            currentTime - requestedAtTime <= pendingThresholdMs
-          ) {
-            return { status: 'pending' };
-          }
-          // Otherwise, return offline
-          return { status: 'offline' };
+      // List the stat files of every dir; a missing dir is simply empty
+      const statsFiles = [];
+      let anyDirExists = false;
+      for (const dir of statsDirs) {
+        let files;
+        try {
+          files = await fs.readdir(dir);
+        } catch (err) {
+          if (err.code === 'ENOENT') continue;
+          throw err;
         }
-        throw err;
+        anyDirExists = true;
+        for (const file of files) {
+          if (statsFilePattern.test(file)) statsFiles.push(path.join(dir, file));
+        }
       }
 
-      // List all files in the directory
-      const files = await fs.readdir(statsDir);
-      const statsFiles = files.filter((file) => statsFilePattern.test(file));
-
-      // If no stats files, check requested status and pending threshold
-      if (statsFiles.length === 0) {
+      // No dir, or no stats files: check requested status and pending threshold
+      if (!anyDirExists || statsFiles.length === 0) {
         if (
           dbStatus.requestedStatus === 'online' &&
           currentTime - requestedAtTime <= pendingThresholdMs
@@ -334,8 +332,7 @@ class MinerService {
       let latestFile = null;
       let latestMtime = 0;
 
-      for (const file of statsFiles) {
-        const filePath = path.join(statsDir, file);
+      for (const filePath of statsFiles) {
         const stats = await fs.stat(filePath);
 
         if (stats.mtimeMs > latestMtime) {
@@ -511,8 +508,7 @@ class MinerService {
     // written alongside the USB stat files. The backend miner script launches
     // the III binary; there is no separate systemd unit.
     try {
-      const iiiStatsDir =
-        process.env.APOLLO_III_STATS_DIR || getMinerRuntimeDir();
+      const iiiStatsDir = getApolloIIIStatsDir();
       const iiiPath = `${iiiStatsDir}/apollo-miner-3.json`;
       await fs.access(iiiPath);
       const parsed = await this._parseStatFileEntry(iiiPath, {

@@ -22,6 +22,12 @@ function getMinerRuntimeDir(stateDir = getStateDir()) {
   return path.join(stateDir, 'miner');
 }
 
+// Where the Apollo III stat file (apollo-miner-3.json) is read from. The one
+// place that decides it: the online check and the stats read must agree.
+function getApolloIIIStatsDir(env = process.env) {
+  return env.APOLLO_III_STATS_DIR || getMinerRuntimeDir();
+}
+
 // True when we manage runtime state under a state dir (production, or an
 // explicit APOLLO_STATE_DIR). In plain development the DB stays in the repo.
 function isManagedStateDir() {
@@ -173,6 +179,7 @@ module.exports = {
   getStateDir,
   getDbPath,
   getMinerRuntimeDir,
+  getApolloIIIStatsDir,
   getCkpoolRuntimeDir,
   getCkpoolLogsDir,
   getLegacyDbPath,
