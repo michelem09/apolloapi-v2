@@ -22,7 +22,7 @@ jest.mock('../src/logger', () => {
 });
 
 const logger = require('../src/logger');
-const { getDeviceFamily, parseBoardName, resetDeviceFamilyCache } = require('../src/deviceFamily');
+const { getDeviceFamily, parseBoardName, familyOf, resetDeviceFamilyCache } = require('../src/deviceFamily');
 const { hasUsbMiners, resetUsbMinersCache, GRACE_MS } = require('../src/usbMiners');
 const { MINER_MODES, availableMinerModes } = require('../src/constants/minerModes');
 const signals = require('../src/services/signals');
@@ -35,7 +35,9 @@ const NO_SUPER = ['eco', 'balanced', 'turbo', 'custom'];
 // (null: no such file, as on a dev machine or in CI).
 const FAMILIES = {
   'apollo-iii': { release: 'BOARD_NAME="Apollo 3"\n', modes: ALL },
-  legacy: { release: 'BOARD=orangepi\nBOARD_NAME="Orange Pi Zero"\n', modes: NO_SUPER },
+  legacy: { release: 'BOARD=orangepi4-lts\nBOARD_NAME="FutureBit Apollo II"\n', modes: NO_SUPER },
+  // An Apollo III whose armbian-release was reset to stock must not lose super_eco.
+  'stock-board': { release: 'BOARD=rock-5b-plus\nBOARD_NAME="Rock 5B Plus"\n', modes: ALL },
   // A Solo Node only has modes while USB miners are attached.
   'solo-node': { release: "BOARD_NAME='Solo Node'\n", usb: true, modes: NO_SUPER },
   'solo-node-no-usb': { release: "BOARD_NAME='Solo Node'\n", usb: false, modes: [] },
@@ -92,6 +94,7 @@ describe('device family detection (armbian-release BOARD_NAME)', () => {
     ['export prefix', 'export BOARD_NAME="Apollo 3"\n', 'Apollo 3'],
     ['leading whitespace', '   BOARD_NAME=foo\n', 'foo'],
     ['escaped quote in double quotes', 'BOARD_NAME="a\\"b"\n', 'a"b'],
+    ['multi-word name with a trailing comment', 'BOARD_NAME="FutureBit Apollo II" # x\n', 'FutureBit Apollo II'],
     ['empty value is unset', 'BOARD_NAME=\n', null],
     ['empty quotes are unset', 'BOARD_NAME=""\n', null],
     ['a later empty assignment unsets an earlier one', 'BOARD_NAME=foo\nBOARD_NAME=\n', null],
@@ -101,6 +104,22 @@ describe('device family detection (armbian-release BOARD_NAME)', () => {
     ['a commented-out line is ignored', '# BOARD_NAME=foo\n', null],
   ])('parses: %s', (_name, text, expected) => {
     expect(parseBoardName(text)).toBe(expected);
+  });
+
+  it.each([
+    ['FutureBit Apollo II', 'legacy'],
+    ['FutureBit Apollo BTC', 'legacy'],
+    ['FutureBit Apollo', 'legacy'],
+    ['Apollo 3', 'apollo-iii'],
+    ['Solo Node', 'solo-node'],
+    ['FutureBit Apollo 3', 'unknown'], // names the III: never legacy
+    ['FutureBit Apollo III', 'unknown'],
+    ['FutureBit Apollonia', 'unknown'], // \b: not a word boundary match
+    ['Rock 5B Plus', 'unknown'],
+    ['Orange Pi Zero', 'unknown'],
+    [null, 'unknown'],
+  ])('familyOf(%s) is %s', (board, family) => {
+    expect(familyOf(board)).toBe(family);
   });
 
   describe('cache', () => {
@@ -129,7 +148,9 @@ describe('device family detection (armbian-release BOARD_NAME)', () => {
 
   it.each(Object.keys(FAMILIES))('resolves %s', (name) => {
     asDevice(name);
-    expect(getDeviceFamily()).toBe(name.replace('-no-usb', ''));
+    expect(getDeviceFamily()).toBe(
+      { 'solo-node-no-usb': 'solo-node', 'stock-board': 'unknown' }[name] || name
+    );
   });
 
   it('is unknown (not legacy) when the file has no BOARD_NAME', () => {

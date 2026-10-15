@@ -9,11 +9,13 @@ const fs = require('fs');
  *
  *   'apollo-iii'  BOARD_NAME="Apollo 3"   internal apollo-miner-v3
  *   'solo-node'   BOARD_NAME="Solo Node"  no internal miner (USB boards only)
- *   'legacy'      any other BOARD_NAME    Apollo I/II (the scripts' catch-all; the
- *                                         real Apollo I/II values are not documented
- *                                         anywhere we could find, so no explicit list)
- *   'unknown'     file missing/unreadable, or no BOARD_NAME in it (dev machine,
- *                 CI): callers treat this as "do not restrict anything"
+ *   'legacy'      BOARD_NAME="FutureBit Apollo …"  Apollo I/II. Read off an Apollo II
+ *                 ("FutureBit Apollo II"); an Apollo I (BTC) is ASSUMED to start with
+ *                 "FutureBit Apollo" too — no unit available to confirm.
+ *   'unknown'     file missing/unreadable, no BOARD_NAME, or any other name (dev
+ *                 machine, CI, a stock "Rock 5B Plus"): callers treat this as "do not
+ *                 restrict anything". NB miner_start.sh/set_UI_mode.sh still use
+ *                 their own catch-all (anything else = legacy); deliberately unchanged.
  *
  * Only a definite answer is cached — a board never changes at runtime, but an
  * unreadable file might be readable on the next call.
@@ -57,7 +59,11 @@ function familyOf(board) {
   if (!board) return 'unknown';
   if (board === 'Apollo 3') return 'apollo-iii';
   if (board === 'Solo Node') return 'solo-node';
-  return 'legacy';
+  // Anything that names the III is never legacy, whatever its prefix.
+  if (/^FutureBit Apollo\b/.test(board) && !/\b(3|III)\b/i.test(board)) return 'legacy';
+  // Anything else (e.g. the stock "Rock 5B Plus" an apt upgrade resets an
+  // Apollo III to) cannot be told apart from a board we know: do not restrict.
+  return 'unknown';
 }
 
 function getDeviceFamily(env = process.env) {
