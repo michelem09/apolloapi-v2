@@ -6,7 +6,7 @@
 # (futurebit-owned) before this unit runs; the install -d here is only a
 # fallback, and it must keep that ownership: this script runs as root, and a
 # root-owned dir makes the next bootstrap (futurebit) fail with EACCES.
-BIN_DIR=/opt/apolloapi/backend/apollo-miner
+BIN_DIR="${APOLLO_BIN_DIR:-/opt/apolloapi/backend/apollo-miner}"
 STATE_DIR="${APOLLO_STATE_DIR:-/var/lib/apollo}"
 RUNTIME_DIR="${STATE_DIR}/miner"
 
@@ -22,6 +22,27 @@ settings=""
 settings3=""
 [[ -r miner_config  ]] && settings=$(<miner_config)
 [[ -r miner_config3 ]] && settings3=$(<miner_config3)
+
+# The Apollo III binary writes apollo-miner-3.json next to ITSELF, not into its
+# cwd (observed: cwd was $RUNTIME_DIR, the file landed in $BIN_DIR, root-owned,
+# inside the OTA checkout, where the API never looks). It is not known whether it
+# resolves its own dir from argv[0] or from /proc/self/exe; a symlink would only
+# satisfy the first. A real copy in $RUNTIME_DIR satisfies both, so the III
+# binary is run from there. Refreshed when the checkout's binary differs (OTA).
+# Prints the path to launch; falls back to the checkout binary if the copy fails.
+# The USB binaries are untouched: their stat files already land in the cwd.
+stage_v3_binary()
+{
+    local src="$BIN_DIR"/futurebit-miner-v3
+    local dst="$RUNTIME_DIR/futurebit-miner-v3"
+    if [[ -x "$dst" ]] && cmp -s "$src" "$dst"; then
+        echo "$dst"
+    elif install -m 755 "$src" "$dst" >&2 && [[ -x "$dst" ]]; then
+        echo "$dst"
+    else
+        echo "$src"
+    fi
+}
 
 start_hashboards()
 {
@@ -57,7 +78,8 @@ rm -f apollo-miner.* apollo-miner-v*.*
 case "${BOARD_NAME:-}" in
     "Apollo 3")
         # Start the internal miner immediately, then wait for external USB miners.
-        screen -dmS miner "$BIN_DIR"/futurebit-miner-v3 $settings3
+        miner_v3=$(stage_v3_binary)
+        screen -dmS miner "$miner_v3" $settings3
         sleep 35
         ;;
     "Solo Node")
