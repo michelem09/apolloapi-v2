@@ -17,8 +17,16 @@ module.exports = gql`
     "Subscribe to a wildcard for a few seconds and return the topics seen."
     discoverTopics(input: MqttConfigInput!, prefix: String, seconds: Int): MqttDiscoverOutput! @auth
 
-    "Topics the device's own broker connection has already seen (in-memory, bounded); no scan. Not ok while disconnected."
-    cachedTopics: MqttDiscoverOutput! @auth
+    """
+    Topics the device's own broker connection has already seen (in-memory, bounded); no scan.
+    Not ok while disconnected. With lease (default) it starts or renews a browse session, during
+    which the device listens to the # wildcard on the broker; the session ends with endBrowse or after 5
+    minutes without a renewal. error set on an ok result means the broker refused #.
+    """
+    cachedTopics(lease: Boolean = true): MqttDiscoverOutput! @auth
+
+    "End the browse session (the modal closed): stop listening to #. The cache is kept."
+    endBrowse: MqttTestOutput! @auth
   }
 
   type MqttConfigOutput {

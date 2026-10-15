@@ -74,7 +74,7 @@ describe('MQTT client — reconnect signature & command routing', () => {
     expect(client.getValue('a')).toMatchObject({ value: 5 });
   });
 
-  it('clears the cache when the topic set changes (reconnect)', () => {
+  it('drops an input reading when its topic changes (no reconnect)', () => {
     client.configure(base);
     client._ingest('t1', Buffer.from('5'));
     client.configure({ ...base, inputs: [{ name: 'a', topic: 't2' }] });

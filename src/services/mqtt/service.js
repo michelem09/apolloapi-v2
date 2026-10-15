@@ -132,8 +132,14 @@ class MqttService {
   }
 
   // Topics the shared connection has already seen — read from memory, no scan.
-  cachedTopics() {
-    return client.getCachedTopics();
+  cachedTopics(opts) {
+    return client.getCachedTopics(opts);
+  }
+
+  // The browse modal closed: stop listening to everything on the broker.
+  endBrowse() {
+    client.endBrowse();
+    return { ok: true, error: null };
   }
 }
 

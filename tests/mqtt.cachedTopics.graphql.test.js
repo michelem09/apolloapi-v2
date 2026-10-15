@@ -11,6 +11,11 @@ describe('Mqtt.cachedTopics', () => {
     expect(field.astNode.directives.some((d) => d.name.value === 'auth')).toBe(true);
   });
 
+  it('has the @auth directive on endBrowse too', () => {
+    const field = schema.getType('MqttActions').getFields().endBrowse;
+    expect(field.astNode.directives.some((d) => d.name.value === 'auth')).toBe(true);
+  });
+
   it('is rejected without a token, before the resolver runs', async () => {
     const getCachedTopics = jest.spyOn(client, 'getCachedTopics');
     const res = await graphql({ schema, source: QUERY, contextValue: { services: {} } });

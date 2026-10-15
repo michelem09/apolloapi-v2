@@ -45,6 +45,13 @@ module.exports = {
     discoverTopics: (_, { input, prefix, seconds }, { services }) =>
       wrap(async () => services.mqtt.discoverTopics(input, { prefix, seconds })),
 
-    cachedTopics: (_, __, { services }) => wrap(async () => services.mqtt.cachedTopics()),
+    cachedTopics: (_, { lease }, { services }) =>
+      wrap(async () => services.mqtt.cachedTopics({ lease: lease !== false })),
+
+    endBrowse: (_, __, { services }) =>
+      wrap(async () => {
+        const { ok, error } = services.mqtt.endBrowse();
+        return { ok, message: error };
+      }),
   },
 };
