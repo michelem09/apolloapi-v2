@@ -41,7 +41,9 @@ resolve_database_url() {
             return 0
         fi
     done
-    return 1
+    # Not found is an empty answer, not a failure: callers run this inside
+    # $(...), where a non-zero return would fire the inherited ERR trap.
+    return 0
 }
 
 preserve_solo_intent() {
@@ -50,7 +52,8 @@ preserve_solo_intent() {
     fi
 
     local database_url
-    if ! database_url=$(resolve_database_url); then
+    database_url=$(resolve_database_url)
+    if [ -z "$database_url" ]; then
         return 0
     fi
 
@@ -68,7 +71,8 @@ restore_solo_intent() {
     [ -f "$SOLO_REQUEST_FILE" ] || return 0
 
     local database_url
-    if ! database_url=$(resolve_database_url); then
+    database_url=$(resolve_database_url)
+    if [ -z "$database_url" ]; then
         # Keep the marker so a later run can still restore the user's intent
         # instead of silently dropping their solo-mining setting.
         echo -e "${YELLOW}Could not locate the database; keeping preserved solo intent${NC}" >&2
@@ -123,6 +127,12 @@ own_build_artefacts() {
 
 on_error() {
     local status=$?
+    # set -E makes subshells (command substitutions) inherit the ERR trap. A
+    # failure there is the caller's to handle: running the recovery from a
+    # subshell would start services and delete the progress file mid-update.
+    if [ "$BASH_SUBSHELL" != 0 ]; then
+        return "$status"
+    fi
     trap - ERR
     restore_solo_intent || true
     # stop_runtime_services took the API down; bring it back so a failed update
@@ -132,12 +142,7 @@ on_error() {
     # (the API's service monitor only follows the user's requested status).
     # ckpool is left to the API's own lifecycle.
     systemctl start node.service >/dev/null 2>&1 || true
-    # Not from the ERR trap that set -E also fires inside $(...) subshells
-    # (resolve_database_url): that one is spurious and a recursive chown of
-    # node_modules there would run before anything has been built.
-    if [ "$BASH_SUBSHELL" = 0 ]; then
-        own_build_artefacts || true
-    fi
+    own_build_artefacts || true
     rm -f "$TMPFILE"
     echo "Update failed; the system was not rebooted" >&2
     exit "$status"

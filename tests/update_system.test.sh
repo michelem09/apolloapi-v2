@@ -132,6 +132,8 @@ check "success: the update runs to the reboot"            "1" "$(grep -c '^syste
 check "success: exactly the build artefacts are chowned"  "$expected_owned" "$(owned_paths)"
 chown_line=$(grep -n "^chown -R futurebit:futurebit $app/apolloui-v2/.next" "$tmp/calls.log" | head -1 | cut -d: -f1)
 build_line=$(grep -n '^yarn build' "$tmp/calls.log" | head -1 | cut -d: -f1)
+check "success: on_error never ran (no service started)"  "0" "$(grep -c '^systemctl start' "$tmp/calls.log")"
+check "success: the progress file survived until the end" "1" "$(grep -c '^sleep 8' "$tmp/calls.log")"
 check "success: …after the build"                         "1" "$( [ -n "$chown_line" ] && [ -n "$build_line" ] && [ "$chown_line" -gt "$build_line" ] && echo 1 || echo 0 )"
 check "success: binaries dirs are not chowned"            "0" "$(grep '^chown ' "$tmp/calls.log" | grep -c -E 'backend|apollo-miner|ckpool|bitcoind')"
 check "success: the checkout itself is not chowned"       "0" "$(grep -c -E "^chown .* $app/?$" "$tmp/calls.log")"
@@ -142,6 +144,8 @@ check "build fails: the half-built artefacts are chowned" "$expected_owned" "$(o
 check "build fails: binaries dirs are not chowned"        "0" "$(grep '^chown ' "$tmp/calls.log" | grep -c -E 'backend|apollo-miner|ckpool|bitcoind')"
 bl=$(grep -n '^yarn build' "$tmp/calls.log" | head -1 | cut -d: -f1)
 sl=$(grep -n 'systemctl start apollo-api.service' "$tmp/calls.log" | tail -1 | cut -d: -f1)
+check "build fails: apollo-api is started exactly once"   "1" "$(grep -c 'systemctl start apollo-api.service' "$tmp/calls.log")"
+check "build fails: the recovery ran once (node)"         "1" "$(grep -c 'systemctl start node.service' "$tmp/calls.log")"
 check "build fails: apollo-api is started again after it" "1" "$( [ -n "$bl" ] && [ -n "$sl" ] && [ "$sl" -gt "$bl" ] && echo 1 || echo 0 )"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
