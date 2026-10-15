@@ -5,7 +5,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 TMPFILE="${APOLLO_UPDATE_PROGRESS_FILE:-/tmp/update_progress}"
 SOLO_REQUEST_FILE="${APOLLO_SOLO_REQUEST_FILE:-/run/apollo-update-solo-requested-status}"
-APOLLO_DIR='/opt/apolloapi'
+APOLLO_DIR="${APOLLO_UPDATE_DIR:-/opt/apolloapi}"  # env override: tests only
 UI_DIR="${APOLLO_DIR}/apolloui-v2"
 STATE_DIR="${APOLLO_STATE_DIR:-/var/lib/apollo}"
 
@@ -98,6 +98,29 @@ restore_solo_intent() {
     rm -f "$SOLO_REQUEST_FILE"
 }
 
+# This script runs as root, so yarn and the UI build leave root-owned files in
+# the checkout, and the next plain `yarn build` as futurebit (the deploy flow;
+# the services run as futurebit too) dies with EACCES on .next/trace. We hand
+# the artefacts back with a chown afterwards rather than running the build under
+# `sudo -u futurebit`: the tree can already hold root-owned files from an earlier
+# run or a half-finished update, which would make a futurebit build fail
+# half-way here instead, with the services already stopped. Only these paths are
+# chowned, never the checkout: backend/apollo-miner, backend/ckpool and
+# backend/node hold untracked binaries that keep their owner and mode.
+# Called on success and from on_error, so a half-run build can be retried.
+own_build_artefacts() {
+    local path
+    for path in \
+        "${UI_DIR}/.next" \
+        "${UI_DIR}/node_modules" \
+        "${APOLLO_DIR}/node_modules" \
+        "${YARN_CACHE_FOLDER:-}"; do
+        if [ -n "$path" ] && [ -e "$path" ]; then
+            chown -R futurebit:futurebit "$path" || true
+        fi
+    done
+}
+
 on_error() {
     local status=$?
     trap - ERR
@@ -109,6 +132,12 @@ on_error() {
     # (the API's service monitor only follows the user's requested status).
     # ckpool is left to the API's own lifecycle.
     systemctl start node.service >/dev/null 2>&1 || true
+    # Not from the ERR trap that set -E also fires inside $(...) subshells
+    # (resolve_database_url): that one is spurious and a recursive chown of
+    # node_modules there would run before anything has been built.
+    if [ "$BASH_SUBSHELL" = 0 ]; then
+        own_build_artefacts || true
+    fi
     rm -f "$TMPFILE"
     echo "Update failed; the system was not rebooted" >&2
     exit "$status"
@@ -170,7 +199,7 @@ select_yarn_cache() {
 }
 
 set +u
-. /usr/local/nvm/nvm.sh
+. "${APOLLO_NVM_SH:-/usr/local/nvm/nvm.sh}"
 nvm use 21
 set -u
 select_yarn_cache
@@ -191,6 +220,7 @@ rm -rf .next
 yarn build
 
 yarn cache clean
+own_build_artefacts
 
 echo "70" > "$TMPFILE"
 echo -e "${YELLOW} ---> Updating system binaries${NC}"

@@ -93,5 +93,56 @@ PATH="$bin:$PATH" APOLLO_SOLO_REQUEST_FILE="$tmp/solo" APOLLO_UPDATE_PROGRESS_FI
     bash "$SCRIPT" >/dev/null 2>&1
 check "inside its unit it does not re-exec"              "0" "$(grep -c '^systemd-run' "$tmp/calls.log")"
 
+# --- 4. build artefacts go back to futurebit; binaries keep their owner ---------
+# Run past the nvm step against a fake checkout. yarn is a stub that creates the
+# root-owned directories a real run would, and can be made to fail on "build".
+for c in yarn sudo sleep; do
+    cat > "$bin/$c" <<EOS
+#!/bin/sh
+echo "$c \$*" >> "$tmp/calls.log"
+if [ "$c" = yarn ]; then
+    case "\$*" in
+        build) mkdir -p "\$PWD/.next"; [ -n "\${FAKE_BUILD_FAILS:-}" ] && exit 1 ;;
+    esac
+fi
+exit 0
+EOS
+done
+# Services report as stopped, or stop_runtime_services gives up before the build.
+printf '#!/bin/sh\necho "systemctl $*" >> "%s/calls.log"\ncase "$1" in is-active) exit 3;; esac\nexit 0\n' "$tmp" > "$bin/systemctl"
+printf '#!/bin/sh\nexit 1\n' > "$bin/pgrep"
+chmod +x "$bin"/*
+app="$tmp/app"
+mkdir -p "$app/node_modules" "$app/apolloui-v2/node_modules" "$app/backend/systemd" \
+    "$app/backend/apollo-miner" "$app/backend/ckpool" "$app/backend/node"
+printf 'nvm() { :; }\n' > "$tmp/nvm.sh"
+run_update() {
+    : > "$tmp/calls.log"
+    PATH="$bin:$PATH" APOLLO_UPDATE_DIR="$app" APOLLO_NVM_SH="$tmp/nvm.sh" \
+        APOLLO_YARN_CACHE_BASE="$tmp/nvme" APOLLO_UPDATE_SYSTEM_DETACHED=1 \
+        APOLLO_STATE_DIR="$tmp/state" APOLLO_SOLO_REQUEST_FILE="$tmp/solo" \
+        APOLLO_UPDATE_PROGRESS_FILE="$tmp/progress" \
+        bash "$SCRIPT" >/dev/null 2>&1
+}
+expected_owned="$(printf '%s\n' "$app/apolloui-v2/.next" "$app/apolloui-v2/node_modules" "$app/node_modules" "$tmp/nvme/.yarn-cache" | sort)"
+owned_paths() { grep '^chown -R futurebit:futurebit ' "$tmp/calls.log" | grep -v " $tmp/state\$" | sed 's/^chown -R futurebit:futurebit //' | sort; }
+
+run_update
+check "success: the update runs to the reboot"            "1" "$(grep -c '^systemctl reboot' "$tmp/calls.log")"
+check "success: exactly the build artefacts are chowned"  "$expected_owned" "$(owned_paths)"
+chown_line=$(grep -n "^chown -R futurebit:futurebit $app/apolloui-v2/.next" "$tmp/calls.log" | head -1 | cut -d: -f1)
+build_line=$(grep -n '^yarn build' "$tmp/calls.log" | head -1 | cut -d: -f1)
+check "success: …after the build"                         "1" "$( [ -n "$chown_line" ] && [ -n "$build_line" ] && [ "$chown_line" -gt "$build_line" ] && echo 1 || echo 0 )"
+check "success: binaries dirs are not chowned"            "0" "$(grep '^chown ' "$tmp/calls.log" | grep -c -E 'backend|apollo-miner|ckpool|bitcoind')"
+check "success: the checkout itself is not chowned"       "0" "$(grep -c -E "^chown .* $app/?$" "$tmp/calls.log")"
+
+FAKE_BUILD_FAILS=1 run_update
+check "build fails: the update does not reboot"           "0" "$(grep -c '^systemctl reboot' "$tmp/calls.log")"
+check "build fails: the half-built artefacts are chowned" "$expected_owned" "$(owned_paths)"
+check "build fails: binaries dirs are not chowned"        "0" "$(grep '^chown ' "$tmp/calls.log" | grep -c -E 'backend|apollo-miner|ckpool|bitcoind')"
+bl=$(grep -n '^yarn build' "$tmp/calls.log" | head -1 | cut -d: -f1)
+sl=$(grep -n 'systemctl start apollo-api.service' "$tmp/calls.log" | tail -1 | cut -d: -f1)
+check "build fails: apollo-api is started again after it" "1" "$( [ -n "$bl" ] && [ -n "$sl" ] && [ "$sl" -gt "$bl" ] && echo 1 || echo 0 )"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
