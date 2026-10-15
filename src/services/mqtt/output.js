@@ -252,9 +252,19 @@ class MqttOutput {
       fan: fans.length ? Math.round(fans.reduce((a, b) => a + b, 0) / fans.length) : null,
       shares_accepted: sharesAccepted,
       shares_rejected: sharesRejected,
-      mode: settings?.minerMode || 'unknown',
+      mode: this._publishedMode(settings?.minerMode),
       automation,
     };
+  }
+
+  // HA rejects a select state outside its options. A stored mode this device
+  // cannot run (restored super_eco on Apollo I/II) is shown as the mode the
+  // configurator actually applies: the lowest available one.
+  _publishedMode(stored) {
+    if (!stored) return 'unknown';
+    const available = availableMinerModes();
+    if (!available.length || available.includes(stored)) return stored;
+    return available[0];
   }
 
   async buildNodeState() {

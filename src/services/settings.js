@@ -2,6 +2,7 @@ const { GraphQLError } = require('graphql');
 const { execFile } = require('child_process');
 const util = require('util');
 const generateConf = require('../configurator');
+const { availableMinerModes } = require('../constants/minerModes');
 const { applyNodeConfiguration } = require('../node/configManager');
 const log = require('../logger')('settings');
 
@@ -230,6 +231,23 @@ class SettingsService {
       // otherwise leave custom with nothing to act on, which is the mismatch this
       // exists to prevent.
       const storedSettings = await this._readSettings();
+
+      // The GraphQL enum accepts every mode so a restore from another device
+      // loads; choosing one is another matter. Only a change is checked, so an
+      // unrelated save that resends a stale mode (restored super_eco) still works.
+      if (
+        settingsInput.minerMode !== undefined &&
+        settingsInput.minerMode !== storedSettings?.minerMode
+      ) {
+        const available = availableMinerModes();
+        if (!available.includes(settingsInput.minerMode)) {
+          throw new Error(
+            available.length
+              ? `Miner mode "${settingsInput.minerMode}" is not available on this device (available: ${available.join(', ')})`
+              : `Miner mode "${settingsInput.minerMode}" cannot be set: this device has no miner to run it (no USB miner attached)`
+          );
+        }
+      }
       const resultingMode =
         settingsInput.minerMode !== undefined
           ? settingsInput.minerMode

@@ -9,7 +9,9 @@ const fs = require('fs');
  *
  *   'apollo-iii'  BOARD_NAME="Apollo 3"   internal apollo-miner-v3
  *   'solo-node'   BOARD_NAME="Solo Node"  no internal miner (USB boards only)
- *   'legacy'      any other BOARD_NAME    Apollo I/II (the scripts' catch-all)
+ *   'legacy'      any other BOARD_NAME    Apollo I/II (the scripts' catch-all; the
+ *                                         real Apollo I/II values are not documented
+ *                                         anywhere we could find, so no explicit list)
  *   'unknown'     file missing/unreadable, or no BOARD_NAME in it (dev machine,
  *                 CI): callers treat this as "do not restrict anything"
  *
@@ -24,14 +26,31 @@ function releasePath(env = process.env) {
   return env.ARMBIAN_RELEASE_FILE || RELEASE_FILE;
 }
 
-// `. /etc/armbian-release` semantics for the one key we need: KEY=value, KEY="value" or 'value'.
+// What `. /etc/armbian-release` leaves in BOARD_NAME. Per line: `BOARD_NAME=` or
+// `export BOARD_NAME=` (no spaces around `=`: `KEY = value` runs a command, it
+// is not an assignment), then one word, either "double"/'single' quoted or bare
+// up to the first whitespace; a bare word starting with `#` is a comment, i.e.
+// an empty value. The last assignment wins and an empty one unsets it.
 function parseBoardName(text) {
   let board = null;
   for (const line of String(text).split('\n')) {
-    const m = line.match(/^\s*BOARD_NAME\s*=\s*(.*?)\s*$/);
-    if (m) board = m[1].replace(/^(["'])(.*)\1$/, '$2');
+    const m = line.match(/^\s*(?:export\s+)?BOARD_NAME=(.*)$/);
+    if (!m) continue;
+    const rest = m[1];
+    let value = '';
+    if (rest[0] === '"') {
+      const q = rest.slice(1).match(/^((?:\\.|[^"\\])*)"/);
+      value = q ? q[1].replace(/\\(["\\$`])/g, '$1') : '';
+    } else if (rest[0] === "'") {
+      const q = rest.slice(1).match(/^([^']*)'/);
+      value = q ? q[1] : '';
+    } else {
+      const w = rest.match(/^(\S*)/)[1];
+      value = w.startsWith('#') ? '' : w;
+    }
+    board = value || null;
   }
-  return board || null;
+  return board;
 }
 
 function familyOf(board) {

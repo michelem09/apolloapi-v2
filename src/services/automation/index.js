@@ -50,6 +50,7 @@ class AutomationService {
   constructor(knex, deps) {
     this.knex = knex;
     this.deps = deps; // { miner, settings, mqtt }
+    this._degradeWarned = new Set(); // rule:mode pairs already warned about
   }
 
   // ---------------------------------------------------------------- config
@@ -165,7 +166,8 @@ class AutomationService {
   }
 
   async createRule(input) {
-    this._validateRule(input, await this.getConfig());
+    // A new rule is enabled unless it says otherwise, so it gets the full check.
+    this._validateRule(input, await this.getConfig(), { checkModeAvailable: input.enabled !== false });
     const [id] = await this.knex('automation_rules').insert(this._ruleToRow(input));
     return this.getRule(id);
   }
@@ -174,7 +176,13 @@ class AutomationService {
     const existing = await this.knex('automation_rules').where({ id }).first();
     if (!existing) throw new GraphQLError(`Rule ${id} not found`);
 
-    this._validateRule({ ...this._hydrateRule(existing), ...input }, await this.getConfig());
+    // Whether this device can run the rule's mode is checked only when the update
+    // can change that answer: a new action, or switching the rule on. A
+    // priority-only update (drag to reorder) or a rename of a rule that was
+    // already invalid must go through, or a reorder fails half-way.
+    this._validateRule({ ...this._hydrateRule(existing), ...input }, await this.getConfig(), {
+      checkModeAvailable: input.action !== undefined || input.enabled === true,
+    });
 
     await this.knex('automation_rules')
       .where({ id })
@@ -221,7 +229,7 @@ class AutomationService {
     return row;
   }
 
-  _validateRule(rule, config) {
+  _validateRule(rule, config, { checkModeAvailable = true } = {}) {
     if (!rule.name) throw new GraphQLError('Rule name is required');
 
     // Config-aware so user-defined MQTT input signals validate too.
@@ -244,15 +252,17 @@ class AutomationService {
     if (action.type === 'mode' && !MINER_MODES.includes(action.mode)) {
       throw new GraphQLError(`Unknown miner mode: ${action.mode}`);
     }
-    // A known mode this device cannot run (super_eco on Apollo I/II). Only
-    // enforced while the rule is enabled, so a rule saved before this check, or
-    // restored from another device, can still be switched off, renamed-and-disabled
-    // or deleted; the engine skips it meanwhile (see engine.js).
-    if (action.type === 'mode' && rule.enabled !== false) {
+    // A known mode this device cannot run (super_eco on Apollo I/II, any mode on
+    // a Solo Node with no USB miner). Not enforced for a disabled rule, nor when
+    // the caller says the update cannot change the answer (see updateRule); the
+    // engine skips such a rule meanwhile (see engine.js).
+    if (action.type === 'mode' && checkModeAvailable && rule.enabled !== false) {
       const available = availableMinerModes();
       if (!available.includes(action.mode)) {
         throw new GraphQLError(
-          `Miner mode "${action.mode}" is not available on this device (available: ${available.join(', ')})`
+          available.length
+            ? `Miner mode "${action.mode}" is not available on this device (available: ${available.join(', ')})`
+            : `Miner mode "${action.mode}" cannot be used: this device has no miner to run it (no USB miner attached)`
         );
       }
     }
@@ -438,6 +448,19 @@ class AutomationService {
       descriptors: signals.descriptorsById(config),
       availableModes: availableMinerModes(),
     });
+
+    // A safety rule that named a mode this device cannot run was degraded to the
+    // lowest available one: say so once per rule, not on every tick.
+    if (decision.degradedFrom) {
+      const key = `${decision.ruleId}:${decision.degradedFrom}`;
+      if (!this._degradeWarned.has(key)) {
+        this._degradeWarned.add(key);
+        logger.warn(
+          { ruleId: decision.ruleId, from: decision.degradedFrom, to: decision.target.mode },
+          `safety rule "${decision.ruleName}" names mode ${decision.degradedFrom}, not available on this device: using ${decision.target.mode}`
+        );
+      }
+    }
 
     const guard = canApply({ decision, state, config, now });
     const dryRun = !!config.dryRun;

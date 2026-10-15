@@ -13,16 +13,20 @@
  *
  * `super_eco` is Apollo III only. On Apollo I/II (and a Solo Node, which only
  * drives USB boards) the configurator would quietly fall back to `eco`, so
- * offering it would promise something the hardware does not do. When the
- * device cannot be identified (dev machine, CI) nothing is restricted.
+ * offering it would promise something the hardware does not do. A Solo Node has
+ * no internal miner at all: it offers modes only while USB miners are attached,
+ * and none otherwise. When the device cannot be identified (dev machine, CI)
+ * nothing is restricted.
  */
 const { getDeviceFamily } = require('../deviceFamily');
+const { hasUsbMiners } = require('../usbMiners');
 
 const MINER_MODES = ['super_eco', 'eco', 'balanced', 'turbo', 'custom'];
 const APOLLO_III_ONLY = ['super_eco'];
 
 function availableMinerModes(family = getDeviceFamily()) {
   if (family === 'unknown' || family === 'apollo-iii') return [...MINER_MODES];
+  if (family === 'solo-node' && !hasUsbMiners()) return [];
   return MINER_MODES.filter((mode) => !APOLLO_III_ONLY.includes(mode));
 }
 

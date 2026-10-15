@@ -117,6 +117,15 @@ function modeUnavailable(target, availableModes) {
   return !!(availableModes && target && target.type === 'mode' && !availableModes.includes(target.mode));
 }
 
+// A target mode the device cannot run becomes the lowest available one (the order
+// of MINER_MODES is lowest power first), which is what the configurator does on its
+// own for super_eco on Apollo I/II. Unavailable-and-nothing-to-degrade-to cannot
+// reach here: evaluateRule skips that rule.
+function degradeToAvailable(target, availableModes) {
+  if (!modeUnavailable(target, availableModes) || !availableModes.length) return { target };
+  return { target: { type: 'mode', mode: availableModes[0] }, degradedFrom: target.mode };
+}
+
 function evaluateRule(rule, ctx) {
   const conditions = rule.conditions || [];
   if (!conditions.length) return { matched: false, unevaluable: true, why: 'no_conditions' };
@@ -124,7 +133,10 @@ function evaluateRule(rule, ctx) {
   // A rule saved with a mode this device cannot run (super_eco on Apollo I/II,
   // e.g. restored from another device) must not match: applying it would silently
   // run a different mode than the one the rule names. It stays visible as invalid.
-  if (modeUnavailable(parseAction(rule.action), ctx.availableModes)) {
+  // A safety rule is the exception: it is too important to drop, so it matches
+  // and decide() degrades its mode (unless there is no mode at all to degrade to).
+  const target = parseAction(rule.action);
+  if (modeUnavailable(target, ctx.availableModes) && (!rule.is_safety || !ctx.availableModes.length)) {
     return { matched: false, unevaluable: true, why: 'mode_unavailable' };
   }
 
@@ -175,8 +187,10 @@ function decide({ signals, rules, config, state, now, descriptors, availableMode
     const result = evaluateRule(rule, ctx);
     evaluated.push({ ruleId: rule.id, name: rule.name, safety: true, ...result });
     if (result.matched) {
+      const { target, degradedFrom } = degradeToAvailable(parseAction(rule.action), availableModes);
       return {
-        target: parseAction(rule.action),
+        target,
+        ...(degradedFrom ? { degradedFrom } : {}),
         ruleId: rule.id,
         ruleName: rule.name,
         reason: 'safety',
