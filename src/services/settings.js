@@ -5,6 +5,7 @@ const generateConf = require('../configurator');
 const { availableMinerModes } = require('../constants/minerModes');
 const { applyNodeConfiguration } = require('../node/configManager');
 const log = require('../logger')('settings');
+const transition = require('./transition');
 
 const execFilePromise = util.promisify(execFile);
 
@@ -427,7 +428,7 @@ class SettingsService {
     let nodeIsActive = await this._isServiceActive('node.service');
     let nodeRestarted = false;
     if (nodeConfigChanged && nodeIsActive) {
-      await this._runSystemctl('restart', 'node.service');
+      await this._requestService('node', 'online', ['restart', '--no-block', 'node.service']);
       nodeRestarted = true;
       nodeIsActive = true;
     }
@@ -436,17 +437,14 @@ class SettingsService {
       oldSettings.nodeEnableSoloMining !==
       newSettings.nodeEnableSoloMining;
     if (soloChanged) {
-      await this._setSoloRequestedStatus(
-        newSettings.nodeEnableSoloMining ? 'online' : 'offline'
-      );
       if (newSettings.nodeEnableSoloMining) {
         // ckpool has Requires=node.service, so starting it also brings the
         // node up if it was stopped. Start it unconditionally: gating on the
         // node being active left solo "enabled" with ckpool never started,
         // and serviceMonitor then flipped the stale online request to offline.
-        await this._runSystemctl('start', 'ckpool.service');
+        await this._requestService('solo', 'online', ['start', '--no-block', 'ckpool.service']);
       } else {
-        await this._runSystemctl('stop', 'ckpool.service');
+        await this._requestService('solo', 'offline', ['stop', '--no-block', 'ckpool.service']);
       }
     } else if (
       ckpoolConfigChanged &&
@@ -454,25 +452,37 @@ class SettingsService {
       !nodeRestarted &&
       (await this._isServiceActive('ckpool.service'))
     ) {
-      await this._runSystemctl('restart', 'ckpool.service');
+      await this._requestService('solo', 'online', ['restart', '--no-block', 'ckpool.service']);
     }
   }
 
-  async _setSoloRequestedStatus(requestedStatus) {
-    const update = {
-      status: 'pending',
-      requested_status: requestedStatus,
-      requested_at: new Date(),
-    };
-    const updated = await this.knex('service_status')
-      .where({ service_name: 'solo' })
-      .update(update);
-    if (!updated) {
-      await this.knex('service_status').insert({
-        service_name: 'solo',
-        ...update,
-      });
+  // Start/stop/restart a service the monitor tracks, the way the Node and Solo
+  // resolvers do (see transition.js): the request is recorded before the command
+  // so the monitor does not read the change as a crash, published once systemd
+  // accepted the job, and put back if it refused, with one request at a time per
+  // service. `--no-block`, so that a failure here means "refused" and the monitor
+  // decides how the job ended. Outside production there is no systemd and no
+  // monitor, so nothing is recorded (a `pending` row would never close).
+  async _requestService(serviceName, requestedStatus, systemctlArgs) {
+    if (process.env.NODE_ENV !== 'production') {
+      return this._runSystemctl(...systemctlArgs);
     }
+    return transition.run(
+      this.knex,
+      serviceName,
+      requestedStatus,
+      () => this._runSystemctl(...systemctlArgs),
+      {
+        notify: () => {
+          try {
+            const { pushServicesStatus } = require('../app/scheduler');
+            pushServicesStatus().catch(() => {});
+          } catch (_) {
+            // scheduler not running
+          }
+        },
+      }
+    );
   }
 
   // Helper method to read current settings

@@ -54,6 +54,7 @@ module.exports = gql`
   type NodeMutations {
     start: EmptyOutput! @auth
     stop: EmptyOutput! @auth
+    restart: EmptyOutput! @auth
     format: EmptyOutput! @auth
   }
 

@@ -6,6 +6,7 @@ const moment = require('moment');
 const { GraphQLError } = require('graphql');
 const { getMinerRuntimeDir, getApolloIIIStatsDir, getCkpoolLogsDir } = require('../paths');
 const log = require('../logger')('miner');
+const transition = require('./transition');
 
 // Import the dev miner service for development mode
 const devMinerService =
@@ -17,7 +18,6 @@ class MinerService {
     this.utils = utils;
   }
 
-  // Start the miner
   // Push the current services status to all WS subscribers immediately.
   // Uses a lazy require to avoid circular dependency (scheduler → services → miner).
   _notifyServicesStatus() {
@@ -65,35 +65,20 @@ class MinerService {
 
   async start({ source = 'user' } = {}) {
     try {
-      // Update service status in the database
-      await this.knex('service_status')
-        .where({ service_name: 'miner' })
-        .update({
-          status: 'pending',
-          requested_status: 'online',
-          requested_at: Date.now(),
-        });
-
-      // Notify subscribers immediately so the UI shows "pending" without waiting
-      // for the next periodic push (up to 10s later).
-      this._notifyServicesStatus();
-      await this._pauseAutomation(source);
-
-      // Start the miner based on environment
+      // Dev: no systemd and no monitor; the dev miner runs for as long as it
+      // takes, and the row is set online by hand when it is up.
       if (process.env.NODE_ENV === 'development') {
-        log.debug('starting dev miner');
-        await devMinerService.startDevMiner();
-        
-        // In development, update status to online after devMiner starts
-        // (ServiceMonitor is disabled in dev)
-        await this.knex('service_status')
-          .where({ service_name: 'miner' })
-          .update({
-            status: 'online',
-            last_checked: Date.now(),
-          });
-        // Same reason as solo: the arrival has to be announced too.
-        this._notifyServicesStatus();
+        await transition.run(
+          this.knex,
+          'miner',
+          'online',
+          async () => {
+            log.debug('starting dev miner');
+            await devMinerService.startDevMiner();
+          },
+          { notify: () => this._notifyServicesStatus() }
+        );
+        await this._setDevStatus('online');
         log.debug('dev miner started - status updated to online');
       } else {
         // --no-block: miner_start.sh sleeps ~35s waiting for USB boards to
@@ -101,93 +86,102 @@ class MinerService {
         // The board reset and that wait still run in full on the device; we just
         // don't hold the API call open for them. The service monitor reports the
         // miner coming online.
-        await this._execCommand('sudo systemctl start --no-block apollo-miner');
+        await transition.run(
+          this.knex,
+          'miner',
+          'online',
+          () => this._execCommand('sudo systemctl start --no-block apollo-miner'),
+          { notify: () => this._notifyServicesStatus() }
+        );
       }
+      // Only now that the command was accepted: a click that was refused must not
+      // pause the automation.
+      await this._pauseAutomation(source);
       this._reevaluateAutomation(source);
     } catch (error) {
-      throw new GraphQLError(`Failed to start miner: ${error.message}`);
+      throw transition.refused('miner', 'start', error);
     }
   }
 
   // Stop the miner
   async stop({ source = 'user' } = {}) {
     try {
-      // Update service status in the database
-      await this.knex('service_status')
-        .where({ service_name: 'miner' })
-        .update({
-          status: 'pending',
-          requested_status: 'offline',
-          requested_at: Date.now(),
-        });
-
-      this._notifyServicesStatus();
-      await this._pauseAutomation(source);
-
-      // Stop the miner based on environment
+      // Dev: see start().
       if (process.env.NODE_ENV === 'development') {
-        log.debug('stopping dev miner');
-        await devMinerService.stopDevMiner();
-        
-        // In development, update status to offline after devMiner stops
-        // (ServiceMonitor is disabled in dev)
-        await this.knex('service_status')
-          .where({ service_name: 'miner' })
-          .update({
-            status: 'offline',
-            last_checked: Date.now(),
-          });
-        this._notifyServicesStatus();
+        await transition.run(
+          this.knex,
+          'miner',
+          'offline',
+          async () => {
+            log.debug('stopping dev miner');
+            await devMinerService.stopDevMiner();
+          },
+          { notify: () => this._notifyServicesStatus() }
+        );
+        await this._setDevStatus('offline');
         log.debug('dev miner stopped - status updated to offline');
       } else {
-        await this._execCommand('sudo systemctl stop apollo-miner');
+        await transition.run(
+          this.knex,
+          'miner',
+          'offline',
+          () => this._execCommand('sudo systemctl stop --no-block apollo-miner'),
+          { notify: () => this._notifyServicesStatus() }
+        );
       }
+      // Only now that the command was accepted: a click that was refused must not
+      // pause the automation.
+      await this._pauseAutomation(source);
       this._reevaluateAutomation(source);
     } catch (error) {
-      throw new GraphQLError(`Failed to stop miner: ${error.message}`);
+      throw transition.refused('miner', 'stop', error);
     }
   }
 
   // Restart the miner
   async restart({ source = 'user' } = {}) {
     try {
-      // Update service status in the database
-      await this.knex('service_status')
-        .where({ service_name: 'miner' })
-        .update({
-          status: 'pending',
-          requested_status: 'online',
-          requested_at: Date.now(),
-        });
-
-      this._notifyServicesStatus();
-      await this._pauseAutomation(source);
-
-      // Restart the miner based on environment
+      // Dev: see start().
       if (process.env.NODE_ENV === 'development') {
-        log.debug('restarting dev miner');
-        await devMinerService.restartDevMiner();
-        
-        // In development, update status to online after devMiner restarts
-        // (ServiceMonitor is disabled in dev)
-        await this.knex('service_status')
-          .where({ service_name: 'miner' })
-          .update({
-            status: 'online',
-            last_checked: Date.now(),
-          });
-        // Same reason as solo: the arrival has to be announced too.
-        this._notifyServicesStatus();
+        await transition.run(
+          this.knex,
+          'miner',
+          'online',
+          async () => {
+            log.debug('restarting dev miner');
+            await devMinerService.restartDevMiner();
+          },
+          { notify: () => this._notifyServicesStatus() }
+        );
+        await this._setDevStatus('online');
         log.debug('dev miner restarted - status updated to online');
       } else {
         // --no-block: see start(). The 35s device-side wait is unchanged; the
         // API returns at once and the service monitor tracks the miner online.
-        await this._execCommand('sudo systemctl restart --no-block apollo-miner');
+        await transition.run(
+          this.knex,
+          'miner',
+          'online',
+          () => this._execCommand('sudo systemctl restart --no-block apollo-miner'),
+          { notify: () => this._notifyServicesStatus() }
+        );
       }
+      // Only now that the command was accepted: a click that was refused must not
+      // pause the automation.
+      await this._pauseAutomation(source);
       this._reevaluateAutomation(source);
     } catch (error) {
-      throw new GraphQLError(`Failed to restart miner: ${error.message}`);
+      throw transition.refused('miner', 'restart', error);
     }
+  }
+
+  // In development the ServiceMonitor is disabled, so whoever ran the dev miner
+  // records its arrival (and announces it, like the end of any transition).
+  async _setDevStatus(status) {
+    await this.knex('service_status')
+      .where({ service_name: 'miner' })
+      .update({ status, last_checked: Date.now() });
+    this._notifyServicesStatus();
   }
 
   // Get miner statistics

@@ -4,6 +4,7 @@ const { spawn, exec } = require('child_process');
 const axios = require('axios');
 const config = require('config');
 const { GraphQLError } = require('graphql');
+const transition = require('./transition');
 const util = require('util');
 const {
   getStateDir,
@@ -51,36 +52,52 @@ class NodeService {
   // Start the Bitcoin node
   async start() {
     try {
-      await this.knex('service_status')
-        .where({ service_name: 'node' })
-        .update({
-          status: 'pending',
-          requested_status: 'online',
-          requested_at: Date.now()
-        });
-
-      this._notifyServicesStatus();
-      await this._execCommand('sudo systemctl start node');
+      // --no-block: the call returns once systemd has accepted the job, so a
+      // failure here means "refused" and nothing else. bitcoind can take a long
+      // while to come up or go down (TimeoutStopSec is 600), and the service
+      // monitor, not this call, is what reports how the job ended.
+      await transition.run(
+        this.knex,
+        'node',
+        'online',
+        () => this._execCommand('sudo systemctl start --no-block node'),
+        { notify: () => this._notifyServicesStatus() }
+      );
     } catch (error) {
-      throw new GraphQLError(`Failed to start node: ${error.message}`);
+      throw transition.refused('node', 'start', error);
+    }
+  }
+
+  // Restart the Bitcoin node: ONE systemd job. Asked for as a stop followed by a
+  // start, a still-queued stop can be replaced by the start (job mode `replace`)
+  // and the node is never restarted — the new configuration is then not applied
+  // while the screen says it was.
+  async restart() {
+    try {
+      await transition.run(
+        this.knex,
+        'node',
+        'online',
+        () => this._execCommand('sudo systemctl restart --no-block node'),
+        { notify: () => this._notifyServicesStatus() }
+      );
+    } catch (error) {
+      throw transition.refused('node', 'restart', error);
     }
   }
 
   // Stop the Bitcoin node
   async stop() {
     try {
-      await this.knex('service_status')
-        .where({ service_name: 'node' })
-        .update({
-          status: 'pending',
-          requested_status: 'offline',
-          requested_at: Date.now()
-        });
-
-      this._notifyServicesStatus();
-      await this._execCommand('sudo systemctl stop node');
+      await transition.run(
+        this.knex,
+        'node',
+        'offline',
+        () => this._execCommand('sudo systemctl stop --no-block node'),
+        { notify: () => this._notifyServicesStatus() }
+      );
     } catch (error) {
-      throw new GraphQLError(`Failed to stop node: ${error.message}`);
+      throw transition.refused('node', 'stop', error);
     }
   }
 

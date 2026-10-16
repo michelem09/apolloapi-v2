@@ -325,8 +325,8 @@ describe('Settings API', () => {
 
       expect(systemctl.mock.calls).toEqual([
         ['enable', '--now', 'tor.service'],
-        ['restart', 'node.service'],
-        ['start', 'ckpool.service'],
+        ['restart', '--no-block', 'node.service'],
+        ['start', '--no-block', 'ckpool.service'],
       ]);
     });
 
@@ -335,9 +335,6 @@ describe('Settings API', () => {
       jest
         .spyOn(settingsService, '_isServiceActive')
         .mockResolvedValue(false);
-      const soloReq = jest
-        .spyOn(settingsService, '_setSoloRequestedStatus')
-        .mockResolvedValue(undefined);
       const systemctl = jest
         .spyOn(settingsService, '_runSystemctl')
         .mockResolvedValue(undefined);
@@ -349,10 +346,71 @@ describe('Settings API', () => {
         false
       );
 
-      // solo is marked online and ckpool is started unconditionally;
-      // ckpool's Requires=node.service brings the stopped node up.
-      expect(soloReq).toHaveBeenCalledWith('online');
-      expect(systemctl.mock.calls).toEqual([['start', 'ckpool.service']]);
+      // ckpool is started unconditionally; ckpool's Requires=node.service brings
+      // the stopped node up.
+      expect(systemctl.mock.calls).toEqual([['start', '--no-block', 'ckpool.service']]);
+    });
+
+    describe('in production, a service change is a transition (see transition.js)', () => {
+      const originalEnv = process.env.NODE_ENV;
+      const readRow = (name) => knex('service_status').where({ service_name: name }).first();
+
+      beforeEach(async () => {
+        process.env.NODE_ENV = 'production';
+        jest.spyOn(settingsService, '_isServiceActive').mockResolvedValue(false);
+        await knex('service_status').where({ service_name: 'solo' }).del();
+        await knex('service_status').insert({
+          service_name: 'solo',
+          status: 'offline',
+          requested_status: 'offline',
+          requested_at: 1000,
+        });
+      });
+
+      afterEach(() => {
+        process.env.NODE_ENV = originalEnv;
+      });
+
+      const enableSolo = () =>
+        settingsService._applyServiceLifecycle(
+          { nodeEnableTor: false, nodeEnableSoloMining: false },
+          { nodeEnableTor: false, nodeEnableSoloMining: true },
+          false,
+          false
+        );
+
+      it('records the request as pending once, with an integer requested_at, and asks systemd without blocking', async () => {
+        let during;
+        const systemctl = jest
+          .spyOn(settingsService, '_runSystemctl')
+          .mockImplementation(async () => {
+            during = await readRow('solo');
+          });
+
+        await enableSolo();
+
+        expect(systemctl.mock.calls).toEqual([['start', '--no-block', 'ckpool.service']]);
+        // Written before the command (the monitor must find it when the unit moves)...
+        expect(during).toMatchObject({ status: 'pending', requested_status: 'online' });
+        // ...as milliseconds, the one format every other writer uses.
+        expect(Number.isInteger(Number(during.requested_at))).toBe(true);
+        expect(Number(during.requested_at)).toBeGreaterThan(1000);
+        expect((await readRow('solo')).status).toBe('pending');
+      });
+
+      it('puts the row back when systemd refuses, instead of leaving a request nobody will answer', async () => {
+        jest
+          .spyOn(settingsService, '_runSystemctl')
+          .mockRejectedValue(new Error('a terminal is required'));
+
+        await expect(enableSolo()).rejects.toThrow('a terminal is required');
+
+        expect(await readRow('solo')).toMatchObject({
+          status: 'offline',
+          requested_status: 'offline',
+        });
+        expect(Number((await readRow('solo')).requested_at)).toBe(1000);
+      });
     });
 
     it('does not start or restart an offline node', async () => {

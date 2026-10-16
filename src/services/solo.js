@@ -4,6 +4,7 @@ const { exec } = require('child_process');
 // rather than one it just found.
 const RESTORE_WINDOW_SECONDS = 60;
 const { GraphQLError } = require('graphql');
+const transition = require('./transition');
 const fs = require('fs').promises;
 const path = require('path');
 const { getCkpoolLogsDir } = require('../paths');
@@ -121,108 +122,126 @@ class SoloService {
   // Start the solo pool (ckpool)
   async start() {
     try {
-      // Update service status in the database
-      if (this.knex) {
-        await this.knex('service_status')
-          .where({ service_name: 'solo' })
-          .update({
-            status: 'pending',
-            requested_status: 'online',
-            requested_at: Date.now(),
-          });
-        this._notifyServicesStatus();
-      }
-
-      // Start the solo pool based on environment
       if (process.env.NODE_ENV === 'development') {
-        log.debug('starting dev solo pool');
-        await devSoloService.startDevSolo();
-      } else {
-        await this._execCommand('sudo systemctl start ckpool');
-        // Wait for service to be actually active before marking online (avoids monitor overwriting to offline)
-        const becameActive = await this._waitForActive();
-        if (!becameActive) {
-          await this._updateServiceStatus('offline');
-          throw new GraphQLError('Solo pool start timed out: service did not become active');
-        }
+        await this._devTransition('online', async () => {
+          log.debug('starting dev solo pool');
+          await devSoloService.startDevSolo();
+        });
+        await this._updateServiceStatus('online');
+        return;
       }
-
-      // Update status to online after successful start
-      await this._updateServiceStatus('online');
+      const at = await this._requestSystemd('online', 'sudo systemctl start --no-block ckpool');
+      // --no-block returns once the job is queued, so the pool is not up yet.
+      // Waiting for it here is what lets the row go to `online` the moment it
+      // is, instead of after the monitor's next look. This wait is outside the
+      // transition queue (a stop clicked meanwhile must not wait 30 s for it), so
+      // what it writes afterwards is only ever written for ITS request: see
+      // _updateServiceStatus.
+      const becameActive = await this._waitForActive();
+      if (!(await this._isCurrent(at))) return; // a newer request owns the row now
+      if (!becameActive) {
+        await this._updateServiceStatus('offline', at);
+        throw new GraphQLError('Solo pool start timed out: service did not become active');
+      }
+      await this._updateServiceStatus('online', at);
     } catch (error) {
-      // Update status to offline if start failed
-      await this._updateServiceStatus('offline');
-      throw new GraphQLError(`Failed to start solo pool: ${error.message}`);
+      throw this._asFailure('start', error);
     }
   }
 
   // Stop the solo pool (ckpool)
   async stop() {
     try {
-      // Update service status in the database
-      if (this.knex) {
-        await this.knex('service_status')
-          .where({ service_name: 'solo' })
-          .update({
-            status: 'pending',
-            requested_status: 'offline',
-            requested_at: Date.now(),
-          });
-        this._notifyServicesStatus();
-      }
-
-      // Stop the solo pool based on environment
       if (process.env.NODE_ENV === 'development') {
-        log.debug('stopping dev solo pool');
-        await devSoloService.stopDevSolo();
-      } else {
-        await this._execCommand('sudo systemctl stop ckpool');
+        await this._devTransition('offline', async () => {
+          log.debug('stopping dev solo pool');
+          await devSoloService.stopDevSolo();
+        });
+        await this._updateServiceStatus('offline');
+        return;
       }
-
-      // Update status to offline after successful stop
-      await this._updateServiceStatus('offline');
+      const at = await this._requestSystemd('offline', 'sudo systemctl stop --no-block ckpool');
+      // The stop was only queued. The row stays `pending` until the pool is
+      // really down; if it is slow, the monitor closes the transition.
+      const down = await this._waitForInactive();
+      if (down && (await this._isCurrent(at))) await this._updateServiceStatus('offline', at);
     } catch (error) {
-      // Keep status as pending if stop failed
-      throw new GraphQLError(`Failed to stop solo pool: ${error.message}`);
+      throw this._asFailure('stop', error);
     }
   }
 
   // Restart the solo pool (ckpool)
   async restart() {
     try {
-      // Update service status in the database
-      if (this.knex) {
-        await this.knex('service_status')
-          .where({ service_name: 'solo' })
-          .update({
-            status: 'pending',
-            requested_status: 'online',
-            requested_at: Date.now(),
-          });
-        this._notifyServicesStatus();
-      }
-
-      // Restart the solo pool based on environment
       if (process.env.NODE_ENV === 'development') {
-        log.debug('restarting dev solo pool');
-        await devSoloService.restartDevSolo();
-      } else {
-        await this._execCommand('sudo systemctl restart ckpool');
-        // Wait for service to be actually active before marking online (avoids "stoppato ma non riavviato" / connection issue in UI)
-        const becameActive = await this._waitForActive();
-        if (!becameActive) {
-          await this._updateServiceStatus('offline');
-          throw new GraphQLError('Solo pool restart timed out: service did not become active');
-        }
+        await this._devTransition('online', async () => {
+          log.debug('restarting dev solo pool');
+          await devSoloService.restartDevSolo();
+        });
+        await this._updateServiceStatus('online');
+        return;
       }
-
-      // Update status to online after successful restart
-      await this._updateServiceStatus('online');
+      const at = await this._requestSystemd('online', 'sudo systemctl restart --no-block ckpool');
+      // Wait for service to be actually active before marking online (avoids "stoppato ma non riavviato" / connection issue in UI)
+      const becameActive = await this._waitForActive();
+      if (!(await this._isCurrent(at))) return;
+      if (!becameActive) {
+        await this._updateServiceStatus('offline', at);
+        throw new GraphQLError('Solo pool restart timed out: service did not become active');
+      }
+      await this._updateServiceStatus('online', at);
     } catch (error) {
-      // Update status to offline if restart failed
-      await this._updateServiceStatus('offline');
-      throw new GraphQLError(`Failed to restart solo pool: ${error.message}`);
+      throw this._asFailure('restart', error);
     }
+  }
+
+  // Ask systemd for a transition. Written to service_status first and published
+  // once accepted; put back if refused (see transition.js).
+  async _requestSystemd(requested, command) {
+    const action = command.includes(' stop ') ? 'stop' : command.includes(' restart ') ? 'restart' : 'start';
+    let requestedAt = null;
+    try {
+      if (!this.knex) {
+        await this._execCommand(command);
+        return null;
+      }
+      await transition.run(
+        this.knex,
+        'solo',
+        requested,
+        async (ctx) => {
+          requestedAt = ctx.requestedAt;
+          await this._execCommand(command);
+        },
+        { notify: () => this._notifyServicesStatus() }
+      );
+      return requestedAt;
+    } catch (error) {
+      throw transition.refused('solo', action, error);
+    }
+  }
+
+  // Is the row still the request that was made at `at`? (null: no bookkeeping.)
+  async _isCurrent(at) {
+    if (at === null || !this.knex) return true;
+    const row = await this.knex('service_status').where({ service_name: 'solo' }).first();
+    return Number(row?.requested_at) === Number(at);
+  }
+
+  // Dev: no systemd and no monitor, so the work is the dev service's own; same
+  // bookkeeping as in production, announced once it ran.
+  _devTransition(requested, work) {
+    if (!this.knex) return work();
+    return transition.run(this.knex, 'solo', requested, work, {
+      notify: () => this._notifyServicesStatus(),
+    });
+  }
+
+  // A refused command carries a clean, localisable error already (the detail is
+  // in the log); anything else here is one of our own messages (a timeout).
+  _asFailure(action, error) {
+    if (error?.extensions?.code === 'SERVICE_COMMAND_FAILED') return error;
+    return new GraphQLError(`Failed to ${action} solo pool: ${error.message}`);
   }
 
   // Get solo pool status
@@ -463,16 +482,19 @@ class SoloService {
     }
   }
 
-  // Helper method to update service status
-  async _updateServiceStatus(newStatus) {
+  // Helper method to update service status. With `at`, only if the row still
+  // belongs to the request made at that time and the monitor has not recorded a
+  // failure on it: a wait that outlived its request must not write over the
+  // request that replaced it, nor turn the monitor's `error` into `offline`.
+  async _updateServiceStatus(newStatus, at = null) {
     try {
       if (this.knex) {
-        await this.knex('service_status')
-          .where({ service_name: 'solo' })
-          .update({
-            status: newStatus,
-            last_checked: Date.now()
-          });
+        const query = this.knex('service_status').where({ service_name: 'solo' });
+        if (at !== null) query.where({ requested_at: at }).whereNot({ status: 'error' });
+        const changed = await query.update({
+          status: newStatus,
+          last_checked: Date.now()
+        });
         // The end of the transition is a state change like the start of it, and
         // it was the only one nobody announced. Going into `pending` published;
         // arriving at online or offline did not, and the monitor that would
@@ -480,7 +502,7 @@ class SoloService {
         // nothing. The UI then held a stopped pool on screen for up to ten
         // seconds — the next periodic push — while its statistics were already
         // arriving every five.
-        this._notifyServicesStatus();
+        if (changed) this._notifyServicesStatus();
       }
     } catch (error) {
       log.error({ err: error }, 'error updating service status');
@@ -520,7 +542,31 @@ class SoloService {
         if (status === 'failed') return false;
         // activating, inactive, etc. -> keep waiting
       } catch (err) {
-        // is-active exits non-zero when not active; keep polling
+        // is-active exits non-zero for everything but `active`, and says which on
+        // stdout: a unit that failed is an answer, not a reason to poll on.
+        if (String(err?.stdout ?? '').trim() === 'failed') return false;
+      }
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    }
+    return false;
+  }
+
+  /**
+   * Wait for ckpool to be down after a stop (production only). Polls
+   * systemctl is-active until it says inactive or failed. A timeout is not an
+   * error: the stop was accepted and the service monitor closes the transition.
+   * @returns {Promise<boolean>} true once it is down
+   */
+  async _waitForInactive(timeoutMs = 30000, pollIntervalMs = 1500) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const { stdout } = await this._execCommand('systemctl is-active ckpool');
+        const status = (stdout && stdout.trim()) || '';
+        if (status === 'inactive' || status === 'failed') return true;
+      } catch (err) {
+        // is-active exits non-zero when it is not active: that is the answer.
+        if (['inactive', 'failed'].includes(String(err?.stdout ?? '').trim())) return true;
       }
       await new Promise((r) => setTimeout(r, pollIntervalMs));
     }
@@ -532,6 +578,10 @@ class SoloService {
     return new Promise((resolve, reject) => {
       exec(command, (error, stdout, stderr) => {
         if (error) {
+          // exec hands these over beside the error; `systemctl is-active` says
+          // what it found on stdout while exiting non-zero.
+          error.stdout = stdout;
+          error.stderr = stderr;
           reject(error);
           return;
         }
