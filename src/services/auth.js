@@ -5,6 +5,17 @@ const { GraphQLError } = require('graphql');
 const log = require('../logger')('auth');
 const { assertPasswordAcceptable } = require('../passwordPolicy');
 
+// What a failed database write may say to the outside. The driver's message
+// repeats the statement ("insert into `setup` ... - SQLITE_BUSY: database is
+// locked"), and with the values in it where the driver puts them there, that is a
+// bcrypt hash. Only the driver's own part is kept, and any hash that is still in
+// it is blanked.
+const BCRYPT_HASH = /\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}/g;
+const driverReason = (error) => {
+  const text = String(error?.message ?? error).split(' - ').pop();
+  return text.replace(BCRYPT_HASH, '[hash]');
+};
+
 // setup and changePassword both end in a system password change and a stored
 // hash, and neither is atomic. Run concurrently they interleave (two setups would
 // each pass the "already done" check, and the system password could end up
@@ -140,21 +151,20 @@ class AuthService {
         await this.utils.auth.changeSystemPassword(password);
       }
 
-      // Insert the setup record. A knex error carries the password hash, inlined
-      // in `message` as `insert into setup ... values ('$2a$...')`: that must not
-      // reach the response, so the caller gets a plain sentence and the detail
-      // (hash cut out by the logger's err serializer) goes to the log.
+      // Insert the setup record. This answer goes to a client that is not signed in
+      // yet, so it carries the driver's reason and nothing of the statement.
       try {
         await this.knex('setup').insert({
           password: hashedPassword
         });
-      } catch (err) {
-        log.error({ err }, 'failed to store the login password at setup');
-        throw new Error('Setup could not be completed: the login password could not be saved. Try again.');
+      } catch (insertError) {
+        // The logger's err serializer cuts the statement and its values out.
+        log.error({ err: insertError }, 'failed to store the login password at setup');
+        throw new Error(`Could not save the password: ${driverReason(insertError)}`);
       }
     } catch (err) {
-      // This block also wraps assertPasswordAcceptable, the "already done" check
-      // and changeSystemPassword, whose messages are already written for the user.
+      // Policy and chpasswd errors are our own words and pass through as they are;
+      // a failed insert was already turned into a clean one above.
       log.error({ err }, 'setup failed');
       throw err;
     }

@@ -165,26 +165,39 @@ describe('password change order', () => {
   });
 });
 
-describe('setup: a failed insert does not put the hash in the response', () => {
-  it('answers with a plain sentence, whatever the driver put in its message', async () => {
-    const hashInMessage = "insert into `setup` (`password`) values ('$2a$12$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ0123') - SQLITE_BUSY: database is locked";
-    const failingKnex = () => ({
-      select: () => ({ limit: async () => [] }),
-      insert: async () => {
-        throw new Error(hashInMessage);
-      },
-    });
-    const svc = AuthService(failingKnex, { auth: { changeSystemPassword: jest.fn() } });
+describe('a failed write does not carry the hash to the client', () => {
+  const HASH = /\$2[aby]\$/;
 
-    const error = await svc.setup({ password: 'longenough1' }).catch((e) => e);
-
-    expect(error.message).toBe('Setup could not be completed: the login password could not be saved. Try again.');
-    expect(error.message).not.toMatch(/\$2a\$|insert into|SQLITE/);
-    expect(JSON.stringify(error)).not.toMatch(/\$2a\$/);
+  it('setup: a real failing insert answers with the driver reason only', async () => {
+    process.env.NODE_ENV = 'test';
+    await knex('setup').del();
+    const svc = AuthService(knex, { auth: { changeSystemPassword: jest.fn() } });
+    // A real sqlite failure: a NOT NULL violation, with the hash in the statement.
+    await knex.raw('ALTER TABLE setup RENAME TO setup_real');
+    await knex.raw('CREATE TABLE setup (id INTEGER PRIMARY KEY, password TEXT NOT NULL, other TEXT NOT NULL)');
+    try {
+      const error = await svc.setup({ password: 'longenough1' }).catch((e) => e);
+      expect(error.message).toMatch(/^Could not save the password: /);
+      expect(error.message).toMatch(/NOT NULL|SQLITE/);
+      expect(error.message).not.toMatch(HASH);
+      expect(error.message).not.toMatch(/insert into/i);
+    } finally {
+      await knex.raw('DROP TABLE setup');
+      await knex.raw('ALTER TABLE setup_real RENAME TO setup');
+    }
   });
 
-  it('keeps the messages that are already written for the user', async () => {
+  it('through the resolver: the response message has no hash and no SQL', async () => {
+    const authResolver = require('../src/graphql/resolvers/auth');
+    const failing = {
+      setup: jest.fn().mockRejectedValue(new Error('Could not save the password: SQLITE_BUSY: database is locked')),
+    };
+    const result = await authResolver.AuthActions.setup(null, { input: { password: 'x' } }, { services: { auth: failing } });
+    expect(result.error.message).not.toMatch(HASH);
+  });
+
+  it('policy errors still say what they said', async () => {
     const svc = AuthService(knex, { auth: { changeSystemPassword: jest.fn() } });
-    await expect(svc.setup({ password: 'short' })).rejects.toThrow('at least 8 characters');
+    await expect(svc.setup({ password: 'short' })).rejects.toThrow('Password must be at least 8 characters');
   });
 });
