@@ -140,8 +140,9 @@ class SoloService {
       const becameActive = await this._waitForActive();
       if (!(await this._isCurrent(at))) return; // a newer request owns the row now
       if (!becameActive) {
+        if (await this._stillComing()) return; // systemd is retrying: the monitor closes it
         await this._updateServiceStatus('offline', at);
-        throw new GraphQLError('Solo pool start timed out: service did not become active');
+        throw transition.timedOut('solo', 'start', 'service did not become active');
       }
       await this._updateServiceStatus('online', at);
     } catch (error) {
@@ -186,8 +187,9 @@ class SoloService {
       const becameActive = await this._waitForActive();
       if (!(await this._isCurrent(at))) return;
       if (!becameActive) {
+        if (await this._stillComing()) return; // systemd is retrying: the monitor closes it
         await this._updateServiceStatus('offline', at);
-        throw new GraphQLError('Solo pool restart timed out: service did not become active');
+        throw transition.timedOut('solo', 'restart', 'service did not become active');
       }
       await this._updateServiceStatus('online', at);
     } catch (error) {
@@ -242,6 +244,21 @@ class SoloService {
   _asFailure(action, error) {
     if (error?.extensions?.code === 'SERVICE_COMMAND_FAILED') return error;
     return new GraphQLError(`Failed to ${action} solo pool: ${error.message}`);
+  }
+
+  // After a wait that ran out: is systemd still working on the unit (starting,
+  // stopping, or in the auto-restart delay after a failed attempt)? Then it is not off:
+  // the row stays `pending` and the service monitor settles it. Only a unit
+  // that is really down (failed, inactive) is an error for the caller.
+  async _stillComing() {
+    try {
+      const { stdout } = await this._execCommand('systemctl show -p ActiveState,SubState ckpool');
+      const state = /ActiveState=(\S+)/.exec(stdout || '')?.[1];
+      // `deactivating`: the stop of a restart is still running.
+      return ['activating', 'deactivating', 'reloading'].includes(state);
+    } catch (_) {
+      return false;
+    }
   }
 
   // Get solo pool status

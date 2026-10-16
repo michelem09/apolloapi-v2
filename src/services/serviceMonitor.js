@@ -10,6 +10,9 @@ const log = require('../logger')('service-monitor');
 
 const execAsync = promisify(exec);
 
+// Past this, a unit that keeps restarting without ever staying up is an error.
+const AUTO_RESTART_ERROR_AFTER_MS = 90000;
+
 const UPDATE_UNIT = 'apollo-update.service';
 
 // Whether an update is running, asked of systemd rather than inferred from a file.
@@ -240,6 +243,23 @@ class ServiceMonitor {
         resolve({ status: 'offline', systemdStatus: 'connection_error' });
       }
     });
+  }
+
+  // When did this unit first show up in `activating (auto-restart)` in an
+  // unbroken run of readings? null when it is not in that state now.
+  async trackAutoRestart(serviceName, status) {
+    this._autoRestartSince = this._autoRestartSince || {};
+    if (status === 'activating') {
+      try {
+        const { stdout } = await execAsync(`systemctl show -p SubState --value ${serviceName}`);
+        if (String(stdout || '').trim() === 'auto-restart') {
+          if (!this._autoRestartSince[serviceName]) this._autoRestartSince[serviceName] = Date.now();
+          return this._autoRestartSince[serviceName];
+        }
+      } catch (_) {}
+    }
+    delete this._autoRestartSince[serviceName];
+    return null;
   }
 
   // Check status of a single service
@@ -526,6 +546,23 @@ class ServiceMonitor {
             isWithinGracePeriod = true;
             mappedStatus = 'pending';
           }
+        }
+      }
+
+      // A ckpool that crashes on start sits in `activating (auto-restart)`
+      // for as long as Restart= keeps retrying, and never reaches `failed`, so the user
+      // would see a spinner for good. Past the start grace window that is an
+      // error. Limited to ckpool: miner and node have an application check that
+      // already reports a unit that is up but not working.
+      if (serviceName === 'ckpool') {
+        const loopSince = await this.trackAutoRestart(serviceName, status);
+        if (
+          !isWithinGracePeriod &&
+          loopSince !== null &&
+          Date.now() - loopSince > AUTO_RESTART_ERROR_AFTER_MS
+        ) {
+          log.warn({ service: serviceName, afterMs: AUTO_RESTART_ERROR_AFTER_MS }, 'unit stuck in auto-restart: error');
+          mappedStatus = 'error';
         }
       }
 

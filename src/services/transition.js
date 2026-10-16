@@ -118,9 +118,19 @@ const LABELS = { miner: 'miner', node: 'Bitcoin node', solo: 'solo pool', tor: '
 
 const refused = (service, action, error) => {
   log.warn({ service, action, err: error }, 'service command refused');
+  return clean(service, action);
+};
+
+// The command was accepted but the unit did not come up in time.
+const timedOut = (service, action, detail) => {
+  log.warn({ service, action, detail }, 'service command timed out');
+  return clean(service, action);
+};
+
+const clean = (service, action) => {
   return new GraphQLError(`Could not ${action} the ${LABELS[service] || service}`, {
     extensions: { code: 'SERVICE_COMMAND_FAILED', service, action },
   });
 };
 
-module.exports = { run, refused };
+module.exports = { run, refused, timedOut };
