@@ -1,5 +1,6 @@
 const pubsub = require('../pubsub');
 const TOPICS = require('../topics');
+const { errorPayload } = require('../errorPayload');
 
 module.exports = {
   Query: {
@@ -39,7 +40,7 @@ module.exports = {
         pubsub.publish(TOPICS.SETTINGS, { settings: payload });
         return payload;
       } catch (error) {
-        return { result: null, error: { message: error.message } };
+        return { result: null, error: errorPayload(error) };
       }
     }
   }

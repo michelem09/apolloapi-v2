@@ -403,7 +403,10 @@ describe('Settings API', () => {
           .spyOn(settingsService, '_runSystemctl')
           .mockRejectedValue(new Error('a terminal is required'));
 
-        await expect(enableSolo()).rejects.toThrow('a terminal is required');
+        await expect(enableSolo()).rejects.toMatchObject({
+          message: 'Could not start the solo pool',
+          extensions: { code: 'SERVICE_COMMAND_FAILED', service: 'solo', action: 'start' },
+        });
 
         expect(await readRow('solo')).toMatchObject({
           status: 'offline',
@@ -411,6 +414,68 @@ describe('Settings API', () => {
         });
         expect(Number((await readRow('solo')).requested_at)).toBe(1000);
       });
+    });
+
+    it('a refused node restart ends the application with the clean service refusal, and ckpool is not restarted on its account', async () => {
+      jest.spyOn(settingsService, '_isServiceActive').mockResolvedValue(true);
+      const systemctl = jest
+        .spyOn(settingsService, '_runSystemctl')
+        .mockRejectedValue(new Error('Command failed: sudo systemctl restart --no-block node.service: a terminal is required'));
+
+      const error = await settingsService
+        ._applyServiceLifecycle(
+          { nodeEnableTor: false, nodeEnableSoloMining: true },
+          { nodeEnableTor: false, nodeEnableSoloMining: true },
+          true,
+          true
+        )
+        .catch((e) => e);
+
+      expect(error.message).toBe('Could not restart the Bitcoin node');
+      expect(error.message).not.toMatch(/Command failed/);
+      expect(error.extensions).toEqual({ code: 'SERVICE_COMMAND_FAILED', service: 'node', action: 'restart' });
+      // Only the node restart was attempted: nothing was skipped or done on the
+      // assumption that it had worked.
+      expect(systemctl.mock.calls).toEqual([['restart', '--no-block', 'node.service']]);
+    });
+
+    it('an accepted node restart is not followed by a second restart of ckpool', async () => {
+      jest.spyOn(settingsService, '_isServiceActive').mockResolvedValue(true);
+      const systemctl = jest.spyOn(settingsService, '_runSystemctl').mockResolvedValue(undefined);
+
+      await settingsService._applyServiceLifecycle(
+        { nodeEnableTor: false, nodeEnableSoloMining: true },
+        { nodeEnableTor: false, nodeEnableSoloMining: true },
+        true,
+        true
+      );
+
+      expect(systemctl.mock.calls).toEqual([['restart', '--no-block', 'node.service']]);
+    });
+
+    it('update() hands a refusal to the UI as the service error payload, not as "Command failed"', async () => {
+      const transition = require('../src/services/transition');
+      const resolvers = require('../src/graphql/resolvers/settings');
+      const before = await knex('settings')
+        .select('node_max_connections')
+        .orderBy('created_at', 'desc')
+        .orderBy('id', 'desc')
+        .first();
+      jest
+        .spyOn(settingsService, '_applyServiceLifecycle')
+        .mockRejectedValueOnce(transition.refused('node', 'restart', new Error('Command failed: sudo ...')))
+        .mockResolvedValueOnce(undefined);
+
+      const payload = await resolvers.SettingsMutations.update(
+        null,
+        { input: { nodeMaxConnections: before.node_max_connections + 1 } },
+        { services: { settings: settingsService } }
+      );
+
+      expect(payload.result).toBeNull();
+      expect(payload.error).toMatchObject({ type: 'SERVICE_COMMAND_FAILED', path: 'node.restart' });
+      expect(payload.error.message).toMatch(/Could not restart the Bitcoin node/);
+      expect(payload.error.message).not.toMatch(/Command failed/);
     });
 
     it('does not start or restart an offline node', async () => {

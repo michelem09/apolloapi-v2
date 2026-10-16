@@ -356,7 +356,11 @@ class SettingsService {
           log.error({ err: rollbackError }, 'failed to roll back settings application');
         }
       }
-      throw new GraphQLError(`Failed to update settings: ${error.message}`);
+      // A refused service command keeps its code, service and action, so the
+      // resolver can hand them to the UI (see errorPayload).
+      throw new GraphQLError(`Failed to update settings: ${error.message}`, {
+        extensions: error.extensions?.code === 'SERVICE_COMMAND_FAILED' ? error.extensions : undefined,
+      });
     }
   }
 
@@ -428,6 +432,13 @@ class SettingsService {
     let nodeIsActive = await this._isServiceActive('node.service');
     let nodeRestarted = false;
     if (nodeConfigChanged && nodeIsActive) {
+      // Set only once systemd ACCEPTED the restart: a refusal throws from the line
+      // above and ends the whole application (the settings are rolled back), so
+      // the ckpool restart below is never skipped on the strength of a restart
+      // that did not happen. With --no-block, "accepted" is all that is known
+      // here: whether the job then succeeds is the monitor's to report. ckpool
+      // has Requires=node.service, so an accepted node restart takes it down and
+      // up too, which is why it is not restarted a second time.
       await this._requestService('node', 'online', ['restart', '--no-block', 'node.service']);
       nodeRestarted = true;
       nodeIsActive = true;
@@ -464,25 +475,32 @@ class SettingsService {
   // decides how the job ended. Outside production there is no systemd and no
   // monitor, so nothing is recorded (a `pending` row would never close).
   async _requestService(serviceName, requestedStatus, systemctlArgs) {
-    if (process.env.NODE_ENV !== 'production') {
-      return this._runSystemctl(...systemctlArgs);
-    }
-    return transition.run(
-      this.knex,
-      serviceName,
-      requestedStatus,
-      () => this._runSystemctl(...systemctlArgs),
-      {
-        notify: () => {
-          try {
-            const { pushServicesStatus } = require('../app/scheduler');
-            pushServicesStatus().catch(() => {});
-          } catch (_) {
-            // scheduler not running
-          }
-        },
+    const action = systemctlArgs[0];
+    try {
+      if (process.env.NODE_ENV !== 'production') {
+        return await this._runSystemctl(...systemctlArgs);
       }
-    );
+      return await transition.run(
+        this.knex,
+        serviceName,
+        requestedStatus,
+        () => this._runSystemctl(...systemctlArgs),
+        {
+          notify: () => {
+            try {
+              const { pushServicesStatus } = require('../app/scheduler');
+              pushServicesStatus().catch(() => {});
+            } catch (_) {
+              // scheduler not running
+            }
+          },
+        }
+      );
+    } catch (error) {
+      // The same clean, localisable refusal as the service buttons (code, service
+      // and action in the extensions): never "Command failed: sudo systemctl ...".
+      throw transition.refused(serviceName, action, error);
+    }
   }
 
   // Helper method to read current settings
