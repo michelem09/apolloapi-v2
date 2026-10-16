@@ -246,7 +246,9 @@ class ServiceMonitor {
   }
 
   // When did this unit first show up in `activating (auto-restart)` in an
-  // unbroken run of readings? null when it is not in that state now.
+  // unbroken run of readings? null when it is not in a run. A brief
+  // `activating (start)` between two retries does not break the run; only
+  // active / inactive / failed does.
   async trackAutoRestart(serviceName, status) {
     this._autoRestartSince = this._autoRestartSince || {};
     if (status === 'activating') {
@@ -257,8 +259,17 @@ class ServiceMonitor {
           return this._autoRestartSince[serviceName];
         }
       } catch (_) {}
+      // Still `activating`, but not in auto-restart right now. Every retry passes
+      // through `activating (start)` for a moment, and a poll landing there must
+      // neither restart the 90 s clock nor flap the status: a run already under
+      // way is still the same run.
+      return this._autoRestartSince[serviceName] || null;
     }
-    delete this._autoRestartSince[serviceName];
+    // Only a settled state ends the run: up, down, or failed.
+    if (status === 'active' || status === 'inactive' || status === 'failed') {
+      delete this._autoRestartSince[serviceName];
+      if (this._autoRestartReported) delete this._autoRestartReported[serviceName];
+    }
     return null;
   }
 
@@ -561,7 +572,12 @@ class ServiceMonitor {
           loopSince !== null &&
           Date.now() - loopSince > AUTO_RESTART_ERROR_AFTER_MS
         ) {
-          log.warn({ service: serviceName, afterMs: AUTO_RESTART_ERROR_AFTER_MS }, 'unit stuck in auto-restart: error');
+          // Once, on entering error: this runs every poll for as long as the loop
+          // lasts (~280 lines an hour otherwise).
+          if (!this._autoRestartReported?.[serviceName]) {
+            log.warn({ service: serviceName, afterMs: AUTO_RESTART_ERROR_AFTER_MS }, 'unit stuck in auto-restart: error');
+            this._autoRestartReported = { ...this._autoRestartReported, [serviceName]: true };
+          }
           mappedStatus = 'error';
         }
       }

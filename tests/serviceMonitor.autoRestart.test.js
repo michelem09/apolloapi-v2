@@ -113,4 +113,54 @@ describe('ckpool in activating (auto-restart)', () => {
     expect((await readSolo()).status).toBe('pending');
     expect(stuckWarnings()).toHaveLength(0);
   });
+
+  it('warns once on entering error, not on every poll, and again after a recovery', async () => {
+    await settled();
+    await poll();
+    now += 100000;
+    for (let i = 0; i < 5; i += 1) {
+      await poll();
+      now += 10000;
+    }
+    expect((await readSolo()).status).toBe('error');
+    expect(stuckWarnings()).toHaveLength(1);
+    global.__systemd = 'active';
+    await poll();
+    global.__systemd = 'activating';
+    await poll();
+    now += 100000;
+    await poll();
+    expect((await readSolo()).status).toBe('error');
+    expect(stuckWarnings()).toHaveLength(2);
+  });
+
+  it('a poll landing in `activating (start)` between retries neither resets the clock nor flaps', async () => {
+    await settled();
+    await poll(); // clock starts
+    now += 60000;
+    global.__sub = 'start'; // a retry in flight
+    await poll();
+    expect((await readSolo()).status).toBe('pending');
+    now += 31000; // 91 s since the loop began
+    await poll(); // still in `start`: same run, so error
+    expect((await readSolo()).status).toBe('error');
+    global.__sub = 'auto-restart';
+    await poll();
+    expect((await readSolo()).status).toBe('error');
+    global.__sub = 'start';
+    now += 1000;
+    await poll();
+    expect((await readSolo()).status).toBe('error');
+  });
+
+  it('a failed unit ends the run: the next loop starts a new clock', async () => {
+    await settled();
+    await poll();
+    now += 100000;
+    global.__systemd = 'failed';
+    await poll();
+    global.__systemd = 'activating';
+    await poll();
+    expect((await readSolo()).status).not.toBe('error');
+  });
 });
