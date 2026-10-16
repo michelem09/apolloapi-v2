@@ -1,5 +1,5 @@
 // A ckpool that crashes on start sits in `activating (auto-restart)` under
-// Restart=always and never reaches `failed`. Past the start grace window the
+// Restart=on-failure and never reaches `failed`. Past the start grace window the
 // monitor must call that an error, and go back to normal once it is up.
 
 const { knex } = require('../src/db');

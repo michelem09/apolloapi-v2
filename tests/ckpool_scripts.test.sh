@@ -30,9 +30,31 @@ mkdir -p "$tmp/bin" "$tmp/run"
 export APOLLO_DIR="$tmp/apollo" APOLLO_STATE_DIR="$tmp/state"
 BIN="$APOLLO_DIR/backend/ckpool/ckpool"
 mkdir -p "$APOLLO_DIR/backend/ckpool"
+# The binary start.sh launches: its behaviour is picked per test by $CKPOOL_MODE.
+cat > "$BIN" <<'STUB'
+#!/bin/bash
+echo "$$" > "${CKPOOL_STUB_PID:-/dev/null}"
+case "${CKPOOL_MODE:-exit0}" in
+    exit0) exit 0 ;;
+    exit3) exit 3 ;;
+    segv) kill -SEGV $$ ;;
+    sleep) sleep 30 ;;
+    termexit) trap 'exit 0' TERM; sleep 30 & wait ;;
+esac
+STUB
+chmod +x "$BIN"
 cat > "$tmp/bin/screen" <<'STUB'
 #!/bin/bash
 echo "screen $*" >> "$STUB_LOG"
+# `screen -D -m -S name cmd...` as the real one (Debian 4.09) behaves: run the
+# command, wait for it, and exit 0 whatever it did. SCREEN_ACTION=norun skips the
+# command (the session "never started"), SCREEN_ACTION=fail1 exits 1 without it.
+if [ "${1:-}" = "-D" ]; then
+    case "${SCREEN_ACTION:-}" in norun) exit 0 ;; fail1) exit 1 ;; esac
+    shift 4
+    "$@"
+    exit 0
+fi
 case "${SCREEN_ACTION:-none}" in
     hup) [ -n "${TARGET_PID:-}" ] && kill -TERM "$TARGET_PID" 2>/dev/null ;;
     fail) echo "No screen session found." >&2; exit 1 ;;
@@ -140,7 +162,8 @@ bash "$DIR/ckpool_start.sh" >/dev/null 2>&1; rc=$?
 check "start: exits 0"                      "0" "$rc"
 check "start: previous log kept as .1"      "run one" "$(cat "$LOGS/ckpool.log.1")"
 check "start: old log moved away"           "0" "$( [ -e "$LOGS/ckpool.log" ] && echo 1 || echo 0 )"
-check "start: launched ckpool in screen"    "1" "$(grep -c -- "-D -m -S ckpool $BIN -B -c $APOLLO_STATE_DIR/ckpool.conf" "$STUB_LOG")"
+check "start: launched ckpool in screen"    "1" "$(grep -c -- "^screen -D -m -S ckpool sh -c " "$STUB_LOG")"
+check "start: ckpool args after the wrapper" "1" "$(grep -c -- " ckpool-wrapper $APOLLO_STATE_DIR/ckpool/exit-status $BIN -B -c $APOLLO_STATE_DIR/ckpool.conf" "$STUB_LOG")"
 echo "run two" > "$LOGS/ckpool.log"
 bash "$DIR/ckpool_start.sh" >/dev/null 2>&1
 check "start: only one generation kept"     "run two" "$(cat "$LOGS/ckpool.log.1")"
@@ -159,6 +182,53 @@ mine="$(spawn 0 "$CKPOOL_DIR/ckpool")"
 echo "$mine" > "$CKPOOL_PIDFILE"
 bash "$DIR/ckpool_start.sh" >/dev/null 2>&1
 check "start: pid file naming our live ckpool kept" "1" "$( [ -e "$CKPOOL_PIDFILE" ] && echo 1 || echo 0 )"
+
+# --- exit status propagation: screen -D -m exits 0 whatever ckpool did ---
+start_rc() { bash "$DIR/ckpool_start.sh" >/dev/null 2>"$tmp/err"; echo $?; }
+rm -f "$CKPOOL_PIDFILE"
+check "status: ckpool exit 0 -> start exits 0"   "0"   "$(CKPOOL_MODE=exit0 start_rc)"
+check "status: ckpool exit 3 -> start exits 3"   "3"   "$(CKPOOL_MODE=exit3 start_rc)"
+check "status: ckpool SEGV -> start exits 139"   "139" "$(CKPOOL_MODE=segv start_rc)"
+# A status from the previous run must not leak into this one.
+echo 3 > "$APOLLO_STATE_DIR/ckpool/exit-status"
+check "status: stale status file ignored"        "0"   "$(CKPOOL_MODE=exit0 start_rc)"
+# The wrapper never ran / screen failed: not a clean exit.
+check "status: screen ran nothing -> nonzero"    "1"   "$(SCREEN_ACTION=norun start_rc)"
+check "status: screen failed with 1 -> 1"        "1"   "$(SCREEN_ACTION=fail1 start_rc)"
+# Garbled status files are rejected (a stub that writes one instead of running).
+for bad in "abc" "" "999" "-1" "3x" "00003000"; do
+    cat > "$tmp/bin/screen" <<GARBLE
+#!/bin/bash
+printf '%s\n' '$bad' > "$APOLLO_STATE_DIR/ckpool/exit-status"
+exit 0
+GARBLE
+    check "status: garbled [$bad] -> nonzero"  "1" "$(start_rc)"
+done
+
+# A requested stop: screen -X quit HUPs the window. The wrapper forwards the HUP,
+# ckpool ends, and the real status is still recorded (129, which the unit lists
+# in SuccessExitStatus). Real stub again.
+cat > "$tmp/bin/screen" <<'STUB'
+#!/bin/bash
+echo "screen $*" >> "$STUB_LOG"
+shift 4
+"$@"
+exit 0
+STUB
+for sig in HUP TERM; do
+    rm -f "$tmp/ck.pid"
+    CKPOOL_MODE=sleep CKPOOL_STUB_PID="$tmp/ck.pid" bash "$DIR/ckpool_start.sh" >/dev/null 2>&1 &
+    startpid=$!; pids="$pids $startpid"
+    for _ in $(seq 1 50); do [ -s "$tmp/ck.pid" ] && break; sleep 0.1; done
+    ckpid="$(cat "$tmp/ck.pid" 2>/dev/null)"
+    # the wrapper is ckpool's parent
+    wrap="$(ps -o ppid= -p "$ckpid" | tr -d ' ')"
+    kill -"$sig" "$wrap"
+    wait "$startpid"; rc=$?
+    exp=$(( 128 + $(kill -l "$sig") ))
+    check "stop via $sig: start exits $exp"     "$exp" "$rc"
+    check "stop via $sig: ckpool is gone"       "0" "$(alive "$ckpid")"
+done
 
 echo
 echo "$pass passed, $fail failed"
