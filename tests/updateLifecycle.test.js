@@ -72,7 +72,7 @@ describe('update lifecycle contract', () => {
     }
 
     // Both residual process checks: a unit can report inactive while its daemon
-    // survives. ckpool_stop.sh ends in `|| true` and ckpool backgrounds itself.
+    // survives. ckpool_stop.sh always exits 0, even if ckpool outlived its waits.
     expect(script).toContain('pgrep -u futurebit -x bitcoind');
     expect(script).toContain('pgrep -u futurebit -x ckpool');
 

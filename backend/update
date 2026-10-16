@@ -728,9 +728,10 @@ verify_all_stopped() {
       die "$u.service did not stop; aborting update"
     fi
   done
-  # A unit can report inactive while its daemon survives: ckpool_stop.sh ends in
-  # `|| true` and ckpool_start.sh daemonises with -B, so the stop reports success
-  # with the process alive. An orphan holds the stratum port and its pre-update
+  # A unit can report inactive while its daemon survives: ckpool_stop.sh always
+  # exits 0 (having nothing left to stop is a success, and a ckpool that outlives
+  # its TERM/KILL waits is only reported on stdout), so the stop can report
+  # success with the process alive. An orphan holds the stratum port and its pre-update
   # config, and the new instance then cannot bind.
   if pgrep -u futurebit -x bitcoind >/dev/null 2>&1; then
     die "Bitcoin node did not stop cleanly; aborting update"
