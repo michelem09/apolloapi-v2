@@ -67,14 +67,37 @@ screen -D -m -S ckpool sh -c "$WRAPPER" ckpool-wrapper "$STATUS_FILE" \
 
 # What ckpool really did. A missing or garbled status (the wrapper never ran, or
 # was killed outright) is a failure, never a clean exit.
-status=""
-if [ -r "$STATUS_FILE" ]; then
-    status="$(tr -d '[:space:]' < "$STATUS_FILE" 2>/dev/null || true)"
-fi
-case "$status" in
-    ''|*[!0-9]*) status="" ;;
-    *) if [ "${#status}" -gt 3 ] || [ "$status" -gt 255 ]; then status=""; fi ;;
-esac
+read_status() {
+    status=""
+    if [ -r "$STATUS_FILE" ]; then
+        status="$(tr -d '[:space:]' < "$STATUS_FILE" 2>/dev/null || true)"
+    fi
+    case "$status" in
+        ''|*[!0-9]*) status="" ;;
+        *) if [ "${#status}" -gt 3 ] || [ "$status" -gt 255 ]; then status=""; fi ;;
+    esac
+}
+
+# `screen -X quit` (ckpool_stop.sh) makes screen exit at once, before the
+# wrapper has forwarded the HUP, waited for ckpool and written the status: seen
+# on Debian's screen 4.09, where every requested stop ended as "no usable exit
+# status" and left the unit failed. So when the status is not there yet, wait for
+# it, but only while a wrapper of ours is still alive, and never longer than
+# APOLLO_CKPOOL_STATUS_WAIT seconds (default 10, far below TimeoutStopSec).
+read_status
+waited=0
+max_ticks=$(( ${APOLLO_CKPOOL_STATUS_WAIT:-10} * 10 ))
+while [ -z "$status" ] && [ "$waited" -lt "$max_ticks" ]; do
+    # pgrep exits 1 when nothing matches: the wrapper is gone, nothing to wait for.
+    # Any other outcome (including no pgrep at all) keeps waiting out the bound.
+    prc=0
+    pgrep -f -- "ckpool-wrapper ${STATUS_FILE}" >/dev/null 2>&1 || prc=$?
+    if [ "$prc" -eq 1 ]; then break; fi
+    sleep 0.1
+    waited=$((waited + 1))
+    read_status
+done
+read_status
 if [ -n "$status" ]; then
     exit "$status"
 fi

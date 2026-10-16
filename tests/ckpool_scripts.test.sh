@@ -40,6 +40,7 @@ case "${CKPOOL_MODE:-exit0}" in
     segv) kill -SEGV $$ ;;
     sleep) sleep 30 ;;
     termexit) trap 'exit 0' TERM; sleep 30 & wait ;;
+    slowhup) trap 'sleep 1.5; exit 0' HUP; sleep 30 & wait ;;
 esac
 STUB
 chmod +x "$BIN"
@@ -229,6 +230,48 @@ for sig in HUP TERM; do
     check "stop via $sig: start exits $exp"     "$exp" "$rc"
     check "stop via $sig: ckpool is gone"       "0" "$(alive "$ckpid")"
 done
+
+# The real race (Debian screen 4.09): `screen -X quit` makes screen exit 0 at
+# once while the wrapper is still forwarding the HUP and waiting for ckpool, so
+# the status file appears AFTER screen has returned. The stub models it: it runs
+# the wrapper in the background, waits for the quit flag, HUPs the wrapper and
+# exits straight away. ckpool takes 1.5 s to finish after the HUP.
+cat > "$tmp/bin/screen" <<'STUB'
+#!/bin/bash
+echo "screen $*" >> "$STUB_LOG"
+shift 4
+"$@" &
+w=$!
+while [ ! -e "$QUIT_FLAG" ]; do sleep 0.05; done
+kill -HUP "$w" 2>/dev/null
+exit 0
+STUB
+export QUIT_FLAG="$tmp/quit.flag"
+race_run() {
+    rm -f "$tmp/ck.pid" "$QUIT_FLAG"
+    CKPOOL_MODE=slowhup CKPOOL_STUB_PID="$tmp/ck.pid" bash "$DIR/ckpool_start.sh" >/dev/null 2>"$tmp/err" &
+    startpid=$!; pids="$pids $startpid"
+    for _ in $(seq 1 50); do [ -s "$tmp/ck.pid" ] && break; sleep 0.1; done
+    sleep 0.3; : > "$QUIT_FLAG"
+    wait "$startpid"; echo $?
+}
+check "race: screen quits before the status is written -> still start exits 0" "0" "$(race_run)"
+check "race: the status was waited for, not reported missing" "0" "$(grep -c 'no usable exit status' "$tmp/err")"
+# A bounded wait: a wrapper that never writes (killed outright) fails, and the
+# wait ends within the configured bound.
+cat > "$tmp/bin/screen" <<'STUB'
+#!/bin/bash
+shift 4
+( exec -a "ckpool-wrapper $APOLLO_STATE_DIR/ckpool/exit-status" sleep 30 ) &
+exit 0
+STUB
+t0="$(now)"
+rc="$(APOLLO_CKPOOL_STATUS_WAIT=2 start_rc)"
+el=$(( $(now) - t0 ))
+check "race: wrapper alive but silent -> failure after the bound" "1" "$rc"
+check "race: the wait is bounded (2-4 s)" "1" "$( [ "$el" -ge 2 ] && [ "$el" -le 4 ] && echo 1 || echo 0 )"
+pkill_pids="$(pgrep -f "^ckpool-wrapper $APOLLO_STATE_DIR" || true)"
+for p in $pkill_pids; do kill -KILL "$p" 2>/dev/null; done
 
 echo
 echo "$pass passed, $fail failed"

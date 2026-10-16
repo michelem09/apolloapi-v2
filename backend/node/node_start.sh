@@ -71,7 +71,8 @@ set_conf_by_ram_for_ibd() {
 
 select_bitcoind() {
     local software arch
-    if ! software=$(sqlite3 "$DATABASE_URL" \
+    # Wait for the API's write lock instead of failing the start at once.
+    if ! software=$(sqlite3 -cmd ".timeout 5000" "$DATABASE_URL" \
         "SELECT node_software FROM settings ORDER BY created_at DESC, id DESC LIMIT 1;" \
         2>/dev/null); then
         log "ERROR: could not read node software from $DATABASE_URL"
