@@ -192,7 +192,7 @@ describe('a failed write does not carry the hash to the client', () => {
     const failing = {
       setup: jest.fn().mockRejectedValue(new Error('Could not save the password: SQLITE_BUSY: database is locked')),
     };
-    const result = await authResolver.AuthActions.setup(null, { input: { password: 'x' } }, { services: { auth: failing } });
+    const result = await authResolver.AuthMutations.setup(null, { input: { password: 'x' } }, { services: { auth: failing } });
     expect(result.error.message).not.toMatch(HASH);
   });
 
