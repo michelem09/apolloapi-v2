@@ -5,6 +5,15 @@
 const { knex } = require('../src/db');
 const monitorFactory = require('../src/services/serviceMonitor');
 
+const mockWarn = jest.fn();
+jest.mock('../src/logger', () => () => ({
+  warn: (...a) => mockWarn(...a),
+  info: jest.fn(),
+  debug: jest.fn(),
+  error: jest.fn(),
+}));
+const stuckWarnings = () => mockWarn.mock.calls.filter((c) => /stuck in auto-restart/.test(c[1]));
+
 let publishSpy;
 beforeAll(() => {
   publishSpy = jest.spyOn(require('../src/graphql/pubsub'), 'publish').mockImplementation(() => {});
@@ -35,6 +44,7 @@ describe('ckpool in activating (auto-restart)', () => {
   let monitor;
   let now;
   beforeEach(() => {
+    mockWarn.mockClear();
     global.__systemd = 'activating';
     global.__sub = 'auto-restart';
     monitor = monitorFactory(knex, {});
@@ -43,7 +53,9 @@ describe('ckpool in activating (auto-restart)', () => {
   });
   afterEach(() => jest.restoreAllMocks());
 
-  const poll = () => monitor.checkServiceStatus('ckpool', 'solo');
+  // 2nd argument is updateInProgress, compared `=== false`: anything else skips
+  // the grace / manual-stop block these tests are about.
+  const poll = () => monitor.checkServiceStatus('ckpool', false);
   // Past the grace window of the request that started it all.
   const settled = () => setSolo({ status: 'pending', requested_status: 'online', requested_at: now - 200000 });
 
@@ -84,11 +96,21 @@ describe('ckpool in activating (auto-restart)', () => {
   });
 
   it('is left alone while a request is still inside its grace window', async () => {
-    await setSolo({ status: 'pending', requested_status: 'online', requested_at: now - 1000 });
+    // The loop has been running for 100 s (the clock is well past the error
+    // threshold) when a fresh request arrives: its grace window wins. The final
+    // status is `pending` either way (the grace branch overrides), so what the
+    // `!isWithinGracePeriod` guard really decides is whether the error is
+    // declared: the warning is the observable.
+    await settled();
     await poll();
-    now += 50000;
+    now += 100000;
+    await poll();
+    expect((await readSolo()).status).toBe('error');
+    expect(stuckWarnings()).toHaveLength(1);
     await setSolo({ status: 'pending', requested_status: 'online', requested_at: now - 1000 });
+    mockWarn.mockClear();
     await poll();
     expect((await readSolo()).status).toBe('pending');
+    expect(stuckWarnings()).toHaveLength(0);
   });
 });
