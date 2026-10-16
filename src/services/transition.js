@@ -114,7 +114,7 @@ const run = (knex, serviceName, requestedStatus, command, { notify, timeoutMs = 
 // command line and sudo's own words ("Command failed: sudo systemctl ... a
 // terminal is required"): useful in the log, noise on a screen. The client picks
 // its localised text from the code, service and action.
-const LABELS = { miner: 'miner', node: 'Bitcoin node', solo: 'solo pool' };
+const LABELS = { miner: 'miner', node: 'Bitcoin node', solo: 'solo pool', tor: 'Tor' };
 
 const refused = (service, action, error) => {
   log.warn({ service, action, err: error }, 'service command refused');

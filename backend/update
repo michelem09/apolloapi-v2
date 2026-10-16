@@ -398,7 +398,7 @@ restore_solo_intent() {
   fi
   requested="$(<"$SOLO_REQUEST_FILE")"
   case "$requested" in
-    online|offline) sqlite3 "$db" "UPDATE service_status SET status='pending', requested_status='${requested}', requested_at=CURRENT_TIMESTAMP WHERE service_name='solo';" ;;
+    online|offline) sqlite3 "$db" "UPDATE service_status SET status='pending', requested_status='${requested}', requested_at=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE service_name='solo';" ;;
     '')             sqlite3 "$db" "UPDATE service_status SET requested_status=NULL, requested_at=NULL WHERE service_name='solo';" ;;
   esac
   rm -f "$SOLO_REQUEST_FILE"

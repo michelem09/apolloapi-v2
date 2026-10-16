@@ -61,4 +61,18 @@ describe('miner start/stop/restart and the automation pause', () => {
     await miner._pauseAutomation('automation');
     expect(setOverride).not.toHaveBeenCalled();
   });
+
+  it.each(['start', 'stop', 'restart'])(
+    '%s: a failure AFTER the command was accepted is logged, not reported as a refusal',
+    async (action) => {
+      jest.spyOn(miner, '_execCommand').mockResolvedValue({ stdout: '', stderr: '' });
+      jest.spyOn(miner, '_pauseAutomation').mockRejectedValue(new Error('SQLITE_BUSY'));
+
+      await expect(miner[action]()).resolves.toBeUndefined();
+
+      // The request stays recorded: systemd accepted it.
+      const row = await knex('service_status').where({ service_name: 'miner' }).first();
+      expect(row.status).toBe('pending');
+    }
+  );
 });

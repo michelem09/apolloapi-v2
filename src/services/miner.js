@@ -78,8 +78,7 @@ class MinerService {
           },
           { notify: () => this._notifyServicesStatus() }
         );
-        await this._setDevStatus('online');
-        log.debug('dev miner started - status updated to online');
+        log.debug('dev miner started');
       } else {
         // --no-block: miner_start.sh sleeps ~35s waiting for USB boards to
         // enumerate, and a forking unit blocks systemctl for that whole time.
@@ -94,13 +93,11 @@ class MinerService {
           { notify: () => this._notifyServicesStatus() }
         );
       }
-      // Only now that the command was accepted: a click that was refused must not
-      // pause the automation.
-      await this._pauseAutomation(source);
-      this._reevaluateAutomation(source);
     } catch (error) {
+      // Only the command's own refusal is reported as one.
       throw transition.refused('miner', 'start', error);
     }
+    await this._afterAccepted(source, 'online');
   }
 
   // Stop the miner
@@ -118,8 +115,7 @@ class MinerService {
           },
           { notify: () => this._notifyServicesStatus() }
         );
-        await this._setDevStatus('offline');
-        log.debug('dev miner stopped - status updated to offline');
+        log.debug('dev miner stopped');
       } else {
         await transition.run(
           this.knex,
@@ -129,13 +125,11 @@ class MinerService {
           { notify: () => this._notifyServicesStatus() }
         );
       }
-      // Only now that the command was accepted: a click that was refused must not
-      // pause the automation.
-      await this._pauseAutomation(source);
-      this._reevaluateAutomation(source);
     } catch (error) {
+      // Only the command's own refusal is reported as one.
       throw transition.refused('miner', 'stop', error);
     }
+    await this._afterAccepted(source, 'offline');
   }
 
   // Restart the miner
@@ -153,8 +147,7 @@ class MinerService {
           },
           { notify: () => this._notifyServicesStatus() }
         );
-        await this._setDevStatus('online');
-        log.debug('dev miner restarted - status updated to online');
+        log.debug('dev miner restarted');
       } else {
         // --no-block: see start(). The 35s device-side wait is unchanged; the
         // API returns at once and the service monitor tracks the miner online.
@@ -166,12 +159,24 @@ class MinerService {
           { notify: () => this._notifyServicesStatus() }
         );
       }
-      // Only now that the command was accepted: a click that was refused must not
-      // pause the automation.
+    } catch (error) {
+      // Only the command's own refusal is reported as one.
+      throw transition.refused('miner', 'restart', error);
+    }
+    await this._afterAccepted(source, 'online');
+  }
+
+  // What follows a command that systemd (or the dev miner) ACCEPTED. A failure
+  // here is not a refusal and must not be reported as one ("Could not start the
+  // miner" over a miner that is starting): it is logged. The pause comes only now,
+  // so a click that was refused does not pause the automation.
+  async _afterAccepted(source, devStatus) {
+    try {
+      if (process.env.NODE_ENV === 'development') await this._setDevStatus(devStatus);
       await this._pauseAutomation(source);
       this._reevaluateAutomation(source);
     } catch (error) {
-      throw transition.refused('miner', 'restart', error);
+      log.warn({ err: error }, 'follow-up of an accepted miner command failed');
     }
   }
 

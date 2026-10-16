@@ -422,10 +422,15 @@ class SettingsService {
     const torChanged =
       oldSettings.nodeEnableTor !== newSettings.nodeEnableTor;
     if (torChanged) {
-      if (newSettings.nodeEnableTor) {
-        await this._runSystemctl('enable', '--now', 'tor.service');
-      } else {
-        await this._runSystemctl('disable', '--now', 'tor.service');
+      // Tor is not a service the monitor tracks, so no transition: only the
+      // refusal is worded like the others. Left blocking on purpose (no
+      // --no-block): the node is restarted next and its proxy setting needs tor
+      // listening, which `--now` waiting for the start guarantees.
+      const action = newSettings.nodeEnableTor ? 'enable' : 'disable';
+      try {
+        await this._runSystemctl(action, '--now', 'tor.service');
+      } catch (error) {
+        throw transition.refused('tor', action, error);
       }
     }
 
@@ -473,12 +478,20 @@ class SettingsService {
   // accepted the job, and put back if it refused, with one request at a time per
   // service. `--no-block`, so that a failure here means "refused" and the monitor
   // decides how the job ended. Outside production there is no systemd and no
-  // monitor, so nothing is recorded (a `pending` row would never close).
+  // monitor: the row is recorded and then closed by hand (development parity).
   async _requestService(serviceName, requestedStatus, systemctlArgs) {
     const action = systemctlArgs[0];
     try {
       if (process.env.NODE_ENV !== 'production') {
-        return await this._runSystemctl(...systemctlArgs);
+        // No systemd and no monitor, so whoever asks records the arrival, as the
+        // Solo resolver does in development: a `pending` row would never close.
+        await transition.run(this.knex, serviceName, requestedStatus, () =>
+          this._runSystemctl(...systemctlArgs)
+        );
+        await this.knex('service_status')
+          .where({ service_name: serviceName })
+          .update({ status: requestedStatus, last_checked: Date.now() });
+        return undefined;
       }
       return await transition.run(
         this.knex,

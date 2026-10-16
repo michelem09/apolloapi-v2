@@ -140,16 +140,21 @@ class AuthService {
         await this.utils.auth.changeSystemPassword(password);
       }
 
-      // Insert the setup record
-      await this.knex('setup').insert({
-        password: hashedPassword
-      });
+      // Insert the setup record. A knex error carries the password hash, inlined
+      // in `message` as `insert into setup ... values ('$2a$...')`: that must not
+      // reach the response, so the caller gets a plain sentence and the detail
+      // (hash cut out by the logger's err serializer) goes to the log.
+      try {
+        await this.knex('setup').insert({
+          password: hashedPassword
+        });
+      } catch (err) {
+        log.error({ err }, 'failed to store the login password at setup');
+        throw new Error('Setup could not be completed: the login password could not be saved. Try again.');
+      }
     } catch (err) {
-      // A knex error carries the password hash twice: in `bindings` (censored by
-      // the logger's redaction) and inlined in `message`/`stack` as
-      // `insert into setup … values ('$2a$…') - <driver error>`. The logger's err
-      // serializer cuts both down to the driver part. This block also wraps
-      // changeSystemPassword, whose failures are plain Errors with no `code`.
+      // This block also wraps assertPasswordAcceptable, the "already done" check
+      // and changeSystemPassword, whose messages are already written for the user.
       log.error({ err }, 'setup failed');
       throw err;
     }

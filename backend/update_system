@@ -91,7 +91,7 @@ restore_solo_intent() {
                 "UPDATE service_status
                     SET status = 'pending',
                         requested_status = '${requested_status}',
-                        requested_at = CURRENT_TIMESTAMP
+                        requested_at = CAST(strftime('%s','now') AS INTEGER) * 1000
                   WHERE service_name = 'solo';"
             ;;
         '')

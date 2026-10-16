@@ -3,9 +3,11 @@ const fs = require('fs');
 const path = require('path');
 const { defaultDatabaseUrl } = require('./paths');
 
-// This runs before the logger (and before `config`, which the logger's own
-// requires may pull in), so it cannot use ./logger: a bare line on stderr is what
-// the journal captures. Not console.*, which is banned in src/.
+// The logger does not load `config`, but it fixes its level from LOG_LEVEL when it
+// is first required, and this file is what loads `.env` (where LOG_LEVEL may be
+// set). Requiring it here would freeze the level before .env is read, for every
+// component that logs afterwards. So these two warnings go to stderr by hand,
+// which is what the journal captures. Not console.*, which is banned in src/.
 const warn = (message) => process.stderr.write(`${message}\n`);
 
 const newSecret = () => crypto.randomBytes(64).toString('hex');

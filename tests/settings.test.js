@@ -478,6 +478,47 @@ describe('Settings API', () => {
       expect(payload.error.message).not.toMatch(/Command failed/);
     });
 
+    it.each([
+      [true, 'enable'],
+      [false, 'disable'],
+    ])('a refused Tor %s is the clean service refusal, not "Command failed"', async (enableTor, action) => {
+      jest.spyOn(settingsService, '_isServiceActive').mockResolvedValue(false);
+      jest
+        .spyOn(settingsService, '_runSystemctl')
+        .mockRejectedValue(new Error('Command failed: sudo systemctl ... a terminal is required'));
+
+      const error = await settingsService
+        ._applyServiceLifecycle(
+          { nodeEnableTor: !enableTor, nodeEnableSoloMining: false },
+          { nodeEnableTor: enableTor, nodeEnableSoloMining: false },
+          false,
+          false
+        )
+        .catch((e) => e);
+
+      expect(error.message).toBe(`Could not ${action} the Tor`);
+      expect(error.extensions).toEqual({ code: 'SERVICE_COMMAND_FAILED', service: 'tor', action });
+    });
+
+    it('outside production the solo toggle still records the arrival (development parity)', async () => {
+      await knex('service_status').where({ service_name: 'solo' }).del();
+      await knex('service_status').insert({ service_name: 'solo', status: 'offline', requested_status: 'offline', requested_at: 1000 });
+      jest.spyOn(settingsService, '_isServiceActive').mockResolvedValue(false);
+      jest.spyOn(settingsService, '_runSystemctl').mockResolvedValue(undefined);
+
+      await settingsService._applyServiceLifecycle(
+        { nodeEnableTor: false, nodeEnableSoloMining: false },
+        { nodeEnableTor: false, nodeEnableSoloMining: true },
+        false,
+        false
+      );
+
+      const row = await knex('service_status').where({ service_name: 'solo' }).first();
+      // Not left `pending`: there is no monitor here to close it.
+      expect(row).toMatchObject({ status: 'online', requested_status: 'online' });
+      expect(Number(row.requested_at)).toBeGreaterThan(1000);
+    });
+
     it('does not start or restart an offline node', async () => {
       jest
         .spyOn(settingsService, '_isServiceActive')

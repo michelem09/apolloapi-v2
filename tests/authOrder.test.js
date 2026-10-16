@@ -164,3 +164,27 @@ describe('password change order', () => {
     await expect(svc.login({ password: 'stray-row-pass' })).rejects.toThrow('Invalid password');
   });
 });
+
+describe('setup: a failed insert does not put the hash in the response', () => {
+  it('answers with a plain sentence, whatever the driver put in its message', async () => {
+    const hashInMessage = "insert into `setup` (`password`) values ('$2a$12$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ0123') - SQLITE_BUSY: database is locked";
+    const failingKnex = () => ({
+      select: () => ({ limit: async () => [] }),
+      insert: async () => {
+        throw new Error(hashInMessage);
+      },
+    });
+    const svc = AuthService(failingKnex, { auth: { changeSystemPassword: jest.fn() } });
+
+    const error = await svc.setup({ password: 'longenough1' }).catch((e) => e);
+
+    expect(error.message).toBe('Setup could not be completed: the login password could not be saved. Try again.');
+    expect(error.message).not.toMatch(/\$2a\$|insert into|SQLITE/);
+    expect(JSON.stringify(error)).not.toMatch(/\$2a\$/);
+  });
+
+  it('keeps the messages that are already written for the user', async () => {
+    const svc = AuthService(knex, { auth: { changeSystemPassword: jest.fn() } });
+    await expect(svc.setup({ password: 'short' })).rejects.toThrow('at least 8 characters');
+  });
+});
