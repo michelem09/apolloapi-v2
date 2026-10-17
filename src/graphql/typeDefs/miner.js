@@ -6,11 +6,43 @@ module.exports = gql`
   }
 
   type MinerActions {
+    # start/stop/restart/resetBlockFoundFlag: deprecated aliases for UI bundles
+    # that predate the move (a tab left open across an update). They keep @auth,
+    # so an alias is never an unauthenticated way to drive the miner.
+    start: EmptyOutput!
+      @auth
+      @deprecated(
+        reason: "start is a Mutation (Mutation.Miner.start); this query alias only serves pre-mutation UI bundles"
+      )
+    stop: EmptyOutput!
+      @auth
+      @deprecated(
+        reason: "stop is a Mutation (Mutation.Miner.stop); this query alias only serves pre-mutation UI bundles"
+      )
+    restart: EmptyOutput!
+      @auth
+      @deprecated(
+        reason: "restart is a Mutation (Mutation.Miner.restart); this query alias only serves pre-mutation UI bundles"
+      )
+    stats: MinerStatsOutput!
+    online: MinerOnlineOutput!
+    resetBlockFoundFlag: EmptyOutput!
+      @auth
+      @deprecated(
+        reason: "resetBlockFoundFlag is a Mutation (Mutation.Miner.resetBlockFoundFlag); this query alias only serves pre-mutation UI bundles"
+      )
+  }
+
+  # Side-effectful actions must NOT be queries: Apollo Client treats queries as
+  # safe to re-execute, and a phantom re-fire would stop or restart the miner.
+  extend type Mutation {
+    Miner: MinerMutations
+  }
+
+  type MinerMutations {
     start: EmptyOutput! @auth
     stop: EmptyOutput! @auth
     restart: EmptyOutput! @auth
-    stats: MinerStatsOutput!
-    online: MinerOnlineOutput!
     resetBlockFoundFlag: EmptyOutput! @auth
   }
 

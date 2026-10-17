@@ -7,10 +7,37 @@ module.exports = gql`
 
   type SoloActions {
     status: SoloStatusOutput! @auth
+    # start/stop/restart: deprecated aliases for UI bundles that predate the
+    # move. They keep @auth, so an alias is never an unauthenticated way to
+    # drive the solo pool.
+    start: SoloOutput!
+      @auth
+      @deprecated(
+        reason: "start is a Mutation (Mutation.Solo.start); this query alias only serves pre-mutation UI bundles"
+      )
+    stop: SoloOutput!
+      @auth
+      @deprecated(
+        reason: "stop is a Mutation (Mutation.Solo.stop); this query alias only serves pre-mutation UI bundles"
+      )
+    restart: SoloOutput!
+      @auth
+      @deprecated(
+        reason: "restart is a Mutation (Mutation.Solo.restart); this query alias only serves pre-mutation UI bundles"
+      )
+    stats: SoloStatsOutput! @auth
+  }
+
+  # Side-effectful actions must NOT be queries: Apollo Client treats queries as
+  # safe to re-execute.
+  extend type Mutation {
+    Solo: SoloMutations
+  }
+
+  type SoloMutations {
     start: SoloOutput! @auth
     stop: SoloOutput! @auth
     restart: SoloOutput! @auth
-    stats: SoloStatsOutput! @auth
   }
 
   type SoloOutput {
