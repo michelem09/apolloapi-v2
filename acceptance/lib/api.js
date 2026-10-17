@@ -58,7 +58,12 @@ const gql = async (profile, token, query, variables = {}) => {
 // Settings.update, ...) from Query to Mutation; 2.1.x still serves them as
 // queries. A write goes out as a mutation first and, only if the server's schema
 // does not know it there, again as the query of the same text.
-const writeForms = new Map(); // apiBase -> 'mutation' | 'query'
+// Keyed by host AND root field: a 2.1.4 device already serves Node and Mcu actions
+// as mutations while Miner and Solo are still queries, so one form per host would
+// send the wrong one for half the calls.
+const writeForms = new Map(); // `${apiBase}|${rootField}` -> 'mutation' | 'query'
+
+const rootFieldOf = (doc) => /\{\s*(\w+)/.exec(doc.replace(/^\s*\w+\s*(\([^)]*\))?/, ''))?.[1] || '';
 
 // True only when EVERY error is a validation failure about the Mutation root: an
 // unknown field on type "Mutation", or a schema with no Mutation type at all.
@@ -83,7 +88,7 @@ const asQuery = (doc) => {
 
 // `send` is the transport, injectable so the fallback is testable without a device.
 const gqlWrite = async (profile, token, mutationDoc, variables = {}, send = gql) => {
-  const key = profile.apiBase;
+  const key = `${profile.apiBase}|${rootFieldOf(mutationDoc)}`;
   if (writeForms.get(key) === 'query') return send(profile, token, asQuery(mutationDoc), variables);
   try {
     const data = await send(profile, token, mutationDoc, variables);

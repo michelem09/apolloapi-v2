@@ -1,5 +1,5 @@
 const { sshExec } = require('../lib/ssh');
-const { gql } = require('../lib/api');
+const { gqlWrite } = require('../lib/api');
 const { waitUntil } = require('../lib/wait');
 
 const isActive = (profile, unit) => async () =>
@@ -18,14 +18,13 @@ module.exports = {
     const active = isActive(profile, 'apollo-miner');
     assert(await active(), 'the miner is running before we touch it');
 
-    // A query, not a mutation: Miner.start/stop/restart are still under Query,
-    // unlike wifi* and setTimezone. Noted, not worked around — the suite drives
-    // the schema the device actually serves.
-    await gql(profile, token, `{ Miner { stop { error { message } } } }`);
+    // A mutation on v2.2, a query on 2.1.x: gqlWrite tries the first and falls
+    // back to the second, so the suite drives the schema the device serves.
+    await gqlWrite(profile, token, `mutation { Miner { stop { error { message } } } }`);
     const stopped = await waitUntil(async () => !(await active()), { timeoutMs: 60000 });
     assert(stopped.ok, 'systemd reports the miner stopped');
 
-    await gql(profile, token, `{ Miner { start { error { message } } } }`);
+    await gqlWrite(profile, token, `mutation { Miner { start { error { message } } } }`);
     // miner_start.sh enumerates boards and waits on them: ~35 s on an Apollo III,
     // measured, so the window is minutes rather than seconds.
     const started = await waitUntil(active, { timeoutMs: 180000, everyMs: 5000 });

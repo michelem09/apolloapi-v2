@@ -136,3 +136,21 @@ test('gql flags a real Apollo validation body so gqlWrite recognises it (stubbed
     global.fetch = real;
   }
 });
+
+test('the form is cached per root field: Node can be a mutation while Miner is still a query', async () => {
+  const NODE = 'mutation { Node { stop { error { message } } } }';
+  const MINER = 'mutation { Miner { stop { error { message } } } }';
+  const calls = [];
+  const send = async (_p, _t, doc) => {
+    calls.push(`${doc.trimStart().split(/\W/)[0]}:${/\{\s*(\w+)/.exec(doc.replace(/^\s*\w+/, ''))[1]}`);
+    // a 2.1.4-like schema: Node is a mutation, Miner exists only as a query
+    if (doc.trimStart().startsWith('mutation') && doc.includes('Miner')) {
+      throw validation('Cannot query field "Miner" on type "Mutation".');
+    }
+    return {};
+  };
+  await gqlWrite(profile('mixed'), 't', NODE, {}, send);
+  await gqlWrite(profile('mixed'), 't', MINER, {}, send);
+  await gqlWrite(profile('mixed'), 't', MINER, {}, send);
+  assert.deepEqual(calls, ['mutation:Node', 'mutation:Miner', 'query:Miner', 'query:Miner']);
+});
