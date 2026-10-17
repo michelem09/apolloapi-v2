@@ -10,7 +10,11 @@ EnvironmentFile=-/opt/apolloapi/.env
 Type=simple
 User=futurebit
 Group=futurebit
-ExecStart=/usr/local/nvm/versions/node/v21.6.2/bin/node /opt/apolloapi/src/init.js
+# Node comes from the runtime that ships inside the release (backend/runtime/node,
+# installed by backend/utils/install-node-runtime.sh), not from nvm. A rollback to a
+# release that predates it restores the older unit, which still points at the nvm
+# Node 21 that image installs leave on the device.
+ExecStart=/opt/apolloapi/backend/runtime/node/bin/node /opt/apolloapi/src/init.js
 WorkingDirectory=/opt/apolloapi
 Restart=on-failure
 RestartSec=5s

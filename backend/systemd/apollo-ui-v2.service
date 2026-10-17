@@ -7,7 +7,7 @@ After=apollo-api.service
 [Service]
 Type=simple
 User=futurebit
-Environment=PATH=/usr/local/nvm/versions/node/v21.6.2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/usr/local/nvm/versions/node/v21.6.2/bin:/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=PATH=/opt/apolloapi/backend/runtime/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Run the self-contained build (next.config.js: output: 'standalone') instead of
 # `next start`, which needs the full node_modules tree beside it. The standalone
 # bundle is ~73 MB against ~700 MB of node_modules, and needs no build step.
@@ -24,7 +24,11 @@ Environment=PATH=/usr/local/nvm/versions/node/v21.6.2/bin:/usr/local/sbin:/usr/l
 WorkingDirectory=/opt/apolloapi/apolloui-v2
 Environment=HOSTNAME=0.0.0.0
 Environment=PORT=3000
-ExecStart=/usr/local/nvm/versions/node/v21.6.2/bin/node .next/standalone/server.js
+# Node comes from the runtime that ships inside the release (backend/runtime/node,
+# installed by backend/utils/install-node-runtime.sh), not from nvm. A rollback to a
+# release that predates it restores the older unit, which still points at the nvm
+# Node 21 that image installs leave on the device.
+ExecStart=/opt/apolloapi/backend/runtime/node/bin/node .next/standalone/server.js
 Restart=always
 SyslogIdentifier=ApolloUIv2
 
