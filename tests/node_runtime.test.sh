@@ -62,17 +62,34 @@ make_fixture() {
     } > "$d/pins"
 }
 
-# run <version> <dest> [pins] [mirror] — exit status in $rc, output in $out
+# run <version> <dest> [pins] [mirror] — exit status in $rc, output in $out.
+# The machine is an aarch64 one unless MACHINE says otherwise, so the runtime is
+# "for this machine" and the post-extraction run check is exercised everywhere.
 run() {
     local v="$1" dest="$2" pins="${3:-$tmp/fx-$1/pins}" mirror="${4:-$tmp/fx-$1}"
-    out="$(APOLLO_NODE_VERSION="$v" APOLLO_NODE_ARCH=arm64 APOLLO_NODE_PINS="$pins" \
+    out="$(APOLLO_NODE_VERSION="$v" APOLLO_NODE_ARCH=arm64 APOLLO_MACHINE_ARCH="${MACHINE:-aarch64}" APOLLO_NODE_PINS="$pins" \
            APOLLO_NODE_MIRROR="$mirror" APOLLO_YARN_MIRROR="$mirror" \
            bash "$SCRIPT" "$dest" 2>&1)"
     rc=$?
 }
 
+# make_broken_fixture <version> <node-script-body> — like make_fixture, but the
+# extracted bin/node is the given shell script (a binary that dies, or lies).
+make_broken_fixture() {
+    local v="$1" body="$2" d="$tmp/fx-$1"
+    make_fixture "$v"
+    printf '#!/bin/sh\n%s\n' "$body" > "$tmp/build-$v/node-v$v-linux-arm64/bin/node"
+    tar -C "$tmp/build-$v" -czf "$d/v$v/node-v$v-linux-arm64.tar.xz" "node-v$v-linux-arm64"
+    {
+        echo "$(sha_of "$d/v$v/node-v$v-linux-arm64.tar.xz")  node-v$v-linux-arm64.tar.xz"
+        echo "$(sha_of "$d/yarn-1.22.22.tgz")  yarn-1.22.22.tgz"
+    } > "$d/pins"
+}
+
 make_fixture 9.9.9
 make_fixture 9.9.8
+make_broken_fixture 9.9.7 'exit 127'
+make_broken_fixture 9.9.6 'echo v0.0.1'
 
 # --- a correct checksum installs ------------------------------------------------
 dest="$tmp/a/runtime/node"
@@ -138,6 +155,47 @@ run 9.9.9 "$dest"
 check "good upgrade replaces it"                  "v9.9.9" "$("$dest/bin/node" --version 2>/dev/null)"
 check "…without keeping the old tree"             "0" "$(exists "$dest/OLD_MARKER")"
 check "…or any temp dir"                          "0" "$(ls -A "$tmp/d/runtime" | grep -c '^\.node-runtime')"
+
+# --- an extracted node that does not run, or lies ---------------------------------
+# On a machine of the runtime's own architecture this is a failed install and the
+# previous runtime survives. Only a cross build (other architecture) skips the check.
+dest="$tmp/g/runtime/node"
+run 9.9.8 "$dest"
+touch "$dest/OLD_MARKER"
+run 9.9.7 "$dest"
+check "a node that does not start is refused"       "1" "$( [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'does not start' && echo 1 || echo 0 )"
+check "…the message names the runtime's arch"       "1" "$(printf '%s' "$out" | grep -c 'extracted arm64 node does not start on this arm64 machine')"
+check "…and the previous runtime is untouched"      "v9.9.8:1" "$("$dest/bin/node" --version 2>/dev/null):$(exists "$dest/OLD_MARKER")"
+run 9.9.6 "$dest"
+check "a node that reports another version is refused" "1" "$( [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'reports v0.0.1' && echo 1 || echo 0 )"
+check "…and the previous runtime is untouched"      "v9.9.8:1" "$("$dest/bin/node" --version 2>/dev/null):$(exists "$dest/OLD_MARKER")"
+dest="$tmp/g2/runtime/node"
+MACHINE=x86_64 run 9.9.7 "$dest"
+check "cross build: the unrunnable node is installed" "0" "$rc"
+check "…and the skipped check is declared"          "1" "$(printf '%s' "$out" | grep -c 'cross build')"
+dest="$tmp/g3/runtime/node"
+out="$(APOLLO_NODE_VERSION=9.9.9 APOLLO_NODE_ARCH=riscv64 APOLLO_NODE_PINS="$tmp/fx-9.9.9/pins" \
+       APOLLO_NODE_MIRROR="$tmp/fx-9.9.9" APOLLO_YARN_MIRROR="$tmp/fx-9.9.9" bash "$SCRIPT" "$dest" 2>&1)"; rc=$?
+check "an unknown architecture is refused, naming it" "1" "$( [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'no Node runtime for riscv64' && echo 1 || echo 0 )"
+
+# --- the final move fails: the previous runtime comes back --------------------------
+# A mv that fails for the last step only (runtime tree -> destination).
+dest="$tmp/h/runtime/node"
+run 9.9.8 "$dest"
+touch "$dest/OLD_MARKER"
+mvbin="$tmp/mvfail-bin"; mkdir -p "$mvbin"
+cat > "$mvbin/mv" <<EOS
+#!/bin/sh
+case "\$1" in */.node-runtime.*/node) [ "\$2" = "$dest" ] && exit 1;; esac
+exec /bin/mv "\$@"
+EOS
+chmod +x "$mvbin/mv"
+out="$(PATH="$mvbin:$PATH" APOLLO_NODE_VERSION=9.9.9 APOLLO_NODE_ARCH=arm64 APOLLO_MACHINE_ARCH=aarch64 \
+       APOLLO_NODE_PINS="$tmp/fx-9.9.9/pins" APOLLO_NODE_MIRROR="$tmp/fx-9.9.9" APOLLO_YARN_MIRROR="$tmp/fx-9.9.9" \
+       bash "$SCRIPT" "$dest" 2>&1)"; rc=$?
+check "a failing final move: exit non-zero"          "1" "$( [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'could not move' && echo 1 || echo 0 )"
+check "…the previous runtime is back in place"       "v9.9.8:1" "$("$dest/bin/node" --version 2>/dev/null):$(exists "$dest/OLD_MARKER")"
+check "…and no temp dir is left"                     "0" "$(ls -A "$tmp/h/runtime" | grep -c '^\.node-runtime')"
 
 # --- refusals that happen before any download -----------------------------------
 dest="$tmp/e/runtime/node"

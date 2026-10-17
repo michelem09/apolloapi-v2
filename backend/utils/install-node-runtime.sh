@@ -29,7 +29,7 @@
 #
 # Test seams (all optional): APOLLO_NODE_VERSION, APOLLO_NODE_PINS,
 # APOLLO_NODE_MIRROR (an https URL, or a local directory), APOLLO_NODE_ARCH,
-# APOLLO_YARN_MIRROR.
+# APOLLO_MACHINE_ARCH (what `uname -m` would say), APOLLO_YARN_MIRROR.
 set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -73,11 +73,16 @@ VERSION="${VERSION#v}"
 printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
   || die ".nvmrc must be an exact version like 26.12.0, got '$VERSION'"
 
-case "${APOLLO_NODE_ARCH:-$(uname -m)}" in
-  aarch64|arm64) ARCH='arm64' ;;
-  x86_64|amd64)  ARCH='x64' ;;
-  *) die "no Node runtime for $(uname -m)" ;;
-esac
+arch_name() {  # uname -m style name -> Node's name for it, empty when unknown
+  case "$1" in
+    aarch64|arm64) echo arm64 ;;
+    x86_64|amd64)  echo x64 ;;
+  esac
+}
+WANT_ARCH="${APOLLO_NODE_ARCH:-$(uname -m)}"
+ARCH="$(arch_name "$WANT_ARCH")"
+[ -n "$ARCH" ] || die "no Node runtime for $WANT_ARCH"
+MACHINE_ARCH="$(arch_name "${APOLLO_MACHINE_ARCH:-$(uname -m)}")"
 
 NODE_FILE="node-v${VERSION}-linux-${ARCH}.tar.xz"
 YARN_FILE="yarn-${YARN_VERSION}.tgz"
@@ -164,11 +169,18 @@ chmod 755 "$NEW/lib/node_modules/yarn/bin/yarn.js"
 # runtime that a root-run installer put there.
 chmod -R a+rX "$NEW"
 
-# Proof that what we are about to publish runs, before it replaces anything. Skipped
-# only when the binary cannot execute here at all (an aarch64 runtime unpacked on a
-# dev Mac): the checksum already vouched for the bytes.
-if got="$("$NEW/bin/node" --version 2>/dev/null)"; then
+# Proof that what we are about to publish runs, before it replaces anything. When
+# the runtime is for this machine's architecture a binary that does not start is a
+# failed install (a broken extraction, a libc it cannot load), and the previous
+# runtime stays. Only a cross build (an arm64 runtime unpacked on an x64 dev box or
+# release runner) cannot execute here at all: that check is skipped, loudly, and the
+# checksum has already vouched for the bytes.
+if [ "$ARCH" = "$MACHINE_ARCH" ]; then
+  got="$("$NEW/bin/node" --version 2>/dev/null)" \
+    || die "the extracted $ARCH node does not start on this $ARCH machine — refusing to install"
   [ "$got" = "v$VERSION" ] || die "extracted node reports $got, expected v$VERSION"
+else
+  log "cross build ($ARCH runtime on a ${MACHINE_ARCH:-unknown} machine): not running the extracted node"
 fi
 
 if [ -e "$DEST" ] || [ -L "$DEST" ]; then
