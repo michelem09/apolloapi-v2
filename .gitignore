@@ -101,3 +101,5 @@ docs-ai/
 /test-results/
 /playwright-report/
 /playwright/.cache/
+# Node runtime fetched by backend/utils/install-node-runtime.sh (a build artifact)
+backend/runtime/

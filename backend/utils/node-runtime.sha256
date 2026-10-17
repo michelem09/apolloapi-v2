@@ -1,0 +1,20 @@
+# Pinned checksums for backend/utils/install-node-runtime.sh. The script refuses
+# anything not listed here, so this file is the trust root for the Node runtime
+# that every device executes: bump it by hand, together with .nvmrc.
+#
+# Format: "<sha256>  <file name>", two spaces, as sha256sum prints it.
+#
+# Node: copied verbatim from https://nodejs.org/dist/v26.12.0/SHASUMS256.txt,
+# whose clearsigned copy (SHASUMS256.txt.asc) was checked with GPG
+# against the release key C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C (Richard Lau),
+# which is listed in https://github.com/nodejs/release-keys (keys.list), on
+# 2026-10-17. To bump: download SHASUMS256.txt and its .asc, `gpg --verify` the
+# .asc with a key from that list, and copy the two linux lines.
+fd6cc729fa4448c2ac27c3fca5606019ced63c65a15c152c8df03e0cbce7f4c5  node-v26.12.0-linux-arm64.tar.xz
+fd47865ecd6391ebb431fc815e01b9135bf83ded5cf373247e9331e196b7aded  node-v26.12.0-linux-x64.tar.xz
+#
+# Yarn classic, from the npm registry (node 25+ no longer ships corepack, and
+# the git-based install paths on the device run `yarn`). sha256 computed on the
+# tarball; cross-checked against the registry's own dist.integrity for
+# yarn@1.22.22 (sha512-prL3kGtyG7o9Z9Sv8IPfBNrWTDmXB4Qbes8A9rEzt6wkJV8mUvoirjU0Mp3GGAU06Y0XQyA3/2/RQFVuK7MTfg==).
+c17d3797fb9a9115bf375e31bfd30058cac6bc9c3b8807a3d8cb2094794b51ca  yarn-1.22.22.tgz
