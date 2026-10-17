@@ -139,7 +139,7 @@ run_update() {
         bash "$SCRIPT" >/dev/null 2>&1
 }
 for f in "$app/yarn-error.log" "$app/apolloui-v2/yarn-error.log"; do : > "$f"; done
-expected_owned="$(printf '%s\n' "$app/yarn-error.log" "$app/apolloui-v2/yarn-error.log" "$app/apolloui-v2/.next" "$app/apolloui-v2/node_modules" "$app/node_modules" "$tmp/nvme/.yarn-cache" | sort)"
+expected_owned="$(printf '%s\n' "$app/yarn-error.log" "$app/apolloui-v2/yarn-error.log" "$app/apolloui-v2/.next" "$app/apolloui-v2/node_modules" "$app/node_modules" "$tmp/nvme/.yarn-cache" "$app/backend/runtime" | sort)"
 owned_paths() { grep '^chown -R futurebit:futurebit ' "$tmp/calls.log" | grep -v " $tmp/state\$" | sed 's/^chown -R futurebit:futurebit //' | sort; }
 
 run_update
@@ -150,13 +150,13 @@ build_line=$(grep -n '^yarn build' "$tmp/calls.log" | head -1 | cut -d: -f1)
 check "success: on_error never ran (no service started)"  "0" "$(grep -c '^systemctl start' "$tmp/calls.log")"
 check "success: the progress file survived until the end" "1" "$(grep -c '^sleep 8' "$tmp/calls.log")"
 check "success: …after the build"                         "1" "$( [ -n "$chown_line" ] && [ -n "$build_line" ] && [ "$chown_line" -gt "$build_line" ] && echo 1 || echo 0 )"
-check "success: binaries dirs are not chowned"            "0" "$(grep '^chown ' "$tmp/calls.log" | grep -c -E 'backend|apollo-miner|ckpool|bitcoind')"
+check "success: binaries dirs are not chowned"            "0" "$(grep '^chown ' "$tmp/calls.log" | grep -v "$app/backend/runtime\$" | grep -c -E 'backend|apollo-miner|ckpool|bitcoind')"
 check "success: the checkout itself is not chowned"       "0" "$(grep -c -E "^chown .* $app/?$" "$tmp/calls.log")"
 
 FAKE_BUILD_FAILS=1 run_update
 check "build fails: the update does not reboot"           "0" "$(grep -c '^systemctl reboot' "$tmp/calls.log")"
 check "build fails: the half-built artefacts are chowned" "$expected_owned" "$(owned_paths)"
-check "build fails: binaries dirs are not chowned"        "0" "$(grep '^chown ' "$tmp/calls.log" | grep -c -E 'backend|apollo-miner|ckpool|bitcoind')"
+check "build fails: binaries dirs are not chowned"        "0" "$(grep '^chown ' "$tmp/calls.log" | grep -v "$app/backend/runtime\$" | grep -c -E 'backend|apollo-miner|ckpool|bitcoind')"
 bl=$(grep -n '^yarn build' "$tmp/calls.log" | head -1 | cut -d: -f1)
 sl=$(grep -n 'systemctl start apollo-api.service' "$tmp/calls.log" | tail -1 | cut -d: -f1)
 check "build fails: apollo-api is started exactly once"   "1" "$(grep -c 'systemctl start apollo-api.service' "$tmp/calls.log")"
@@ -169,6 +169,7 @@ check "build fails: apollo-api is started again after it" "1" "$( [ -n "$bl" ] &
 # itself, in a subshell and in the main shell.
 eval "$(sed -n '/^on_error()/,/^}/p' "$SCRIPT")"
 restore_solo_intent() { :; }; own_build_artefacts() { :; }
+API_STOPPED=1; NODE_STOPPED=1
 TMPFILE="$tmp/progress-sub"; : > "$TMPFILE"
 : > "$tmp/calls.log"
 ( PATH="$bin:$PATH"; false || on_error ) >/dev/null 2>&1
@@ -176,8 +177,16 @@ check "on_error in a subshell starts nothing"            "0" "$(grep -c '^system
 check "…and leaves the progress file alone"              "1" "$( [ -e "$TMPFILE" ] && echo 1 || echo 0 )"
 PATH="$bin:$PATH" TMPFILE="$tmp/progress-main" bash -c "$(sed -n '/^on_error()/,/^}/p' "$SCRIPT")
 restore_solo_intent() { :; }; own_build_artefacts() { :; }
+API_STOPPED=1; NODE_STOPPED=0
 false; on_error" >/dev/null 2>&1
 check "on_error in the main shell of a run starts the API" "1" "$(grep -c '^systemctl start apollo-api.service' "$tmp/calls.log")"
+check "…and not the node it did not stop"                  "0" "$(grep -c '^systemctl start node.service' "$tmp/calls.log")"
+: > "$tmp/calls.log"
+PATH="$bin:$PATH" TMPFILE="$tmp/progress-none" bash -c "$(sed -n '/^on_error()/,/^}/p' "$SCRIPT")
+restore_solo_intent() { :; }; own_build_artefacts() { :; }
+API_STOPPED=0; NODE_STOPPED=0
+false; on_error" >/dev/null 2>&1
+check "on_error before anything was stopped starts nothing" "0" "$(grep -c '^systemctl start' "$tmp/calls.log")"
 
 # --- 6. the Node runtime: installed first, used by the bootstrap, no nvm ------------
 run_update
@@ -191,6 +200,7 @@ check "the bootstrap runs on the runtime's node"           "1" "$(grep -c "^sudo
 
 FAKE_RUNTIME_FAILS=1 run_update
 check "runtime install fails: nothing is stopped"          "0" "$(grep -c '^systemctl stop' "$tmp/calls.log")"
+check "…and nothing is started (a stopped node stays so)"  "0" "$(grep -c '^systemctl start' "$tmp/calls.log")"
 check "…no unit is replaced"                               "0" "$(grep -c '^install -m 644' "$tmp/calls.log")"
 check "…yarn never runs"                                   "0" "$(grep -c '^yarn' "$tmp/calls.log")"
 check "…and the device is not rebooted"                    "0" "$(grep -c '^systemctl reboot' "$tmp/calls.log")"

@@ -117,13 +117,21 @@ restore_solo_intent() {
 # backend/apollo-miner, ckpool and node keep their owner and mode). It is not a
 # security boundary: the 2.1.4 updater and image_update/install already chown
 # the whole checkout.
+# backend/runtime is one of the artefacts: install-node-runtime.sh runs here as
+# root (tar --no-same-owner), and a runtime tree and temp dir left root-owned would
+# make the next install-node-runtime.sh run as futurebit unable to replace the
+# runtime or clean its orphaned .node-runtime.* dirs (~178 MB each).
 # Called on success and from on_error, so a half-run build can be retried.
+API_STOPPED=0
+NODE_STOPPED=0
+
 own_build_artefacts() {
     local path
     for path in \
         "${UI_DIR}/.next" \
         "${UI_DIR}/node_modules" \
         "${APOLLO_DIR}/node_modules" \
+        "${APOLLO_DIR}/backend/runtime" \
         "${UI_DIR}/yarn-error.log" \
         "${APOLLO_DIR}/yarn-error.log" \
         "${YARN_CACHE_FOLDER:-}"; do
@@ -144,13 +152,21 @@ on_error() {
     fi
     trap - ERR
     restore_solo_intent || true
+    # Restart only what this run stopped (stop_runtime_services sets the flags
+    # before each stop). A failure before that, e.g. the runtime download, must not
+    # start a node the user had stopped; a device that was never touched needs
+    # nothing.
     # stop_runtime_services took the API down; bring it back so a failed update
     # leaves a device that answers (its service monitor restores node/ckpool).
-    systemctl start apollo-api.service >/dev/null 2>&1 || true
+    if [ "$API_STOPPED" = 1 ]; then
+        systemctl start apollo-api.service >/dev/null 2>&1 || true
+    fi
     # node is stopped by stop_runtime_services too, and nothing else restarts it
     # (the API's service monitor only follows the user's requested status).
     # ckpool is left to the API's own lifecycle.
-    systemctl start node.service >/dev/null 2>&1 || true
+    if [ "$NODE_STOPPED" = 1 ]; then
+        systemctl start node.service >/dev/null 2>&1 || true
+    fi
     own_build_artefacts || true
     rm -f "$TMPFILE"
     echo "Update failed; the system was not rebooted" >&2
@@ -163,8 +179,10 @@ stop_runtime_services() {
     # The API goes first. A live 2.1.x API runs a service monitor that records
     # "node stopped" as requested_status='offline' (it cannot tell us from the
     # user), and the bootstrap below moves the database out from under it.
+    API_STOPPED=1
     systemctl stop apollo-api.service
     systemctl stop ckpool.service
+    NODE_STOPPED=1
     systemctl stop node.service
 
     if systemctl is-active --quiet ckpool.service ||
