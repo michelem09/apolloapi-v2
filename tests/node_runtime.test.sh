@@ -149,6 +149,33 @@ run 9.9.9 "$dest" "$tmp/fx-9.9.9/pins" "http://nodejs.org/dist"
 check "a plain-http mirror is refused"            "1" "$( [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'refusing mirror' && echo 1 || echo 0 )"
 check "…and none of them created anything"        "0" "$(exists "$tmp/e")"
 
+# --- an xz tarball on a machine without xz --------------------------------------
+# tar's own "xz: Cannot exec" says nothing useful. Needs xz to build the fixture
+# and a non-root user (root would go and apt-get it), so it is skipped elsewhere.
+if command -v xz >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ]; then
+    xzfx="$tmp/fx-xz"; mkdir -p "$xzfx/v9.9.9"
+    cp "$tmp/fx-9.9.9/yarn-1.22.22.tgz" "$xzfx/"
+    gzip -dc < "$tmp/fx-9.9.9/v9.9.9/node-v9.9.9-linux-arm64.tar.xz" | xz -c > "$xzfx/v9.9.9/node-v9.9.9-linux-arm64.tar.xz"
+    {
+        echo "$(sha_of "$xzfx/v9.9.9/node-v9.9.9-linux-arm64.tar.xz")  node-v9.9.9-linux-arm64.tar.xz"
+        grep 'yarn-' "$tmp/fx-9.9.9/pins"
+    } > "$xzfx/pins"
+    # A PATH with the tools the script needs and no xz.
+    nox="$tmp/noxz-bin"; mkdir -p "$nox"
+    for c in bash sh tar gzip awk tr od cut grep mktemp rm mv mkdir cp ln chmod dirname id cat sed head sha256sum shasum uname; do
+        p="$(command -v "$c" 2>/dev/null)" && ln -sf "$p" "$nox/$c"
+    done
+    dest="$tmp/f/runtime/node"
+    out="$(PATH="$nox" APOLLO_NODE_VERSION=9.9.9 APOLLO_NODE_ARCH=arm64 APOLLO_NODE_PINS="$xzfx/pins" \
+           APOLLO_NODE_MIRROR="$xzfx" APOLLO_YARN_MIRROR="$xzfx" "$nox/bash" "$SCRIPT" "$dest" 2>&1)"; rc=$?
+    check "an xz tarball without xz installed is refused" "1" "$( [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'xz is needed' && echo 1 || echo 0 )"
+    check "…with nothing installed"                      "0" "$(exists "$dest")"
+    run 9.9.9 "$dest" "$xzfx/pins" "$xzfx"
+    check "…and the same fixture installs where xz exists" "0" "$rc"
+else
+    echo "  skip xz-less machine (needs xz and a non-root user)"
+fi
+
 # --- the repo's own pins -------------------------------------------------------
 # .nvmrc is the single source of the version; bumping it without pinning the new
 # tarball would break the next release build and every image install.

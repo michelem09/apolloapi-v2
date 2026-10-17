@@ -128,6 +128,22 @@ log "downloading yarn $YARN_VERSION"
 fetch "$YARN_MIRROR/$YARN_FILE" "$TMP/$YARN_FILE"
 verified "$TMP/$YARN_FILE" "$YARN_FILE" "$YARN_SHA"
 
+# The official tarball is .xz. Debian/Ubuntu images normally have it, but a
+# minimal one may not, and tar's own "xz: Cannot exec" says nothing useful. As root
+# we install it the way install-update-deps.sh installs its tools; otherwise say so.
+# (Detected from the file's magic number, so a test fixture in another format is
+# not affected.)
+if [ "$(od -An -tx1 -N6 "$TMP/$NODE_FILE" | tr -d ' \n')" = "fd377a585a00" ] && ! command -v xz >/dev/null 2>&1; then
+  if [ "$(id -u)" -eq 0 ] && command -v apt-get >/dev/null 2>&1; then
+    log "installing xz-utils from apt"
+    DEBIAN_FRONTEND=noninteractive apt-get -y -q install xz-utils >/dev/null \
+      || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get -y -q install xz-utils >/dev/null; } \
+      || die "could not install xz-utils, which is needed to unpack the Node tarball"
+  else
+    die "xz is needed to unpack the Node tarball (apt-get install xz-utils)"
+  fi
+fi
+
 NEW="$TMP/node"
 mkdir -p "$NEW"
 tar -C "$NEW" --strip-components=1 --no-same-owner -xf "$TMP/$NODE_FILE"
