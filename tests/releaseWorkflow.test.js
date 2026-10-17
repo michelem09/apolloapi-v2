@@ -194,8 +194,9 @@ describe('release artifact Node runtime', () => {
     for (const arch of ['arm64', 'x64']) {
       expect(pins).toMatch(new RegExp(`^[0-9a-f]{64}  node-v${nvmrc.replace(/\./g, '\\.')}-linux-${arch}\\.tar\\.xz$`, 'm'));
     }
-    for (const f of ['Dockerfile.test', 'Dockerfile.integration']) {
-      expect(read(f)).toContain(`FROM node:${major}-`);
+    // The exact version, not the floating major tag: the images must not move under .nvmrc.
+    for (const f of [['Dockerfile.test'], ['Dockerfile.integration'], ['apolloui-v2', 'Dockerfile']]) {
+      expect(read(...f)).toMatch(new RegExp(`^FROM node:${nvmrc.replace(/\./g, '\\.')}-`, 'm'));
     }
   });
 
