@@ -149,6 +149,23 @@ describe('update lifecycle contract', () => {
     expect(backup).toBeGreaterThan(assertion);
   });
 
+  it('refuses an artifact without a usable Node runtime before stopping anything', () => {
+    const script = readBackendScript('update');
+
+    // The release's units run backend/runtime/node/bin/node. backend/ is replaced
+    // wholesale, so an artifact without it swaps in services that cannot start —
+    // and the rollback then costs a full outage. The behaviour of the check itself
+    // is exercised in tests/ota/rollback.test.sh; this pins WHERE it runs.
+    const check = script.indexOf('check_runtime_node "$STAGING" || die');
+    const stop = script.lastIndexOf('log "Stopping services"');
+    const backup = script.indexOf('backup_code\n');
+    expect(check).toBeGreaterThan(-1);
+    expect(stop).toBeGreaterThan(check);
+    expect(backup).toBeGreaterThan(check);
+    // After the staging tree is complete, with the other artifact checks.
+    expect(check).toBeGreaterThan(script.indexOf('Artifact is missing the $unit unit'));
+  });
+
   it('provisions its own dependencies instead of refusing to run', () => {
     const script = readBackendScript('update');
 

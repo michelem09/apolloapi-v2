@@ -896,6 +896,41 @@ health_ok() {
   return 1
 }
 
+# The Node runtime the release's units execute (backend/runtime/node, put into the
+# artifact by release.yml via backend/utils/install-node-runtime.sh). Like bitcoind
+# it arrives with backend/ and the old copy goes away with the old backend/, so an
+# artifact without a usable one would swap in units whose ExecStart points at
+# nothing: apollo-api, apollo-bootstrap and apollo-ui-v2 all fail to start, and the
+# health gate then pays for it with a full rollback — after the services were
+# already stopped. Checked on the staged tree, before anything is stopped.
+#
+# "Usable" is judged from the file alone, because the updater runs on whatever
+# machine the tests use and must not need to execute the binary: a regular,
+# executable file whose ELF header says 64-bit little-endian AArch64. That
+# catches the realistic mistakes — an x86_64 runtime from a wrongly-targeted
+# build, a stub or an HTML error page saved as `node`, a file that lost its
+# execute bit through the packaging — without running anything.
+#
+# Rollback needs nothing from this: the previous backend/ and the previous units
+# come back together, and a release that predates the runtime has units pointing
+# at the nvm Node 21 that those devices still carry.
+elf_is_aarch64() {  # file
+  local hdr
+  hdr="$(od -An -tx1 -N20 "$1" 2>/dev/null | tr -d ' \n')" || return 1
+  # 7f 45 4c 46 = "\x7fELF"; byte 4: class 2 = 64-bit; byte 5: data 1 = little
+  # endian; bytes 18-19: e_machine, 0xb7 = EM_AARCH64 (183).
+  [ "${hdr:0:8}" = "7f454c46" ] && [ "${hdr:8:2}" = "02" ] \
+    && [ "${hdr:10:2}" = "01" ] && [ "${hdr:36:4}" = "b700" ]
+}
+
+check_runtime_node() {  # staging dir
+  local node="$1/backend/runtime/node/bin/node"
+  [ -f "$node" ] || { err "No Node runtime in the artifact (backend/runtime/node/bin/node)"; return 1; }
+  [ -x "$node" ] || { err "The artifact's Node runtime is not executable"; return 1; }
+  elf_is_aarch64 "$node" || { err "The artifact's Node runtime is not an aarch64 ELF binary"; return 1; }
+  return 0
+}
+
 # --- run ---------------------------------------------------------------------
 # Everything above is definitions; the tests source the file to here and stop.
 [ -n "${APOLLO_UPDATE_LIB:-}" ] && return 0
@@ -1071,6 +1106,9 @@ if [ -d "$STAGING/backend/node/bin" ]; then
       || die "Artifact carries no bitcoind at all — refusing to install"
   fi
 fi
+# Same reasoning as bitcoind above: backend/ is replaced wholesale, and the units
+# that come with it run this Node.
+check_runtime_node "$STAGING" || die "Artifact carries no usable Node runtime — refusing to install"
 for f in $ROOT_FILES; do
   [ -e "$STAGING/$f" ] || die "Artifact is missing $f — refusing to install"
 done

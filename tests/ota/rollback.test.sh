@@ -31,7 +31,7 @@ export RESULTS
 # Hand-written assertions. The shared version-ordering fixture adds one per case
 # on top, counted below so a growing table does not need this number edited —
 # while a scenario that dies before asserting still fails the suite.
-HAND_WRITTEN_ASSERTIONS=83
+HAND_WRITTEN_ASSERTIONS=95
 VERSION_FIXTURE="$REPO/apolloui-v2/src/lib/version-order.fixture.txt"
 if [ ! -f "$VERSION_FIXTURE" ]; then
   printf '\033[0;31mmissing %s\033[0m — the UI submodule is not checked out\n' "$VERSION_FIXTURE"
@@ -100,6 +100,70 @@ echo "rollback contract"
   restore_code >/dev/null 2>&1
   check "rollback brings all six flavours back with it" "$(flavours)" "6"
   check "rollback restores the old code" "$(cat "$APOLLO_ROOT_DIR/src/marker" 2>/dev/null)" "OLD"
+)
+
+# --- the Node runtime travels with backend/, and is checked before the swap ---
+# The units of a release run backend/runtime/node/bin/node, so an artifact without
+# a usable one would swap in services that cannot start — after everything was
+# already stopped. check_runtime_node judges the STAGED file from its bytes (the
+# tests run on a Mac, the device on aarch64).
+(
+  make_device
+  st="$ROOT/stage"; mkdir -p "$st/backend/runtime/node/bin"
+  node="$st/backend/runtime/node/bin/node"
+  # e_ident: 7f E L F, class 2 (64-bit), data 1 (LE), version 1, then padding;
+  # e_type 2; e_machine at byte 18: b7 00 = AArch64, 3e 00 = x86-64.
+  elf() { printf "\\177ELF\\$1\\$2\\001\\000\\000\\000\\000\\000\\000\\000\\000\\000\\002\\000\\${3}\\000\\001\\000\\000\\000"; }
+
+  elf 002 001 267 > "$node"; chmod 755 "$node"
+  check_runtime_node "$st" 2>/dev/null; check "a staged aarch64 ELF node is accepted" "$?" "0"
+
+  elf 002 001 076 > "$node"
+  check_runtime_node "$st" 2>/dev/null; check "an x86-64 node is refused" "$?" "1"
+
+  elf 001 001 267 > "$node"
+  check_runtime_node "$st" 2>/dev/null; check "a 32-bit ELF is refused" "$?" "1"
+
+  elf 002 002 267 > "$node"
+  check_runtime_node "$st" 2>/dev/null; check "a big-endian ELF is refused" "$?" "1"
+
+  printf '#!/bin/sh\necho v26.12.0\n' > "$node"
+  check_runtime_node "$st" 2>/dev/null; check "a script standing in for node is refused" "$?" "1"
+
+  : > "$node"
+  check_runtime_node "$st" 2>/dev/null; check "an empty file is refused" "$?" "1"
+
+  elf 002 001 267 > "$node"; chmod 644 "$node"
+  check_runtime_node "$st" 2>/dev/null; check "an ELF that lost its execute bit is refused" "$?" "1"
+
+  rm -rf "$st/backend/runtime"
+  out="$(check_runtime_node "$st" 2>&1)"; rc=$?
+  check "an artifact with no runtime is refused" "$rc" "1"
+  check "…and says which file is missing" "$(printf '%s' "$out" | grep -c 'backend/runtime/node/bin/node')" "1"
+  rm -rf "$ROOT"
+)
+
+# The runtime sits inside backend/, so the backup and the rollback move it with
+# everything else: no second mechanism, no window.
+(
+  make_device
+  mkdir -p "$APOLLO_ROOT_DIR/backend/runtime/node/bin"; echo OLDNODE > "$APOLLO_ROOT_DIR/backend/runtime/node/bin/node"
+  claim_backup; backup_code 2>/dev/null
+  check "the runtime is moved aside with backend/" "$([ -e "$APOLLO_ROOT_DIR/backend/runtime" ] && echo present || echo gone)" "gone"
+  mkdir -p "$APOLLO_ROOT_DIR/backend/runtime/node/bin"; echo NEWNODE > "$APOLLO_ROOT_DIR/backend/runtime/node/bin/node"   # the new release
+  restore_code >/dev/null 2>&1
+  check "rollback restores the previous runtime, not the new one" "$(cat "$APOLLO_ROOT_DIR/backend/runtime/node/bin/node" 2>/dev/null)" "OLDNODE"
+)
+
+# A device that never had a runtime (it predates this release) must not keep the
+# new one after a rollback: its restored units point at nvm, and a leftover
+# 180 MB tree would sit in backend/ for good.
+(
+  make_device
+  claim_backup; backup_code 2>/dev/null
+  mkdir -p "$APOLLO_ROOT_DIR/backend/runtime/node/bin"; echo NEWNODE > "$APOLLO_ROOT_DIR/backend/runtime/node/bin/node"
+  restore_code >/dev/null 2>&1
+  check "rollback to a release without a runtime removes the new one" "$([ -e "$APOLLO_ROOT_DIR/backend/runtime" ] && echo present || echo gone)" "gone"
 )
 
 # --- two consecutive failed runs -----------------------------------------------
