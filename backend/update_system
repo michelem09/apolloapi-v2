@@ -189,6 +189,20 @@ chown -R futurebit:futurebit "$STATE_DIR"
 
 preserve_solo_intent
 
+# The units installed just below run Node from backend/runtime/node (the same
+# runtime the OTA artifact ships), so it must exist before any of them is
+# installed: on_error restarts apollo-api, and apollo-api Requires the bootstrap
+# unit, which would otherwise be a unit pointing at a binary that is not there.
+# Done before anything is stopped, too: a failed download (no network, a checksum
+# that does not match) then aborts with the device untouched.
+#
+# This is the one place a 2.1.x device, still on nvm Node 21, gets the new runtime:
+# nvm and its Node stay on disk and are simply no longer used, which is also what
+# a rollback to the old units relies on.
+echo -e "${YELLOW} ---> Installing the Node.js runtime${NC}"
+bash "${APOLLO_DIR}/backend/utils/install-node-runtime.sh"
+export PATH="${APOLLO_DIR}/backend/runtime/node/bin:${PATH}"
+
 # The updater that launched this script may be from the pre-refactor release.
 # Install the new graceful-stop definitions before touching active binaries,
 # then stop again even if a newer outer updater already did so.
@@ -212,10 +226,6 @@ select_yarn_cache() {
     fi
 }
 
-set +u
-. "${APOLLO_NVM_SH:-/usr/local/nvm/nvm.sh}"
-nvm use 21
-set -u
 select_yarn_cache
 
 echo "30" > "$TMPFILE"
@@ -226,7 +236,7 @@ yarn
 echo "40" > "$TMPFILE"
 echo -e "${YELLOW} ---> Updating UI modules${NC}"
 cd "$UI_DIR"
-yarn --ignore-engines
+yarn
 
 echo "50" > "$TMPFILE"
 echo -e "${YELLOW} ---> Building UI (could take a few minutes)${NC}"
@@ -269,7 +279,7 @@ chown -R futurebit:futurebit "$STATE_DIR"
 sudo -u futurebit env \
     NODE_ENV=production \
     APOLLO_STATE_DIR="$STATE_DIR" \
-    /usr/local/nvm/versions/node/v21.6.2/bin/node \
+    "${APOLLO_DIR}/backend/runtime/node/bin/node" \
     "${APOLLO_DIR}/src/bootstrap.js"
 
 # A live device capable of running the updater has already completed the

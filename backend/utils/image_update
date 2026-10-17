@@ -73,16 +73,19 @@ git -C "$APOLLO_DIR" remote set-url origin "$APOLLO_API_URL"
 git -C "$UI_DIR" remote set-url origin "$APOLLO_UI_URL"
 chown -R futurebit:futurebit "$APOLLO_DIR"
 
-set +u
-. /usr/local/nvm/nvm.sh
-nvm use 21
-set -u
-
 ### API ###
 #############
 echo -e "${YELLOW} ---> Updating API modules${NC}"
 git -C "$APOLLO_DIR" reset --hard
 git -C "$APOLLO_DIR" pull --ff-only
+
+# Node and yarn come from the runtime this checkout pins (.nvmrc), fetched only
+# after the pull so the script and its checksums are the new ones. nvm is no
+# longer used: the units, the OTA artifact and this script all run the same Node.
+echo -e "${YELLOW} ---> Installing the Node.js runtime${NC}"
+bash "${APOLLO_DIR}/backend/utils/install-node-runtime.sh"
+export PATH="${APOLLO_DIR}/backend/runtime/node/bin:${PATH}"
+
 cd "$APOLLO_DIR"
 yarn
 
@@ -110,7 +113,7 @@ if [ "$API_BRANCH" != "$UI_BRANCH" ]; then
 fi
 
 cd "$UI_DIR"
-yarn --ignore-engines
+yarn
 
 echo -e "${YELLOW} ---> Building UI (could take a few minutes)${NC}"
 rm -rf .next

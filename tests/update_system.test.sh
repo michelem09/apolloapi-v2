@@ -5,9 +5,9 @@
 # must go down with node/ckpool, come back if the update fails, and the state dir
 # must be futurebit-owned before the bootstrap runs.
 #
-# The script is run for real with every system command stubbed. It dies on its
-# own at the missing nvm (right after the services are stopped), which exercises
-# the ERR path for free.
+# The script is run for real with every system command stubbed. In the first
+# sections yarn is a stub that fails (right after the services are stopped), which
+# exercises the ERR path for free.
 #
 # Run: bash tests/update_system.test.sh
 
@@ -33,9 +33,27 @@ EOS
 done
 chmod +x "$bin"/*
 
+# A fake checkout whose runtime installer is a stub: the real one downloads Node
+# (tests/node_runtime.test.sh covers it). The stub records the call and leaves a
+# runtime/node/bin/node behind, as the real one does.
+app="$tmp/app"
+mkdir -p "$app/node_modules" "$app/apolloui-v2/node_modules" "$app/backend/systemd" \
+    "$app/backend/apollo-miner" "$app/backend/ckpool" "$app/backend/node" "$app/backend/utils"
+cat > "$app/backend/utils/install-node-runtime.sh" <<EOS
+#!/bin/bash
+echo "install-node-runtime \$*" >> "$tmp/calls.log"
+[ -n "\${FAKE_RUNTIME_FAILS:-}" ] && exit 1
+mkdir -p "$app/backend/runtime/node/bin"
+exit 0
+EOS
+# yarn fails, so the run stops right after the services went down (section 4
+# replaces this stub with one that works).
+printf '#!/bin/sh\necho "yarn $*" >> "%s/calls.log"\nexit 1\n' "$tmp" > "$bin/yarn"; chmod +x "$bin/yarn"
+mkdir -p "$tmp/state"
+
 # --- 1. the update dies after the stops: API is stopped, then restarted ----------
 : > "$tmp/calls.log"
-PATH="$bin:$PATH" APOLLO_STATE_DIR="$tmp/state" APOLLO_SOLO_REQUEST_FILE="$tmp/solo" APOLLO_UPDATE_PROGRESS_FILE="$tmp/progress" \
+PATH="$bin:$PATH" APOLLO_UPDATE_DIR="$app" APOLLO_STATE_DIR="$tmp/state" APOLLO_SOLO_REQUEST_FILE="$tmp/solo" APOLLO_UPDATE_PROGRESS_FILE="$tmp/progress" \
     bash "$SCRIPT" >/dev/null 2>&1
 calls="$(cat "$tmp/calls.log")"
 stop_api=$(grep -n 'systemctl stop apollo-api.service' <<<"$calls" | head -1 | cut -d: -f1)
@@ -94,7 +112,7 @@ PATH="$bin:$PATH" APOLLO_SOLO_REQUEST_FILE="$tmp/solo" APOLLO_UPDATE_PROGRESS_FI
 check "inside its unit it does not re-exec"              "0" "$(grep -c '^systemd-run' "$tmp/calls.log")"
 
 # --- 4. build artefacts go back to futurebit; binaries keep their owner ---------
-# Run past the nvm step against a fake checkout. yarn is a stub that creates the
+# Run past the yarn steps against the fake checkout. yarn is a stub that creates the
 # root-owned directories a real run would, and can be made to fail on "build".
 for c in yarn sudo sleep; do
     cat > "$bin/$c" <<EOS
@@ -112,13 +130,9 @@ done
 printf '#!/bin/sh\necho "systemctl $*" >> "%s/calls.log"\ncase "$1" in is-active) exit 3;; esac\nexit 0\n' "$tmp" > "$bin/systemctl"
 printf '#!/bin/sh\nexit 1\n' > "$bin/pgrep"
 chmod +x "$bin"/*
-app="$tmp/app"
-mkdir -p "$app/node_modules" "$app/apolloui-v2/node_modules" "$app/backend/systemd" \
-    "$app/backend/apollo-miner" "$app/backend/ckpool" "$app/backend/node"
-printf 'nvm() { :; }\n' > "$tmp/nvm.sh"
 run_update() {
     : > "$tmp/calls.log"
-    PATH="$bin:$PATH" APOLLO_UPDATE_DIR="$app" APOLLO_NVM_SH="$tmp/nvm.sh" \
+    PATH="$bin:$PATH" APOLLO_UPDATE_DIR="$app" \
         APOLLO_YARN_CACHE_BASE="$tmp/nvme" APOLLO_UPDATE_SYSTEM_DETACHED=1 \
         APOLLO_STATE_DIR="$tmp/state" APOLLO_SOLO_REQUEST_FILE="$tmp/solo" \
         APOLLO_UPDATE_PROGRESS_FILE="$tmp/progress" \
@@ -164,6 +178,26 @@ PATH="$bin:$PATH" TMPFILE="$tmp/progress-main" bash -c "$(sed -n '/^on_error()/,
 restore_solo_intent() { :; }; own_build_artefacts() { :; }
 false; on_error" >/dev/null 2>&1
 check "on_error in the main shell of a run starts the API" "1" "$(grep -c '^systemctl start apollo-api.service' "$tmp/calls.log")"
+
+# --- 6. the Node runtime: installed first, used by the bootstrap, no nvm ------------
+run_update
+first_unit=$(grep -n '^install -m 644 '"$app"'/backend/systemd/' "$tmp/calls.log" | head -1 | cut -d: -f1)
+first_stop2=$(grep -n '^systemctl stop' "$tmp/calls.log" | head -1 | cut -d: -f1)
+rt=$(grep -n '^install-node-runtime' "$tmp/calls.log" | head -1 | cut -d: -f1)
+check "the runtime installer runs once"                    "1" "$(grep -c '^install-node-runtime' "$tmp/calls.log")"
+check "…before any unit is installed"                      "1" "$( [ -n "$rt" ] && [ -n "$first_unit" ] && [ "$rt" -lt "$first_unit" ] && echo 1 || echo 0 )"
+check "…and before any service is stopped"                 "1" "$( [ -n "$rt" ] && [ -n "$first_stop2" ] && [ "$rt" -lt "$first_stop2" ] && echo 1 || echo 0 )"
+check "the bootstrap runs on the runtime's node"           "1" "$(grep -c "^sudo -u futurebit env .* $app/backend/runtime/node/bin/node $app/src/bootstrap.js" "$tmp/calls.log")"
+
+FAKE_RUNTIME_FAILS=1 run_update
+check "runtime install fails: nothing is stopped"          "0" "$(grep -c '^systemctl stop' "$tmp/calls.log")"
+check "…no unit is replaced"                               "0" "$(grep -c '^install -m 644' "$tmp/calls.log")"
+check "…yarn never runs"                                   "0" "$(grep -c '^yarn' "$tmp/calls.log")"
+check "…and the device is not rebooted"                    "0" "$(grep -c '^systemctl reboot' "$tmp/calls.log")"
+
+# The script must not depend on nvm any more, or a device imaged without it would
+# die at the first yarn.
+check "no code path sources nvm or names a v21 node"       "0" "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c -E 'nvm\.sh|nvm use|node/v21|--ignore-engines')"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

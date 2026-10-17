@@ -171,44 +171,22 @@ fi
 # Navigate to the /opt/apolloapi directory
 cd $APOLLO_DIR
 
-#### NVM SETUP ####
+#### NODE RUNTIME ####
 #########################
-# Install NVM
-echo -e "${YELLOW} ---> Installing NVM${NC}"
+# Node and yarn live in backend/runtime/node, the same runtime the units and the
+# OTA artifact use (version: .nvmrc, checksum: backend/utils/node-runtime.sha256).
+# No nvm: there is a single Node on the device, and it is the one the services run.
+echo -e "${YELLOW} ---> Installing the Node.js runtime${NC}"
+if ! bash "$APOLLO_DIR/backend/utils/install-node-runtime.sh"; then
+    echo -e "${RED} ---> Node.js runtime installation failed — aborting install${NC}" >&2
+    exit 1
+fi
+export PATH="$APOLLO_DIR/backend/runtime/node/bin:$PATH"
 
-mkdir /usr/local/nvm
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.38.0/install.sh | NVM_DIR=/usr/local/nvm bash
-
-. /usr/local/nvm/nvm.sh
-
-# Define the NVM_DIR variable
-NVM_DIR_LINE='export NVM_DIR="/usr/local/nvm"'
-
-# Define the NVM sourcing line
-NVM_SOURCE_LINE='[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" # This loads nvm'
-
-# Add the lines to the user's ~/.bashrc file
-echo "$NVM_DIR_LINE" >> /home/futurebit/.bashrc
-echo "$NVM_SOURCE_LINE" >> /home/futurebit/.bashrc
-
-echo -e "${GREEN} ---> Lines added to /home/futurebit/.bashrc${NC}"
-
-# Enable nvm for the current shell session
-eval "$NVM_DIR_LINE"
-eval "$NVM_SOURCE_LINE"
-
-# Change ownership of /usr/local/nvm to user "futurebit"
-chown -R futurebit /usr/local/nvm
-echo -e "${GREEN} ---> Changed ownership of /usr/local/nvm to futurebit${NC}"
-
-# Install Node.js version 21 using nvm
-nvm install 21.6.2
-echo -e "${GREEN} ---> Node.js version 21 installed${NC}"
-
-# Install yarn globally
-nvm use 21.6.2
-npm i -g yarn
-echo -e "${GREEN} ---> Yarn installed globally${NC}"
+# futurebit's interactive shells get the same node and yarn (for ssh deploys).
+NODE_PATH_LINE='export PATH="/opt/apolloapi/backend/runtime/node/bin:$PATH"'
+grep -qxF "$NODE_PATH_LINE" /home/futurebit/.bashrc 2>/dev/null || echo "$NODE_PATH_LINE" >> /home/futurebit/.bashrc
+echo -e "${GREEN} ---> Node.js $(node --version) and yarn $(yarn --version) installed${NC}"
 
 #### APOLLO SETUP ####
 # Install API dependencies
