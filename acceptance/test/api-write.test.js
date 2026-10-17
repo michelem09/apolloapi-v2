@@ -154,3 +154,16 @@ test('the form is cached per root field: Node can be a mutation while Miner is s
   await gqlWrite(profile('mixed'), 't', MINER, {}, send);
   assert.deepEqual(calls, ['mutation:Node', 'mutation:Miner', 'query:Miner', 'query:Miner']);
 });
+
+test('an aliased root field is cached under the real field name', async () => {
+  const { rootFieldOf } = require('../lib/api');
+  assert.equal(rootFieldOf('mutation { Miner { stop { error { message } } } }'), 'Miner');
+  assert.equal(rootFieldOf('mutation { a: Miner { stop { error { message } } } }'), 'Miner');
+  assert.equal(rootFieldOf('mutation Named($i: X!) { x : Node { stop } }'), 'Node');
+
+  // The same field under two aliases shares one probe: 2.1.4 is asked once.
+  const s = fakeServer({ mutations: false });
+  await gqlWrite(profile('old'), 't', 'mutation { a: Auth { changePassword { error { message } } } }', {}, s.send);
+  await gqlWrite(profile('old'), 't', 'mutation { b: Auth { changePassword { error { message } } } }', {}, s.send);
+  assert.deepEqual(s.calls, ['mutation', 'query', 'query']);
+});

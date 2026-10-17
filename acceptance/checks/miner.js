@@ -1,5 +1,5 @@
 const { sshExec } = require('../lib/ssh');
-const { gqlWrite } = require('../lib/api');
+const { gql, gqlWrite } = require('../lib/api');
 const { waitUntil } = require('../lib/wait');
 
 const isActive = (profile, unit) => async () =>
@@ -20,11 +20,17 @@ module.exports = {
 
     // A mutation on v2.2, a query on 2.1.x: gqlWrite tries the first and falls
     // back to the second, so the suite drives the schema the device serves.
-    await gqlWrite(profile, token, `mutation { Miner { stop { error { message } } } }`);
+    // A refusal comes back in the payload with a 200: fail on its message now
+    // instead of polling systemd for a minute for a stop that was never issued.
+    const refusal = (data, action) => data?.Miner?.[action]?.error?.message;
+
+    const stopAnswer = await gqlWrite(profile, token, `mutation { Miner { stop { error { message } } } }`);
+    assert(!refusal(stopAnswer, 'stop'), `Miner.stop was accepted (${refusal(stopAnswer, 'stop')})`);
     const stopped = await waitUntil(async () => !(await active()), { timeoutMs: 60000 });
     assert(stopped.ok, 'systemd reports the miner stopped');
 
-    await gqlWrite(profile, token, `mutation { Miner { start { error { message } } } }`);
+    const startAnswer = await gqlWrite(profile, token, `mutation { Miner { start { error { message } } } }`);
+    assert(!refusal(startAnswer, 'start'), `Miner.start was accepted (${refusal(startAnswer, 'start')})`);
     // miner_start.sh enumerates boards and waits on them: ~35 s on an Apollo III,
     // measured, so the window is minutes rather than seconds.
     const started = await waitUntil(active, { timeoutMs: 180000, everyMs: 5000 });

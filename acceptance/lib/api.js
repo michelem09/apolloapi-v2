@@ -63,7 +63,10 @@ const gql = async (profile, token, query, variables = {}) => {
 // send the wrong one for half the calls.
 const writeForms = new Map(); // `${apiBase}|${rootField}` -> 'mutation' | 'query'
 
-const rootFieldOf = (doc) => /\{\s*(\w+)/.exec(doc.replace(/^\s*\w+\s*(\([^)]*\))?/, ''))?.[1] || '';
+// The real root field, not its alias: `mutation { a: Miner { … } }` is still
+// Miner, and the alias would otherwise split one field into several cache keys.
+const rootFieldOf = (doc) =>
+  /\{\s*(?:\w+\s*:\s*)?(\w+)/.exec(doc.replace(/^\s*\w+\s*\w*\s*(\([^)]*\))?/, ''))?.[1] || '';
 
 // True only when EVERY error is a validation failure about the Mutation root: an
 // unknown field on type "Mutation", or a schema with no Mutation type at all.
@@ -104,4 +107,4 @@ const gqlWrite = async (profile, token, mutationDoc, variables = {}, send = gql)
 
 const resetWriteForms = () => writeForms.clear();
 
-module.exports = { mintToken, gql, gqlWrite, resetWriteForms, deviceNode };
+module.exports = { mintToken, gql, gqlWrite, resetWriteForms, deviceNode, rootFieldOf };
