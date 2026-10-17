@@ -1,6 +1,6 @@
 #!/bin/bash
 
-cd /opt/apolloapi/backend/apollo-miner || exit 1
+cd "${APOLLO_MINER_DIR:-/opt/apolloapi/backend/apollo-miner}" || exit 1
 
 ARMBIAN_RELEASE="/etc/armbian-release"
 if [[ -r "$ARMBIAN_RELEASE" ]]; then
@@ -26,7 +26,11 @@ reset_external_hashboards()
 
 stop_apollo3_miner()
 {
-    local pattern='^(\./|/opt/apolloapi/backend/apollo-miner/)futurebit-miner-v3([[:space:]]|$)'
+    # miner_start.sh runs the binary from a copy in the runtime dir
+    # (/var/lib/apollo/miner), so match any path, not just the checkout.
+    # Anchored on argv[0]: the SCREEN process carries the path as an argument
+    # and must not match, nor futurebit-miner-v3.bak.
+    local pattern='^([^[:space:]]*/)?futurebit-miner-v3([[:space:]]|$)'
     local timeout=60
     local waited=0
 
