@@ -122,7 +122,6 @@ restore_solo_intent() {
 # make the next install-node-runtime.sh run as futurebit unable to replace the
 # runtime or clean its orphaned .node-runtime.* dirs (~178 MB each).
 # Called on success and from on_error, so a half-run build can be retried.
-API_STOPPED=0
 NODE_STOPPED=0
 
 own_build_artefacts() {
@@ -152,18 +151,14 @@ on_error() {
     fi
     trap - ERR
     restore_solo_intent || true
-    # Restart only what this run stopped (stop_runtime_services sets the flags
-    # before each stop). A failure before that, e.g. the runtime download, must not
-    # start a node the user had stopped; a device that was never touched needs
-    # nothing.
-    # stop_runtime_services took the API down; bring it back so a failed update
-    # leaves a device that answers (its service monitor restores node/ckpool).
-    if [ "$API_STOPPED" = 1 ]; then
-        systemctl start apollo-api.service >/dev/null 2>&1 || true
-    fi
-    # node is stopped by stop_runtime_services too, and nothing else restarts it
-    # (the API's service monitor only follows the user's requested status).
-    # ckpool is left to the API's own lifecycle.
+    # The API always comes back, even if this run never stopped it: an external
+    # updater may have, and a failed update must leave a device that answers.
+    # Starting an active unit is a no-op.
+    systemctl start apollo-api.service >/dev/null 2>&1 || true
+    # node only if this run stopped it (the flag is set before the stop): a
+    # failure before that, e.g. the runtime download, must not start a node the
+    # user had stopped, and nothing else restarts it (the API's service monitor
+    # only follows the user's requested status). ckpool is left to the API.
     if [ "$NODE_STOPPED" = 1 ]; then
         systemctl start node.service >/dev/null 2>&1 || true
     fi
@@ -179,7 +174,6 @@ stop_runtime_services() {
     # The API goes first. A live 2.1.x API runs a service monitor that records
     # "node stopped" as requested_status='offline' (it cannot tell us from the
     # user), and the bootstrap below moves the database out from under it.
-    API_STOPPED=1
     systemctl stop apollo-api.service
     systemctl stop ckpool.service
     NODE_STOPPED=1

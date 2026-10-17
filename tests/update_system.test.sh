@@ -169,7 +169,7 @@ check "build fails: apollo-api is started again after it" "1" "$( [ -n "$bl" ] &
 # itself, in a subshell and in the main shell.
 eval "$(sed -n '/^on_error()/,/^}/p' "$SCRIPT")"
 restore_solo_intent() { :; }; own_build_artefacts() { :; }
-API_STOPPED=1; NODE_STOPPED=1
+NODE_STOPPED=1
 TMPFILE="$tmp/progress-sub"; : > "$TMPFILE"
 : > "$tmp/calls.log"
 ( PATH="$bin:$PATH"; false || on_error ) >/dev/null 2>&1
@@ -177,16 +177,17 @@ check "on_error in a subshell starts nothing"            "0" "$(grep -c '^system
 check "…and leaves the progress file alone"              "1" "$( [ -e "$TMPFILE" ] && echo 1 || echo 0 )"
 PATH="$bin:$PATH" TMPFILE="$tmp/progress-main" bash -c "$(sed -n '/^on_error()/,/^}/p' "$SCRIPT")
 restore_solo_intent() { :; }; own_build_artefacts() { :; }
-API_STOPPED=1; NODE_STOPPED=0
+NODE_STOPPED=0
 false; on_error" >/dev/null 2>&1
 check "on_error in the main shell of a run starts the API" "1" "$(grep -c '^systemctl start apollo-api.service' "$tmp/calls.log")"
 check "…and not the node it did not stop"                  "0" "$(grep -c '^systemctl start node.service' "$tmp/calls.log")"
 : > "$tmp/calls.log"
 PATH="$bin:$PATH" TMPFILE="$tmp/progress-none" bash -c "$(sed -n '/^on_error()/,/^}/p' "$SCRIPT")
 restore_solo_intent() { :; }; own_build_artefacts() { :; }
-API_STOPPED=0; NODE_STOPPED=0
+NODE_STOPPED=0
 false; on_error" >/dev/null 2>&1
-check "on_error before anything was stopped starts nothing" "0" "$(grep -c '^systemctl start' "$tmp/calls.log")"
+check "on_error before anything was stopped starts the API" "1" "$(grep -c '^systemctl start apollo-api.service' "$tmp/calls.log")"
+check "…but not the node"                                   "0" "$(grep -c '^systemctl start node.service' "$tmp/calls.log")"
 
 # --- 6. the Node runtime: installed first, used by the bootstrap, no nvm ------------
 run_update
@@ -200,7 +201,8 @@ check "the bootstrap runs on the runtime's node"           "1" "$(grep -c "^sudo
 
 FAKE_RUNTIME_FAILS=1 run_update
 check "runtime install fails: nothing is stopped"          "0" "$(grep -c '^systemctl stop' "$tmp/calls.log")"
-check "…and nothing is started (a stopped node stays so)"  "0" "$(grep -c '^systemctl start' "$tmp/calls.log")"
+check "…a stopped node stays so"                          "0" "$(grep -c '^systemctl start node.service' "$tmp/calls.log")"
+check "…and the API is started (no-op if active)"        "1" "$(grep -c '^systemctl start apollo-api.service' "$tmp/calls.log")"
 check "…no unit is replaced"                               "0" "$(grep -c '^install -m 644' "$tmp/calls.log")"
 check "…yarn never runs"                                   "0" "$(grep -c '^yarn' "$tmp/calls.log")"
 check "…and the device is not rebooted"                    "0" "$(grep -c '^systemctl reboot' "$tmp/calls.log")"
