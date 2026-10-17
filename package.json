@@ -7,11 +7,10 @@
   "license": "CC-BY-NC-ND-4.0",
   "bin": "src/init.js",
   "engines": {
-    "node": ">= 21.x"
+    "node": ">=26"
   },
   "scripts": {
     "dev": "./node_modules/nodemon/bin/nodemon.js src/init.js",
-    "build": "pkg . --targets node8-linux-armv7 --no-bytecode",
     "run-container": "docker run --rm -it -v \"$(pwd)\":/hostdir --entrypoint=/bin/bash orange",
     "test": "jest",
     "lint": "eslint src",
@@ -53,7 +52,6 @@
     "eslint": "^9",
     "jest": "^29.7.0",
     "nodemon": "^3.1.9",
-    "pkg": "^5.8.1",
     "supertest": "^7.1.0"
   }
 }

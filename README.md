@@ -6,7 +6,7 @@ Backend and device management service for Apollo systems. In production this rep
 
 ### Requirements
 
-- Node.js `21.x`
+- Node.js `26.12.0` (exact, from `.nvmrc`). On a device this is the pinned runtime in `backend/runtime/node`, not nvm.
 - Yarn
 
 ### Install
@@ -55,7 +55,7 @@ These installers perform the full device setup:
 - Create the `futurebit` user.
 - Clone `apolloapi-v2` into `/opt/apolloapi`.
 - Clone `apolloui-v2` into `/opt/apolloapi/apolloui-v2`.
-- Install NVM, Node `21.6.2`, and Yarn.
+- Install the pinned Node.js runtime and Yarn into `backend/runtime/node` (`backend/utils/install-node-runtime.sh`; version from `.nvmrc`, checksums in `backend/utils/node-runtime.sha256`).
 - Create `.env` files for the API and UI.
 - Run `yarn` for the API.
 - Run `yarn install` and `yarn build` for the UI on-device.

@@ -14,7 +14,7 @@ Use this to verify the codebase (including the [implemented security/reliability
 docker-compose run --rm test
 ```
 
-This builds the image from `Dockerfile.test` (Node 21 + npm install), runs `npm test` (Jest with in-memory SQLite), and exits. No systemd, no install script.
+This builds the image from `Dockerfile.test` (Node 26 + npm install), runs `npm test` (Jest with in-memory SQLite), and exits. No systemd, no install script.
 
 **Run tests with local source (faster iteration):**
 
@@ -26,7 +26,7 @@ The first volume mounts the project; the anonymous volume keeps container `node_
 
 **Run tests locally (no Docker):**
 
-Requires Node 21+ (see `package.json` engines). If you use nvm:
+Requires Node 26+ (see `package.json` engines). If you use nvm:
 
 ```bash
 nvm use
@@ -108,7 +108,7 @@ docker run -it --privileged \
 1. **Copies project** to `/tmp/apolloapi-v2/`
 2. **Runs install-v2 dev** with all original parameters
 3. **Installs all system packages** required
-4. **Configures NVM and Node.js** 21.6.2
+4. **Installs the pinned Node.js runtime** (26.x from `.nvmrc`, in `backend/runtime/node`) and Yarn
 5. **Installs dependencies** for API and UI
 6. **Configures systemd** services
 7. **Checks status** of installed services
@@ -118,7 +118,7 @@ docker run -it --privileged \
 The test should show:
 - ✅ System packages installation
 - ✅ Creation of `futurebit` user
-- ✅ NVM and Node.js installation
+- ✅ Node.js runtime installation
 - ✅ API dependencies installation
 - ✅ UI dependencies installation
 - ✅ UI build

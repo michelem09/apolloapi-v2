@@ -1,11 +1,11 @@
 # Lightweight image to run Apollo API v2 test suite (Jest)
 # Use this to verify the codebase without an Apollo device or Armbian
 
-FROM node:21-bookworm-slim
+FROM node:26-bookworm-slim
 
 WORKDIR /app
 
-# Build tools for native deps (e.g. diskusage, sqlite3)
+# Build tools for native deps (sqlite3 ships a prebuilt binary; these are the fallback)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
