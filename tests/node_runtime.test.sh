@@ -185,6 +185,13 @@ for arch in arm64 x64; do
       "$(grep -c "^[0-9a-f]\{64\}  node-v$want-linux-$arch.tar.xz\$" "$REPO/backend/utils/node-runtime.sha256")"
 done
 
+# The Docker images build and test the code, so they pin the same exact version:
+# a floating "26" tag moves under .nvmrc and the image stops matching the runtime.
+for f in Dockerfile.test Dockerfile.integration apolloui-v2/Dockerfile; do
+    check "$f pins node $want exactly" "1" \
+      "$(grep -c "^FROM node:$want-" "$REPO/$f" | awk '$1>0{print 1; next}{print 0}')"
+done
+
 echo
 echo "--- $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

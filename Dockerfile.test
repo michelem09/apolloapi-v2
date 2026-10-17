@@ -1,7 +1,7 @@
 # Lightweight image to run Apollo API v2 test suite (Jest)
 # Use this to verify the codebase without an Apollo device or Armbian
 
-FROM node:26-bookworm-slim
+FROM node:26.12.0-bookworm-slim
 
 WORKDIR /app
 
