@@ -109,11 +109,23 @@ echo -e "${YELLOW} ---> Cleaning up NVM and Node.js${NC}"
 npm uninstall -g yarn 2>/dev/null || true
 
 # Remove NVM lines from futurebit's bashrc
-if [ -f "/home/futurebit/.bashrc" ]; then
-    sed -i '/export NVM_DIR="\/usr\/local\/nvm"/d' /home/futurebit/.bashrc
-    sed -i '/\[ -s "$NVM_DIR\/nvm.sh" \] && \. "$NVM_DIR\/nvm.sh"/d' /home/futurebit/.bashrc
+FUTUREBIT_BASHRC="${APOLLO_FUTUREBIT_BASHRC:-/home/futurebit/.bashrc}"  # env override: tests only
+if [ -f "$FUTUREBIT_BASHRC" ]; then
+    sed -i '/export NVM_DIR="\/usr\/local\/nvm"/d' "$FUTUREBIT_BASHRC"
+    sed -i '/\[ -s "$NVM_DIR\/nvm.sh" \] && \. "$NVM_DIR\/nvm.sh"/d' "$FUTUREBIT_BASHRC"
     echo -e "${GREEN} ---> Removed NVM lines from futurebit's bashrc${NC}"
 fi
+
+# Remove the Node runtime PATH line that image_install* appended. Exactly that
+# line (whole-line match), never a user's own PATH edits.
+remove_node_path_line() {
+    local bashrc="$1"
+    [ -f "$bashrc" ] || return 0
+    grep -vxF 'export PATH="/opt/apolloapi/backend/runtime/node/bin:$PATH"' "$bashrc" > "$bashrc.apollo-tmp" || true
+    cat "$bashrc.apollo-tmp" > "$bashrc"
+    rm -f "$bashrc.apollo-tmp"
+}
+remove_node_path_line "$FUTUREBIT_BASHRC"
 
 # Remove NVM directory
 rm -rf /usr/local/nvm
