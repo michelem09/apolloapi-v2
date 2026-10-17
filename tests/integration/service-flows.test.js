@@ -96,7 +96,7 @@ describe('T1 — node connection credentials', () => {
 describe('T1 — miner start/stop/restart (Miner.*)', () => {
   it('Miner.start → requested_status=online + systemctl start apollo-miner', async () => {
     const spy = jest.spyOn(services.miner, '_execCommand').mockResolvedValue('');
-    const res = await run(`query { Miner { start { error { message } } } }`);
+    const res = await run(`mutation { Miner { start { error { message } } } }`);
     expect(res.data.Miner.start.error).toBeNull();
     const row = await knex('service_status').where({ service_name: 'miner' }).first();
     expect(row.requested_status).toBe('online');
@@ -105,7 +105,7 @@ describe('T1 — miner start/stop/restart (Miner.*)', () => {
 
   it('Miner.stop → requested_status=offline + systemctl stop --no-block apollo-miner', async () => {
     const spy = jest.spyOn(services.miner, '_execCommand').mockResolvedValue('');
-    const res = await run(`query { Miner { stop { error { message } } } }`);
+    const res = await run(`mutation { Miner { stop { error { message } } } }`);
     expect(res.data.Miner.stop.error).toBeNull();
     const row = await knex('service_status').where({ service_name: 'miner' }).first();
     expect(row.requested_status).toBe('offline');
@@ -114,9 +114,19 @@ describe('T1 — miner start/stop/restart (Miner.*)', () => {
 
   it('Miner.restart → systemctl restart apollo-miner', async () => {
     const spy = jest.spyOn(services.miner, '_execCommand').mockResolvedValue('');
-    const res = await run(`query { Miner { restart { error { message } } } }`);
+    const res = await run(`mutation { Miner { restart { error { message } } } }`);
     expect(res.data.Miner.restart.error).toBeNull();
     expect(spy).toHaveBeenCalledWith('sudo systemctl restart --no-block apollo-miner');
+  });
+});
+
+describe('T1 — deprecated query aliases of the actions', () => {
+  // Kept for clients on the old schema: the same resolver, reached as a query.
+  it('Miner.start still works as a query and records the same request', async () => {
+    const spy = jest.spyOn(services.miner, '_execCommand').mockResolvedValue('');
+    const res = await run(`query { Miner { start { error { message } } } }`);
+    expect(res.data.Miner.start.error).toBeNull();
+    expect(spy).toHaveBeenCalledWith('sudo systemctl start --no-block apollo-miner');
   });
 });
 
@@ -129,7 +139,7 @@ describe('T1 — solo start/stop (Solo.*)', () => {
   it('Solo.start → requested_status=online + systemctl start ckpool (waitForActive ok)', async () => {
     // _execCommand serves both the start command and the is-active poll in _waitForActive
     const spy = jest.spyOn(services.solo, '_execCommand').mockResolvedValue({ stdout: 'active' });
-    const res = await run(`query { Solo { start { error { message } } } }`);
+    const res = await run(`mutation { Solo { start { error { message } } } }`);
     expect(res.data.Solo.start.error).toBeNull();
     const row = await knex('service_status').where({ service_name: 'solo' }).first();
     expect(row.requested_status).toBe('online');
@@ -138,7 +148,7 @@ describe('T1 — solo start/stop (Solo.*)', () => {
 
   it('Solo.stop → requested_status=offline + systemctl stop --no-block ckpool', async () => {
     const spy = jest.spyOn(services.solo, '_execCommand').mockResolvedValue({ stdout: 'inactive' });
-    const res = await run(`query { Solo { stop { error { message } } } }`);
+    const res = await run(`mutation { Solo { stop { error { message } } } }`);
     expect(res.data.Solo.stop.error).toBeNull();
     const row = await knex('service_status').where({ service_name: 'solo' }).first();
     expect(row.requested_status).toBe('offline');

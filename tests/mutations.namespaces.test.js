@@ -116,7 +116,7 @@ describe('Miner / Solo actions are Mutations, with guarded query aliases', () =>
     expect(spy).not.toHaveBeenCalled();
   });
 
-  // With a token (the directive reads ctx.user) both forms reach the same service call.
+  // With a token (the @auth directive reads context.isAuthenticated) both forms reach the same service call.
   it.each(cases)('%s.%s runs the service through the mutation and through the alias', async (ns, a) => {
     for (const kind of ['mutation', 'query']) {
       const fn = jest.fn().mockResolvedValue(undefined);
