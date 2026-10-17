@@ -1,9 +1,9 @@
 name: release
 
 # Builds the signed release artifact for OTA updates. Everything runs on an ARM
-# runner because the backend has native dependencies (sqlite3) that must be
-# compiled for the device's aarch64 ABI — an x86 build would produce a tarball
-# that cannot start.
+# runner: the artifact carries aarch64 binaries (the Node runtime, sqlite3's
+# native addon, the Next.js standalone server's), and the build must run the very
+# runtime that ships — an x86 build would produce a tarball that cannot start.
 
 on:
   push:
@@ -64,9 +64,17 @@ jobs:
           git submodule update --init --depth 1
           git -C apolloui-v2 log --oneline -1
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc   # must match the device ABI for sqlite3
+      - name: Install the Node runtime
+        # The artifact carries its own Node (backend/runtime/node, run by the
+        # release's units), so the build uses that same binary rather than a
+        # setup-node install of "the same version": node_modules, the UI build and
+        # the runtime that executes them cannot drift. Version from .nvmrc, sha256
+        # pinned in backend/utils/node-runtime.sha256. Putting it first on PATH
+        # also provides yarn (pinned 1.22.22), which Node 25+ no longer bundles.
+        run: |
+          set -Eeuo pipefail
+          bash backend/utils/install-node-runtime.sh
+          echo "$GITHUB_WORKSPACE/backend/runtime/node/bin" >> "$GITHUB_PATH"
 
       - name: Derive version, channel and tag
         id: meta
@@ -135,7 +143,7 @@ jobs:
       - name: Install dependencies
         run: |
           yarn install --frozen-lockfile
-          yarn --cwd apolloui-v2 install --frozen-lockfile --ignore-engines
+          yarn --cwd apolloui-v2 install --frozen-lockfile
 
       - name: Lint
         # Enforces no-console over src/ (see eslint.config.js): a raw console.* skips
@@ -227,8 +235,26 @@ jobs:
             '{version: $version, git_sha: $git_sha, build_time: $build_time, channel: $channel}' \
             > "$STAGE/version.json"
 
+          # The runtime travelled in with backend/ above (tar keeps its modes and
+          # symlinks, which `cp -r` would not). Verified on the staged copy, not
+          # assumed: the updater refuses an artifact without it, and finding that
+          # out on a device is the expensive way. This runner is aarch64, so the
+          # binary can be run, not just inspected.
+          RT="$STAGE/backend/runtime/node/bin/node"
+          [ -x "$RT" ] || { echo "::error::the staged tree has no executable $RT"; exit 1; }
+          # Same header test as the updater's check_runtime_node: 64-bit LE ELF,
+          # e_machine 0xb7 (AArch64). od, not file(1), which a runner image need
+          # not carry.
+          HDR="$(od -An -tx1 -N20 "$RT" | tr -d ' \n')"
+          [ "${HDR:0:12}" = "7f454c460201" ] && [ "${HDR:36:4}" = "b700" ] \
+            || { echo "::error::$RT is not an aarch64 ELF binary (header $HDR)"; exit 1; }
+          WANT="v$(tr -d '[:space:]' < .nvmrc)"
+          [ "$("$RT" --version)" = "$WANT" ] \
+            || { echo "::error::staged node reports $("$RT" --version), .nvmrc says $WANT"; exit 1; }
+          "$STAGE/backend/runtime/node/bin/yarn" --version >/dev/null
+
           echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
-          du -sh "$STAGE"
+          du -sh "$STAGE" "$STAGE/backend/runtime"
 
       - name: Pack and hash
         id: pack
@@ -238,6 +264,10 @@ jobs:
         run: |
           set -Eeuo pipefail
           tar -C "$STAGE" --zstd -cf "$TARBALL" .
+          # The execute bit has to survive the archive: a runtime that unpacks as
+          # 0644 is a device whose services all fail to start.
+          tar --zstd -tvf "$TARBALL" | grep -E '^-rwxr-xr-x .* \./backend/runtime/node/bin/node$' >/dev/null \
+            || { echo "::error::backend/runtime/node/bin/node lost its execute bit in the tarball"; exit 1; }
           SHA=$(sha256sum "$TARBALL" | cut -d' ' -f1)
           SIZE=$(stat -c%s "$TARBALL")
           echo "sha256=$SHA"  >> "$GITHUB_OUTPUT"
