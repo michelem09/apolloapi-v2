@@ -1,15 +1,21 @@
 const { sshExec } = require('./ssh');
 
-// nvm puts node outside the PATH of a non-interactive ssh shell, so `node` alone
-// is "command not found" there however well it works when you log in. Resolve it
-// once, by asking the device, instead of hardcoding a version that changes.
+// The runtime the units run on (2.2 and later) is the first choice: it is the very
+// node the API runs, and it is at a fixed path. 2.1.x devices have only nvm, whose
+// node is outside the PATH of a non-interactive ssh shell, so `node` alone is
+// "command not found" there however well it works when you log in: those fall back
+// to PATH, then to the nvm glob. Resolved once, by asking the device, instead of
+// hardcoding a version that changes.
+const RUNTIME_NODE = '/opt/apolloapi/backend/runtime/node/bin/node';
+const NVM_NODE_GLOB = '/usr/local/nvm/versions/node/*/bin/node';
+const nodeLookupCommand = ({ runtime = RUNTIME_NODE, nvmGlob = NVM_NODE_GLOB } = {}) =>
+  `if [ -x ${runtime} ]; then echo ${runtime}; ` +
+  `else command -v node || ls -d ${nvmGlob} 2>/dev/null | tail -1; fi`;
+
 let cachedNode = null;
 const deviceNode = async (profile) => {
   if (cachedNode) return cachedNode;
-  const { stdout } = await sshExec(
-    profile,
-    'command -v node || ls -d /usr/local/nvm/versions/node/*/bin/node 2>/dev/null | tail -1'
-  );
+  const { stdout } = await sshExec(profile, nodeLookupCommand());
   if (!stdout) throw new Error('no node interpreter found on the device');
   cachedNode = stdout.split('\n').pop().trim();
   return cachedNode;
@@ -107,4 +113,4 @@ const gqlWrite = async (profile, token, mutationDoc, variables = {}, send = gql)
 
 const resetWriteForms = () => writeForms.clear();
 
-module.exports = { mintToken, gql, gqlWrite, resetWriteForms, deviceNode, rootFieldOf };
+module.exports = { mintToken, gql, gqlWrite, resetWriteForms, deviceNode, nodeLookupCommand, rootFieldOf };
