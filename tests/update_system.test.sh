@@ -53,7 +53,7 @@ mkdir -p "$tmp/state"
 
 # --- 1. the update dies after the stops: API is stopped, then restarted ----------
 : > "$tmp/calls.log"
-PATH="$bin:$PATH" APOLLO_UPDATE_DIR="$app" APOLLO_STATE_DIR="$tmp/state" APOLLO_SOLO_REQUEST_FILE="$tmp/solo" APOLLO_UPDATE_PROGRESS_FILE="$tmp/progress" \
+PATH="$bin:$PATH" APOLLO_UPDATE_DIR="$app" APOLLO_UPDATE_SYSTEM_DETACHED=1 APOLLO_STATE_DIR="$tmp/state" APOLLO_SOLO_REQUEST_FILE="$tmp/solo" APOLLO_UPDATE_PROGRESS_FILE="$tmp/progress" \
     bash "$SCRIPT" >/dev/null 2>&1
 calls="$(cat "$tmp/calls.log")"
 stop_api=$(grep -n 'systemctl stop apollo-api.service' <<<"$calls" | head -1 | cut -d: -f1)
