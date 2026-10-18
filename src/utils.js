@@ -340,9 +340,11 @@ module.exports.auth = {
         // Restart the node service
         await mockSystemctl('restart', 'node');
 
-        // Restart ckpool if solo mining is enabled
+        // Restart ckpool if solo mining is enabled. try-restart: a ckpool the
+        // user stopped stays stopped and reads the new password from
+        // ckpool.conf (ckpool_start.sh passes -c) at its next start.
         if (settings?.nodeEnableSoloMining) {
-          await mockSystemctl('restart', 'ckpool');
+          await mockSystemctl('try-restart', 'ckpool');
         }
 
         console.log('Password updated successfully in api.conf and ckpool.conf');
@@ -504,7 +506,13 @@ module.exports.auth = {
 
   // Manage Bitcoin configuration (api.conf and user.conf)
   // Note: bitcoin.conf is managed by node_start.sh and includes api.conf and user.conf
-  async manageBitcoinConf(settings) {
+  //
+  // `options.soloWasEnabled` is whether solo mining was already on before this
+  // change. Only turning it on starts ckpool; if it was on, a save must not start
+  // a ckpool the user stopped (try-restart: restart only if running, and a stopped
+  // one reads the new ckpool.conf at its next start). Left undefined (boot path)
+  // it keeps the historical enable + restart.
+  async manageBitcoinConf(settings, options = {}) {
     try {
       // Ensure settings is valid
       if (!settings) {
@@ -545,7 +553,13 @@ module.exports.auth = {
           if (isProduction()) {
             await mockSystemctl('daemon-reload', '');
             await mockSystemctl('enable', 'ckpool');
-            await mockSystemctl('restart', 'ckpool');
+            if (options.soloWasEnabled === true) {
+              await mockSystemctl('try-restart', 'ckpool');
+            } else if (options.soloWasEnabled === false) {
+              await mockSystemctl('start', 'ckpool');
+            } else {
+              await mockSystemctl('restart', 'ckpool');
+            }
           } else {
             console.log('[DEV] Would setup solo mining with ckpool');
           }

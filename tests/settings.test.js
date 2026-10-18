@@ -326,6 +326,29 @@ describe('Settings API', () => {
       expect(utils.auth.manageBitcoinConf).not.toHaveBeenCalled();
     });
 
+    it('passes whether solo mining was already on to manageBitcoinConf', async () => {
+      await settings.update({ nodeEnableSoloMining: false });
+      utils.auth.manageBitcoinConf.mockClear();
+
+      await settings.update({ nodeEnableSoloMining: true }); // off -> on
+      expect(utils.auth.manageBitcoinConf).toHaveBeenLastCalledWith(
+        expect.anything(),
+        { soloWasEnabled: false }
+      );
+
+      await settings.update({ btcsig: 'changed while solo is on' }); // on -> on
+      expect(utils.auth.manageBitcoinConf).toHaveBeenLastCalledWith(
+        expect.anything(),
+        { soloWasEnabled: true }
+      );
+
+      await settings.update({ nodeEnableSoloMining: false }); // on -> off
+      expect(utils.auth.manageBitcoinConf).toHaveBeenLastCalledWith(
+        expect.anything(),
+        { soloWasEnabled: true }
+      );
+    });
+
     it('still switches bitcoin software when nodeSoftware actually changes', async () => {
       await settings.update({ nodeSoftware: 'core_29_2' }); // seed default is core-28.1
 

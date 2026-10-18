@@ -282,7 +282,9 @@ class SettingsService {
         oldSettings.mindiff !== newSettings.mindiff ||
         (!isBitcoinSoftwareChanging && oldSettings.nodeSoftware !== newSettings.nodeSoftware)
       ) {
-        await this.utils.auth.manageBitcoinConf(backendSettings);
+        await this.utils.auth.manageBitcoinConf(backendSettings, {
+          soloWasEnabled: !!oldSettings.nodeEnableSoloMining,
+        });
       }
 
       // Generate miner configuration
