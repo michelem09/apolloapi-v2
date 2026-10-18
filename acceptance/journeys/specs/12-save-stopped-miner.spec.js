@@ -27,10 +27,11 @@ test('saving the pools while the miner is stopped keeps it stopped', async ({ j 
   const plainWorker = testWorker.replace(/-test$/, '');
   const alt = plainWorker === testWorker ? `${testWorker}-alt` : plainWorker;
 
-  // The status the UI shows: the service monitor's, from the API (10 s tick).
+  // The status the UI shows: the service monitor's, from the API (10 s tick). The API's
+  // serviceName is `miner` (the systemd unit is apollo-miner).
   const apiStatus = async () => {
     const data = await j.gql(SERVICES);
-    return (data.Services.stats.result?.data ?? []).find((x) => x.serviceName === 'apollo-miner')?.status ?? 'unknown';
+    return (data.Services.stats.result?.data ?? []).find((x) => x.serviceName === 'miner')?.status ?? 'unknown';
   };
   const waitApiOffline = async (timeoutMs) => {
     let last = 'unknown';

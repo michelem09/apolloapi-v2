@@ -38,6 +38,29 @@ const saveAndWait = async (j, guard) => {
   return since;
 };
 
+// A save with the miner stopped does NOT start it (v2.1.4): the toast says the
+// settings apply on its next start, and a user then presses Start on the Miner
+// page. With the miner running the save restarts it, as before. `wasStopped` is
+// read BEFORE the save, from systemd (`activating` counts as running).
+const minerIsStopped = async (j) => !['active', 'activating'].includes(await j.probes.unitState(j.ssh, 'apollo-miner'));
+
+const saveAndStartIfStopped = async (j, guard, { wasStopped }) => {
+  const since = j.toastCount();
+  await j.save(guard);
+  if (wasStopped) {
+    // Called inside the journey's own step: no nested j.step.
+    await j.waitForToast(/The miner is stopped/, { since, timeoutMs: 12000 });
+    await j.page.goto('/miner');
+    const start = j.page.getByRole('button', { name: /^Start$/ });
+    await start.waitFor({ timeout: 30000 });
+    await j.shot('miner-stopped');
+    await start.click();
+  } else {
+    await j.settle(since, 12000);
+  }
+  return since;
+};
+
 // A save bar only appears on a CHANGE. If the form already holds the target (a
 // device left there by an earlier round, or the previous journey), typing the
 // target again changes nothing and there is nothing to click. Move it somewhere
@@ -50,4 +73,4 @@ const avoidNoop = async (j, target) => {
   return true;
 };
 
-module.exports = { soloSwitch, soloInput, presetSelect, urlInput, userInput, walletInput, openPools, setSolo, saveAndWait, avoidNoop };
+module.exports = { soloSwitch, soloInput, presetSelect, urlInput, userInput, walletInput, openPools, setSolo, saveAndWait, avoidNoop, minerIsStopped, saveAndStartIfStopped };

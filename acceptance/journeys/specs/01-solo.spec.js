@@ -22,8 +22,11 @@ test('solo mining with an address', async ({ j }) => {
     await P.walletInput(j.page).fill(soloAddress);
     await j.shot('solo-filled');
   });
-  await j.step('save', async () => {
-    await P.saveAndWait(j);
+  // The round starts with the miner off, and a save no longer starts a stopped miner:
+  // the user presses Start, which is what this journey does.
+  const wasStopped = await P.minerIsStopped(j);
+  await j.step(wasStopped ? 'save, then start the stopped miner' : 'save', async () => {
+    await P.saveAndStartIfStopped(j, undefined, { wasStopped });
     await j.shot('saved');
   });
 

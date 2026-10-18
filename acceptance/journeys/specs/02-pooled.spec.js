@@ -20,8 +20,11 @@ test('pooled mining with a changed worker', async ({ j }) => {
     await P.userInput(j.page).fill(worker);
     await j.shot('pooled-filled');
   });
-  await j.step('save', async () => {
-    await P.saveAndWait(j, { label: 'worker', stillThere: async () => (await P.userInput(j.page).inputValue()) === worker });
+  // The round starts with the miner off, and a save no longer starts a stopped miner:
+  // the user presses Start, which is what this journey does.
+  const wasStopped = await P.minerIsStopped(j);
+  await j.step(wasStopped ? 'save, then start the stopped miner' : 'save', async () => {
+    await P.saveAndStartIfStopped(j, { label: 'worker', stillThere: async () => (await P.userInput(j.page).inputValue()) === worker }, { wasStopped });
     await j.shot('saved');
   });
 
