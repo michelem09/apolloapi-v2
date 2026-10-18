@@ -13,7 +13,9 @@ const P = require('../pools-ui');
 // 45 s after the save: a start would be visible as `activating` by then. The round's
 // snapshot/restore puts the worker back; this journey never starts the miner.
 const WATCH_MS = 45000;
-const STOPPED = ['inactive', 'failed'];
+// systemd `inactive` only: for the service monitor a `failed` unit whose requested
+// status is online is `error`, never `offline`, so the UI would not show a stopped miner.
+const SERVICES = '{ Services { stats { result { data { serviceName status } } error { message } } } }';
 
 test('saving the pools while the miner is stopped keeps it stopped', async ({ j }) => {
   if (j.local) j.skip('needs a device: the state of the unit and the journal are the evidence');
@@ -25,18 +27,40 @@ test('saving the pools while the miner is stopped keeps it stopped', async ({ j 
   const plainWorker = testWorker.replace(/-test$/, '');
   const alt = plainWorker === testWorker ? `${testWorker}-alt` : plainWorker;
 
+  // The status the UI shows: the service monitor's, from the API (10 s tick).
+  const apiStatus = async () => {
+    const data = await j.gql(SERVICES);
+    return (data.Services.stats.result?.data ?? []).find((x) => x.serviceName === 'apollo-miner')?.status ?? 'unknown';
+  };
+  const waitApiOffline = async (timeoutMs) => {
+    let last = 'unknown';
+    const r = await j.waitUntil(async () => (last = await apiStatus()) === 'offline', { timeoutMs, everyMs: 2000 });
+    return { ok: r.ok, last };
+  };
+
   await j.step('make sure the miner is stopped first', async () => {
-    const s = await state();
-    if (STOPPED.includes(s)) return;
-    if (s === 'activating') await j.waitUntil(async () => (await state()) !== 'activating', { timeoutMs: 150000, everyMs: 3000 });
-    await j.gqlWrite('mutation { Miner { stop { error { message } } } }');
-    const r = await j.waitUntil(async () => STOPPED.includes(await state()), { timeoutMs: 120000, everyMs: 3000 });
-    j.must(r.ok, 'could not bring the miner to a stop before saving');
+    let s = await state();
+    if (s === 'activating') {
+      await j.waitUntil(async () => (await state()) !== 'activating', { timeoutMs: 150000, everyMs: 3000 });
+      s = await state();
+    }
+    if (s !== 'inactive') {
+      await j.gqlWrite('mutation { Miner { stop { error { message } } } }');
+      const r = await j.waitUntil(async () => (await state()) === 'inactive', { timeoutMs: 120000, everyMs: 3000 });
+      j.must(r.ok, `precondition not met: apollo-miner is ${await state()} and could not be brought to inactive before saving (not a build failure)`);
+    }
   });
   await j.verify('the unit is inactive on the device', async () => {
     const s = await state();
-    j.must(STOPPED.includes(s), `apollo-miner is ${s}`);
+    j.must(s === 'inactive', `apollo-miner is ${s}`);
     return s;
+  });
+  // Right after a stop the DB can still say `pending`, and the UI would render
+  // "Save & Restart" on a correct build: wait for the monitor to say offline.
+  await j.verify('the API reports the miner offline', async () => {
+    const r = await waitApiOffline(40000);
+    j.must(r.ok, `precondition not met: the API still reports apollo-miner ${r.last} 40 s after it stopped (not a build failure)`);
+    return r.last;
   });
 
   await j.step('sign in', () => j.signIn());
@@ -51,12 +75,20 @@ test('saving the pools while the miner is stopped keeps it stopped', async ({ j 
 
   await j.step('the save button reads exactly "Save"', async () => {
     const buttons = j.page.getByRole('button', { name: /^Save/ });
-    await buttons.first().waitFor({ timeout: 10000 });
-    const names = (await buttons.evaluateAll((els) => els.map((e) => (e.getAttribute('aria-label') || e.textContent || '').trim())));
-    j.must(names.length === 1 && names[0] === 'Save', `the save button reads ${JSON.stringify(names)}, not "Save" (a stopped miner has nothing to restart)`);
+    const names = async () => buttons.evaluateAll((els) => els.map((e) => (e.getAttribute('aria-label') || e.textContent || '').trim()));
+    // Bounded wait, not one read: the label follows the status pushed over WS.
+    let last = [];
+    const r = await j.waitUntil(async () => {
+      last = await names().catch(() => []);
+      return last.length === 1 && last[0] === 'Save';
+    }, { timeoutMs: 20000, everyMs: 500 });
+    j.must(r.ok, `the save button reads ${JSON.stringify(last)}, not "Save" (a stopped miner has nothing to restart)`);
   });
 
   const epoch = Number(await j.ssh('date +%s'));
+  // A line in the journal inside the window, so an empty read can be told from an unreadable journal.
+  const MARK = `j12-marker-${epoch}`;
+  await j.ssh(`logger -t acceptance-j12 ${MARK} || true`);
   let since;
   await j.step('save', async () => {
     since = j.toastCount();
@@ -80,14 +112,28 @@ test('saving the pools while the miner is stopped keeps it stopped', async ({ j 
     while (Date.now() - t0 < WATCH_MS) {
       const s = await state();
       seen.push(s);
-      j.must(STOPPED.includes(s), `apollo-miner became ${s} ${Math.round((Date.now() - t0) / 1000)} s after the save`);
+      j.must(s === 'inactive', `apollo-miner became ${s} ${Math.round((Date.now() - t0) / 1000)} s after the save`);
       await new Promise((r) => setTimeout(r, 2500));
     }
     return `${seen.length} reads, all ${[...new Set(seen)].join('/')}`;
   });
   await j.verify('the journal shows no apollo-miner start since the save', async () => {
-    const log = await j.ssh(`journalctl -u apollo-miner --since @${epoch} -o cat --no-pager 2>/dev/null || true`);
-    const starts = log.split('\n').filter((l) => /^Start(ing|ed) apollo-miner/.test(l.trim()));
+    // Prints the exit status last, so an unreadable journal is not read as "no starts".
+    const read = async (args) => {
+      const out = await j.ssh(`journalctl ${args} --since @${epoch} -o cat --no-pager 2>&1; echo "__rc=$?"`);
+      const m = /__rc=(\d+)\s*$/.exec(out);
+      return { rc: m ? Number(m[1]) : -1, text: m ? out.slice(0, m.index) : out };
+    };
+    const marker = await read('-t acceptance-j12');
+    const miner = await read('-u apollo-miner');
+    if (marker.rc !== 0 || !marker.text.includes(MARK) || miner.rc !== 0) {
+      // The 45 s systemd watch above stays the gate; say plainly that this one did not look.
+      const why = `journal check inconclusive: journalctl ${marker.rc !== 0 || miner.rc !== 0 ? `failed (rc ${marker.rc}/${miner.rc})` : 'does not show this journey\'s own marker'}`;
+      j.finding(why);
+      return why;
+    }
+    const starts = miner.text.split('\n').filter((l) => /^Start(ing|ed) apollo-miner/.test(l.trim()));
     j.must(!starts.length, `the journal shows a start: ${starts.join(' | ')}`);
+    return 'journal readable, no start';
   });
 });
