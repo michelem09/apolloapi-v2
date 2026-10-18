@@ -37,8 +37,12 @@ const hasText = (value) =>
 // file only deals with one of them.
 const isSuperEco = (mode) => mode === 'super_eco' || mode === 'super-eco';
 
+// Rows saved before the service started trimming may still carry edge
+// whitespace; the miner line must not.
+const clean = (value) => (typeof value === 'string' ? value.trim() : value);
+
 const splitPoolUrl = (url) => {
-  const [host, port] = url.replace(/^.*\/\//, '').split(':');
+  const [host, port] = clean(url).replace(/^.*\/\//, '').split(':');
   return { host, port };
 };
 
@@ -48,7 +52,7 @@ const splitPoolUrl = (url) => {
  */
 function buildCommonArgs(mainPool, settings) {
   const { host, port } = splitPoolUrl(mainPool.url);
-  let args = `-host ${host} -port ${port} -user ${mainPool.username}`;
+  let args = `-host ${host} -port ${port} -user ${clean(mainPool.username)}`;
 
   if (hasText(mainPool.password)) args += ` -pswd ${mainPool.password}`;
 
@@ -101,7 +105,7 @@ function buildApollo3Config(common, settings, backupPool) {
     const backup = splitPoolUrl(backupPool.url);
     if (backup.host && backup.port) {
       args += ` -host2 ${backup.host} -port2 ${backup.port}` +
-        ` -user2 ${backupPool.username}`;
+        ` -user2 ${clean(backupPool.username)}`;
       if (hasText(backupPool.password)) args += ` -pswd2 ${backupPool.password}`;
     }
   }

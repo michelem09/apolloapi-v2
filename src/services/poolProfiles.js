@@ -27,6 +27,8 @@ class PoolProfilesService {
   async save({ name, url, username, password }) {
     const trimmedName = (name || '').trim();
     const trimmedUrl = (url || '').trim();
+    // The worker name gets the same edge-trim as the URL; the password does not.
+    const trimmedUsername = typeof username === 'string' ? username.trim() : username;
 
     if (!trimmedName) {
       throw new GraphQLError('A name is required to save a pool');
@@ -39,7 +41,7 @@ class PoolProfilesService {
       const row = {
         name: trimmedName,
         url: trimmedUrl,
-        username: username ?? null,
+        username: trimmedUsername ?? null,
         password: password ?? null,
       };
 
