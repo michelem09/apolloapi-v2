@@ -15,11 +15,13 @@ WorkingDirectory=/opt/apolloapi/backend/apollo-miner
 # it a no-op when ExecStop already did it.
 ExecStop=/opt/apolloapi/backend/apollo-miner/miner_stop.sh
 ExecStopPost=-/opt/apolloapi/backend/apollo-miner/miner_stop.sh --if-owed
-# Only the main process gets SIGTERM before ExecStopPost; the rest of the cgroup
-# (the screen sessions and the miners in them) stays up until the shutdown script
-# has run, then gets SIGKILL. With the default (control-group) the screen is
-# signalled together with the miner and hangs it up, so the Apollo 3 binary is
-# cut off in the middle of its own SIGTERM shutdown.
+# On an explicit stop only the main process gets SIGTERM before ExecStopPost; the
+# rest of the cgroup (the screen sessions and the miners in them) stays up until
+# the shutdown script has run, then gets SIGKILL. With the default (control-group)
+# the screen is signalled together with the miner and hangs it up, so the Apollo 3
+# binary is cut off in the middle of its own SIGTERM shutdown. Not so after a
+# crash of the main process (the screen): systemd then kills the rest of the
+# cgroup at once, before ExecStopPost, as the default did before (with SIGHUP).
 KillMode=mixed
 #Restart
 Restart=always

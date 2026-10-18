@@ -29,6 +29,8 @@ LOG="$tmp/calls.log"
 for cmd in gpio screen; do
     printf '#!/bin/bash\necho "%s $*" >> "$STUB_LOG"\n' "$cmd" > "$tmp/bin/$cmd"
 done
+# GPIO_DIE=1: the shutdown script is killed in the middle of its gpio reset.
+printf '#!/bin/bash\necho "gpio $*" >> "$STUB_LOG"\n[ -n "${GPIO_DIE:-}" ] && kill -KILL "$PPID"\nexit 0\n' > "$tmp/bin/gpio"
 # No session to find, nothing to wait for: `screen -ls` prints nothing.
 printf '#!/bin/bash\necho "apollo-helper $*" >> "$STUB_LOG"\ncase "$1" in -s) echo Apollo-2;; esac\n' > "$tmp/miner/apollo-helper"
 # The start script waits 35 s for USB boards; the wait is not what is under test.
@@ -42,7 +44,7 @@ export ARMBIAN_RELEASE_FILE="$tmp/armbian-release"
 : > "$ARMBIAN_RELEASE_FILE"
 
 resets() { grep -c '^gpio write 0 0' "$LOG"; }
-stop()   { bash "$tmp/miner/miner_stop.sh" "$@" >/dev/null 2>&1; }
+stop()   { ( bash "$tmp/miner/miner_stop.sh" "$@" >/dev/null 2>&1 ); }
 start()  { bash "$tmp/miner/miner_start.sh" >/dev/null 2>&1; }
 fresh()  { : > "$LOG"; rm -f "$MINER_STOPPED_MARKER"; }
 
@@ -68,6 +70,13 @@ stop; start; : > "$LOG"
 check "start clears the marker" 0 "$([ -e "$MINER_STOPPED_MARKER" ] && echo 1 || echo 0)"
 stop --if-owed
 check "--if-owed after the next start runs" 1 "$(resets)"
+
+# 4b. A shutdown that died half-way is still owed: the marker is written last.
+fresh; start; : > "$LOG"
+GPIO_DIE=1 stop
+check "a stop killed half-way leaves no marker" 0 "$([ -e "$MINER_STOPPED_MARKER" ] && echo 1 || echo 0)"
+stop --if-owed
+check "...so --if-owed does it again" 2 "$(resets)"
 
 # Past the start script: the real sleep is back (step 6 needs the waiting to be real).
 rm -f "$tmp/bin/sleep"

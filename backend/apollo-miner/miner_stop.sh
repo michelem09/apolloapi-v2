@@ -6,8 +6,9 @@ STOPPED_MARKER="${MINER_STOPPED_MARKER:-/run/apollo-miner.stopped}"
 
 # The unit runs this twice per stop: as ExecStop, and as ExecStopPost with
 # --if-owed. ExecStop is skipped when the stop lands while miner_start.sh is still
-# running (the unit is "activating" for ~35s) and after a crash, ExecStopPost never
-# is, so between them every stop gets the full shutdown once: a shutdown that
+# running (the unit is "activating" for ~35s) and after a crash; ExecStopPost never
+# is (but after a crash of the main process the miners are already killed by then),
+# so between them every stop gets the full shutdown once: a shutdown that
 # already ran since the last start leaves the marker, and the second call is a no-op.
 if [[ "${1:-}" == "--if-owed" && -e "$STOPPED_MARKER" ]]; then
     exit 0
