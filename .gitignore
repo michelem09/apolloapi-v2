@@ -108,3 +108,5 @@ acceptance/profile.json
 # Acceptance workspace: its dependencies are its own, never the root's
 acceptance/node_modules/
 acceptance/test-results/
+# A journey round's report and screenshots
+acceptance/journeys/out/

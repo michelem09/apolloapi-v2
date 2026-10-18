@@ -5,8 +5,11 @@ const run = promisify(execFile);
 
 // Every command the run issues on the device goes through here: argv array, no
 // shell on this side, and a timeout, so one wedged command cannot hang the run.
-const sshExec = async (profile, command, { timeoutMs = 30000 } = {}) => {
-  const { stdout, stderr } = await run(
+//
+// `input` goes to the remote command's stdin: the way a secret reaches the device
+// without ever being part of a command line (ps, shell history, the journal).
+const sshExec = async (profile, command, { timeoutMs = 30000, input } = {}) => {
+  const child = run(
     'ssh',
     [
       '-o', 'StrictHostKeyChecking=no',
@@ -17,6 +20,8 @@ const sshExec = async (profile, command, { timeoutMs = 30000 } = {}) => {
     ],
     { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }
   );
+  if (input !== undefined) child.child.stdin.end(input);
+  const { stdout, stderr } = await child;
   return { stdout: stdout.trim(), stderr: stderr.trim() };
 };
 

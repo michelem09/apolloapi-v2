@@ -1,0 +1,12 @@
+{
+  "host": "192.168.86.66",
+  "user": "futurebit",
+  "apiPort": 5000,
+  "uiPort": 3000,
+  "wifi": {
+    "ssid": "Wiffy"
+  },
+  "journeys": {
+    "worker": "michelem09.apollo2-test"
+  }
+}

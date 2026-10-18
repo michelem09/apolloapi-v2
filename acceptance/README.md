@@ -55,3 +55,61 @@ Exit codes: `0` everything ran and passed · `1` a check failed · `2` the run
 never started (no profile, device not declared, ssh unreachable) · `3` everything
 that ran passed, but something skipped — a skip proves nothing, so it is not a
 green light.
+
+## User journeys (the real UI, on a guinea-pig device)
+
+The checks above drive the API and a few UI specs. The journeys drive the UI the
+way a person does — solo on with an address, a pooled worker, padded input, node
+software, Tor, Wi-Fi, units and time zone, the password — and then ask the
+**device** whether it happened (`systemctl`, the miner's `miner_config` and stat
+file, ckpool's `pool.status`, `bitcoind -version`, `nmcli`, `timedatectl`, the
+shadow file). A toast that says "saved" proves the page got an answer, nothing
+more. Run from the Mac; the LAN is not reachable from the cloud.
+
+    node acceptance/journeys.js --profile acceptance/profiles/apollo2.json
+    node acceptance/journeys.js --profile acceptance/profiles/apollo2.json --only solo,password
+    node acceptance/journeys.js --list
+    yarn --cwd acceptance journeys --profile profiles/apollo2.json    # same thing
+
+One command is the whole round. `--only` takes short names (`solo`, `pooled`,
+`padded`, `node-software`, `tor`, `wifi`, `units-timezone`, `password`), in file
+order whatever the order typed; a name that matches nothing is an error. `--bail`
+stops at the first failure. Each journey is one spec in `journeys/specs/`.
+
+Needs the same things as the rest of the suite (`ACCEPTANCE_OK` on the device, the
+device password in the keychain, `yarn --cwd acceptance install`, chromium), plus
+the Wi-Fi passphrase for the Wi-Fi journey. The profile's optional `journeys`
+object overrides what is typed (`worker`, `soloAddress`, …; see
+`journeys/defaults.js`).
+
+What a round guarantees, even when a journey fails or the run is interrupted:
+
+1. It starts only on a device that carries `ACCEPTANCE_OK`, and only if the stored
+   password still logs in.
+2. It photographs the device first — database, system timezone, the miner/node/
+   ckpool config files, service states, the NetworkManager connections, the
+   installed `bitcoind`, pools and settings — and after a failed journey, and
+   again at the end, puts all of it back. Ethernet is never taken down. Anything
+   that did not come back is listed as **drift** and fails the round.
+3. The round ends with, in this order: the state restored, the **original
+   password set again** (through the API, unconditionally if the password journey
+   ran, and checked on the dashboard and on the Linux user), the **miner off** (it
+   waits until the unit is no longer `activating` — systemd skips `ExecStop` for
+   one that is — stops through the API, and confirms `miner_stop.sh` logged its
+   closing line), and a final check of both.
+
+The report is `journeys/out/<timestamp>/report.md` (+ `report.json`): per journey
+the result, duration, every step with the device checks marked, every toast in
+order (a toast shown twice, or an empty one, is called out), console errors,
+findings (a save that said nothing), and a screenshot per step, plus a failure
+shot. Exit codes as above: `0` clean, `1` failure or drift, `2` never started,
+`3` something skipped.
+
+Offline: `node --test acceptance/test/*.test.js` covers the snapshot/restore logic,
+the ordering of the end-of-round steps when a journey (or the restore) throws, and
+the parsers. A local dev backend and UI can run the UI half of most journeys:
+
+    node acceptance/journeys.js --local http://127.0.0.1:48811 --api http://127.0.0.1:47811
+
+In that mode every device check is recorded as skipped, nothing is snapshotted or
+restored, and the exit code is always `3`: it proves the page, not the device.

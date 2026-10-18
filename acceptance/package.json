@@ -9,7 +9,8 @@
   "scripts": {
     "run": "node run.js",
     "test": "node --test test/*.test.js",
-    "browser": "playwright test --config browser/playwright.config.js"
+    "browser": "playwright test --config browser/playwright.config.js",
+    "journeys": "node journeys.js"
   },
   "dependencies": {},
   "devDependencies": {
