@@ -106,8 +106,43 @@ const parseNmcliDevices = (text) =>
     return { device, type, state, connection };
   });
 
+// Saved profiles, active or not: `nmcli -t -f NAME,UUID,TYPE,AUTOCONNECT connection show`.
+const parseNmcliSaved = (text) =>
+  String(text || '').split('\n').filter(Boolean).map((l) => {
+    const [name, uuid, type, autoconnect] = splitTerse(l);
+    return { name, uuid, type, autoconnect };
+  });
+
 const isWifi = (c) => /wireless|wifi/i.test(c.type || '');
 const isEthernet = (c) => /ethernet/i.test(c.type || '') || /^(eth|en)/.test(c.device || '');
+
+// ARP flux: with ethernet and wifi on the SAME subnet and Linux's defaults
+// (arp_ignore=0, arp_announce=0), either interface answers ARP for the other's
+// address, so taking wlan down/up can make the ethernet address unreachable for
+// minutes. Returns the reason a wifi journey is unsafe, or null.
+const ipv4Network = (cidr) => {
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/.exec(cidr);
+  if (!m) return null;
+  const bits = Number(m[5]);
+  const n = (((+m[1] << 24) | (+m[2] << 16) | (+m[3] << 8) | +m[4]) >>> 0);
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return `${(n & mask) >>> 0}/${bits}`;
+};
+
+// `ip -4 -o addr show`: "2: eth0    inet 192.168.86.66/24 brd ..."
+const arpFluxRisk = ({ addrText, arpIgnore, arpAnnounce }) => {
+  const rows = String(addrText || '').split('\n').map((l) => /^\d+:\s+(\S+)\s+inet\s+(\S+)/.exec(l)).filter(Boolean)
+    .map((m) => ({ dev: m[1], cidr: m[2], net: ipv4Network(m[2]) })).filter((r) => r.net);
+  const eth = rows.filter((r) => /^(eth|en)/.test(r.dev));
+  const wifi = rows.filter((r) => /^(wl|wlan)/.test(r.dev));
+  const shared = eth.find((e) => wifi.some((w) => w.net === e.net));
+  if (!shared) return null;
+  const w = wifi.find((x) => x.net === shared.net);
+  const ignore = Number(arpIgnore);
+  const announce = Number(arpAnnounce);
+  if (ignore >= 1 && announce === 2) return null;
+  return `${shared.dev} (${shared.cidr}) and ${w.dev} (${w.cidr}) are on the same subnet, with arp_ignore=${arpIgnore} and arp_announce=${arpAnnounce} (safe is >=1 and 2): ARP flux, so taking the radio down can cut the ethernet address too`;
+};
 
 const deviceOfRoute = (text) => /\bdev\s+(\S+)/.exec(String(text || ''))?.[1] ?? null;
 const devicesOfDefaultRoutes = (text) =>
@@ -209,6 +244,9 @@ const statFileMentions = async (ssh, needles) => {
   return Object.fromEntries(needles.map((n) => [n, text.includes(n)]));
 };
 
+const nmcliSaved = async (ssh) =>
+  parseNmcliSaved(await ssh('nmcli -t -f NAME,UUID,TYPE,AUTOCONNECT connection show || true'));
+
 const nmcliState = async (ssh) => ({
   active: parseNmcliActive(await ssh('nmcli -t -f NAME,UUID,TYPE,DEVICE connection show --active || true')),
   devices: parseNmcliDevices(await ssh('nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status || true')),
@@ -247,6 +285,10 @@ module.exports = {
   splitTerse,
   parseNmcliActive,
   parseNmcliDevices,
+  parseNmcliSaved,
+  arpFluxRisk,
+  ipv4Network,
+  nmcliSaved,
   isWifi,
   isEthernet,
   deviceOfRoute,

@@ -7,14 +7,18 @@ const WLAN = 'Wiffy:uuid-wifi:802-11-wireless:wlan0';
 const ETH = 'Wired connection 1:uuid-eth:802-3-ethernet:eth0';
 
 // A scripted device: answers by pattern, records every command.
-const device = ({ active = [ETH, WLAN], units = {}, version = 'Bitcoin Core version v28.1.0', tz = 'Europe/Rome', failOn = [] } = {}) => {
+const SAVED_WIFI = 'Wiffy:uuid-wifi:802-11-wireless:no';
+const device = ({ active = [ETH, WLAN], saved = [SAVED_WIFI], units = {}, version = 'Bitcoin Core version v28.1.0', tz = 'Europe/Rome', failOn = [] } = {}) => {
   const log = [];
-  const s = { active: [...active], units: { 'apollo-miner': 'inactive', node: 'active', ckpool: 'inactive', ...units } };
+  const s = { saved: [...saved], active: [...active], units: { 'apollo-miner': 'inactive', node: 'active', ckpool: 'inactive', ...units } };
   const ssh = async (cmd) => {
     log.push(cmd);
     if (failOn.some((f) => cmd.includes(f))) throw new Error(`ssh failed: ${f(cmd)}`);
     let m;
     if (/connection show --active/.test(cmd)) return s.active.join('\n');
+    if (/AUTOCONNECT connection show/.test(cmd)) return s.saved.join('\n');
+    if ((m = /connection modify uuid (\S+) connection\.autoconnect (\w+)/.exec(cmd))) { s.saved = s.saved.map((r) => (r.includes(m[1]) ? r.replace(/:\w+$/, `:${m[2]}`) : r)); return ''; }
+    if ((m = /connection modify uuid (\S+) connection\.id '(.*)'/.exec(cmd))) { s.saved = s.saved.map((r) => (r.includes(m[1]) ? r.replace(/^[^:]*/, m[2]) : r)); return ''; }
     if (/device status/.test(cmd)) return 'eth0:ethernet:connected:Wired connection 1\nwlan0:wifi:connected:Wiffy';
     if (/ip route show default/.test(cmd)) return 'default via 1.1.1.1 dev eth0';
     if ((m = /systemctl show (\S+) -p ActiveState/.exec(cmd))) return s.units[m[1]];
@@ -211,4 +215,76 @@ test('drift: a missing ethernet connection is reported — it is the way in', as
   const after = JSON.parse(JSON.stringify(before));
   after.nmcli.active = after.nmcli.active.filter((c) => !/ethernet/.test(c.type));
   assert.match(describeDrift(before, after).join(), /ethernet/);
+});
+
+test('drift: a wifi profile whose autoconnect or uuid changed is reported (the case that went unseen)', async () => {
+  const d = device();
+  const a = api();
+  const before = await capture({ ssh: d.ssh, gql: a.gql });
+  assert.deepEqual(before.savedWifi, [{ name: 'Wiffy', uuid: 'uuid-wifi', type: '802-11-wireless', autoconnect: 'no' }]);
+  const after = JSON.parse(JSON.stringify(before));
+  after.savedWifi[0].autoconnect = 'yes';
+  after.savedWifi[0].uuid = 'uuid-new';
+  const drift = describeDrift(before, after).join('\n');
+  assert.match(drift, /wifi profile Wiffy: autoconnect no -> yes/);
+  assert.match(drift, /wifi profile Wiffy: uuid uuid-wifi -> uuid-new/);
+  after.savedWifi = [];
+  assert.match(describeDrift(before, after).join(), /wifi profile Wiffy is gone/);
+});
+
+test('restore: autoconnect and name are put back, also on a profile recreated with a new uuid', async () => {
+  const d = device();
+  const a = api();
+  const snap = await takeStateSnapshot({ profile: {}, ssh: d.ssh, gql: a.gql, base: base() });
+  d.s.saved = ['Wiffy:uuid-new:802-11-wireless:yes']; // recreated by a join
+  d.log.length = 0;
+  const r = await restoreState({ profile: {}, ssh: d.ssh, gql: a.gql, gqlWrite: a.gqlWrite, snap, base: base(), waitUntil: instantWait });
+  assert.ok(d.log.some((c) => /connection modify uuid uuid-new connection\.autoconnect no/.test(c)), d.log.join('\n'));
+  assert.deepEqual(r.errors, []);
+  assert.equal(d.s.saved[0], 'Wiffy:uuid-new:802-11-wireless:no');
+  // and one renamed in place
+  d.s.saved = ['Other:uuid-wifi:802-11-wireless:no'];
+  d.log.length = 0;
+  await restoreState({ profile: {}, ssh: d.ssh, gql: a.gql, gqlWrite: a.gqlWrite, snap, base: base(), waitUntil: instantWait });
+  assert.ok(d.log.some((c) => /connection modify uuid uuid-wifi connection\.id 'Wiffy'/.test(c)));
+});
+
+test('restore: a name with a quote cannot break out of the command', async () => {
+  const d = device({ saved: ["It's:uuid-wifi:802-11-wireless:no"] });
+  const a = api();
+  const snap = await takeStateSnapshot({ profile: {}, ssh: d.ssh, gql: a.gql, base: base() });
+  d.s.saved = ['x:uuid-wifi:802-11-wireless:no'];
+  d.log.length = 0;
+  await restoreState({ profile: {}, ssh: d.ssh, gql: a.gql, gqlWrite: a.gqlWrite, snap, base: base(), waitUntil: instantWait });
+  assert.ok(d.log.some((c) => c.includes(`connection.id 'It'\\''s'`)), d.log.join('\n'));
+});
+
+test('restore: leaving a connection that is not active is done, not an error, and is tried once', async () => {
+  const d = device({ active: [ETH] });
+  const a = api();
+  const snap = await takeStateSnapshot({ profile: {}, ssh: d.ssh, gql: a.gql, base: base() });
+  d.s.active = [ETH, WLAN];
+  const ssh = async (cmd) => {
+    if (/connection down/.test(cmd)) throw new Error('Error: not an active connection');
+    return d.ssh(cmd);
+  };
+  const log = [];
+  const logged = async (cmd) => { log.push(cmd); return ssh(cmd); };
+  const r = await restoreState({ profile: {}, ssh: logged, gql: a.gql, gqlWrite: a.gqlWrite, snap, base: base(), waitUntil: instantWait });
+  assert.deepEqual(r.errors, []);
+  assert.equal(log.filter((c) => /connection down/.test(c)).length, 1);
+});
+
+test('restore: it waits for the wifi only when it brought it up itself', async () => {
+  const d = device();
+  const a = api();
+  const snap = await takeStateSnapshot({ profile: {}, ssh: d.ssh, gql: a.gql, base: base() });
+  let waits = 0;
+  const waitUntil = async (probe) => { waits += 1; return instantWait(probe); };
+  // already as it was: nothing to bring up, so no 60 s wait
+  await restoreState({ profile: {}, ssh: d.ssh, gql: a.gql, gqlWrite: a.gqlWrite, snap, base: base(), waitUntil });
+  const quiet = waits; // the wait for the API after the DB restore
+  d.s.active = [ETH];
+  await restoreState({ profile: {}, ssh: d.ssh, gql: a.gql, gqlWrite: a.gqlWrite, snap, base: base(), waitUntil });
+  assert.equal(waits - quiet, quiet + 1, 'one extra wait, for the connection it brought up');
 });

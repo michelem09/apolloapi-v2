@@ -32,6 +32,21 @@ test('wifi: leave and rejoin the home network', async ({ j }) => {
     return active.find((c) => j.probes.isWifi(c) && (!dev || c.device === dev)) || null;
   };
 
+  // The reason this journey is unsafe on this device, if it is. Checked before
+  // anything is touched. `--force-wifi` overrides it.
+  if (!j.local) {
+    const risk = j.probes.arpFluxRisk({
+      addrText: await j.ssh('ip -4 -o addr show'),
+      arpIgnore: await j.ssh('sysctl -n net.ipv4.conf.all.arp_ignore'),
+      arpAnnounce: await j.ssh('sysctl -n net.ipv4.conf.all.arp_announce'),
+    });
+    if (risk && !j.ctx.forceWifi) {
+      j.finding(`inconclusive: ${risk}`);
+      j.skip(`inconclusive: ${risk} (--force-wifi to run anyway)`);
+    }
+    if (risk) j.finding(`running anyway (--force-wifi): ${risk}`);
+  }
+
   let radio;
   let startedConnected;
   await j.verify('a radio that is safe to touch', async () => {

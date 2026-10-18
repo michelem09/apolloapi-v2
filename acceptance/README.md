@@ -78,6 +78,15 @@ One command is the whole round. `--only` takes short names (`solo`, `pooled`,
 order whatever the order typed; a name that matches nothing is an error. `--bail`
 stops at the first failure. Each journey is one spec in `journeys/specs/`.
 
+**`wifi` is opt-in**: it is not in the default round. Run it with `--only wifi` or
+add it with `--with wifi`. Taking the radio down and up on a device whose ethernet
+and wifi sit on the same subnet (Linux's defaults, `arp_ignore=0`,
+`arp_announce=0`: ARP flux) can make the ethernet address unreachable for minutes,
+and everything after it then fails for that reason. When it does run, it first
+reads the device's addresses and sysctls; on the same subnet without
+`arp_ignore>=1` and `arp_announce=2` it ends *inconclusive* with that reason rather
+than risk it. `--force-wifi` runs it anyway.
+
 Needs the same things as the rest of the suite (`ACCEPTANCE_OK` on the device, the
 device password in the keychain, `yarn --cwd acceptance install`, chromium), plus
 the Wi-Fi passphrase for the Wi-Fi journey. The profile's optional `journeys`
@@ -91,7 +100,9 @@ What a round guarantees, even when a journey fails or the run is interrupted:
 2. It photographs the device first — database, system timezone, the miner/node/
    ckpool config files, service states, the NetworkManager connections, the
    installed `bitcoind`, pools and settings — and after a failed journey, and
-   again at the end, puts all of it back. Ethernet is never taken down. Anything
+   again at the end, puts all of it back — including each saved wifi profile's name
+and `autoconnect`. Ethernet is never taken down; a connection that is already not
+active is left alone, once. Anything
    that did not come back is listed as **drift** and fails the round.
 3. The round ends with, in this order: the state restored, the **original
    password set again** (through the API, unconditionally if the password journey

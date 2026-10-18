@@ -19,6 +19,9 @@ const WIFI_CONNECT = `mutation($input: McuWifiConnectInput!) {
   Mcu { wifiConnect(input: $input) { result { address } error { message } } }
 }`;
 
+// Single-quote for the remote shell: a profile name is whatever the user typed.
+const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
+
 const flat = (file) => file.split('/').pop();
 
 // Services and the API's own view, read defensively: a field the schema of this
@@ -60,6 +63,7 @@ const capture = async ({ ssh, gql }) => {
     services,
     timezone: await probes.timezone(ssh),
     nmcli: await probes.nmcliState(ssh),
+    savedWifi: (await probes.nmcliSaved(ssh)).filter(probes.isWifi),
     defaultRoute: await probes.defaultRouteDevices(ssh),
     bitcoind: await probes.bitcoindVersion(ssh),
     confHashes: await confHashes(ssh),
@@ -87,18 +91,23 @@ const apiAnswers = (gql) => async () => {
   try { await gql('{ __typename }'); return true; } catch { return false; }
 };
 
+// "Not an active connection" on a `down` is the state that was asked for.
+const alreadyDone = (err) => /not an active connection|no active connection|not active/i.test(`${err?.message} ${err?.stderr || ''}`);
+
 // Ethernet is never taken down, whatever the snapshot says: the run reaches the
 // device through it, and a wifi mistake must not cost the way back in.
 const restoreNetwork = async ({ ssh, gql, snap, wifi, waitUntil, notes, errors }) => {
   const now = await probes.nmcliState(ssh);
   const had = snap.before.nmcli.active;
   const has = (list, uuid) => list.some((c) => c.uuid === uuid);
+  const broughtUp = [];
 
   for (const c of had) {
     if (has(now.active, c.uuid)) continue;
     try {
       await ssh(`sudo nmcli connection up uuid ${c.uuid}`, { timeoutMs: 60000 });
       notes.push(`network: ${c.name} (${c.device}) brought back up`);
+      broughtUp.push(c.uuid);
     } catch (err) {
       // A 2.1.x "disconnect" deletes the saved profile: there is nothing to bring
       // up, so join again the way a user would.
@@ -106,6 +115,7 @@ const restoreNetwork = async ({ ssh, gql, snap, wifi, waitUntil, notes, errors }
         try {
           await gql(WIFI_CONNECT, { input: { ssid: c.name, passphrase: wifi.passphrase, ifname: c.device } });
           notes.push(`network: ${c.name} had no saved profile, joined again`);
+          broughtUp.push(c.uuid);
         } catch (err2) {
           errors.push(`network: could not rejoin ${c.name}: ${err2.message}`);
         }
@@ -115,6 +125,7 @@ const restoreNetwork = async ({ ssh, gql, snap, wifi, waitUntil, notes, errors }
     }
   }
 
+  // Once each, and a profile that is not active counts as done.
   for (const c of now.active) {
     // Only wifi that the snapshot did not have: never ethernet, never loopback.
     if (!probes.isWifi(c) || has(had, c.uuid)) continue;
@@ -122,11 +133,12 @@ const restoreNetwork = async ({ ssh, gql, snap, wifi, waitUntil, notes, errors }
       await ssh(`sudo nmcli connection down uuid ${c.uuid}`, { timeoutMs: 30000 });
       notes.push(`network: left ${c.name}, which was not connected at the start`);
     } catch (err) {
-      errors.push(`network: could not leave ${c.name}: ${err.message}`);
+      if (!alreadyDone(err)) errors.push(`network: could not leave ${c.name}: ${err.message}`);
     }
   }
 
-  const wanted = had.filter(probes.isWifi).map((c) => c.uuid);
+  // Wait only for what this restore itself asked for.
+  const wanted = broughtUp.filter((u) => had.some((c) => c.uuid === u && probes.isWifi(c)));
   if (wanted.length) {
     const ok = await waitFor(
       waitUntil,
@@ -137,6 +149,33 @@ const restoreNetwork = async ({ ssh, gql, snap, wifi, waitUntil, notes, errors }
       { timeoutMs: 60000, everyMs: 3000 }
     );
     if (!ok) errors.push('network: the wifi connection did not come back within 60 s');
+  }
+
+  await restoreSavedWifi({ ssh, snap, notes, errors });
+};
+
+// The saved wifi profiles themselves: name and autoconnect go back to what they
+// were (a profile recreated by a disconnect/join comes back with autoconnect=yes
+// and a new UUID). A UUID cannot be put back: that stays in the drift list.
+const restoreSavedWifi = async ({ ssh, snap, notes, errors }) => {
+  const before = snap.before.savedWifi;
+  if (!before) return;
+  const now = (await probes.nmcliSaved(ssh)).filter(probes.isWifi);
+  for (const s of before) {
+    const c = now.find((x) => x.uuid === s.uuid) || now.find((x) => x.name === s.name && !before.some((b) => b.uuid === x.uuid));
+    if (!c) continue;
+    try {
+      if (c.name !== s.name) {
+        await ssh(`sudo nmcli connection modify uuid ${c.uuid} connection.id ${shq(s.name)}`);
+        notes.push(`network: profile ${c.uuid} renamed back to ${s.name}`);
+      }
+      if (c.autoconnect !== s.autoconnect) {
+        await ssh(`sudo nmcli connection modify uuid ${c.uuid} connection.autoconnect ${s.autoconnect === 'yes' ? 'yes' : 'no'}`);
+        notes.push(`network: ${s.name} autoconnect put back to ${s.autoconnect}`);
+      }
+    } catch (err) {
+      errors.push(`network: could not restore the saved profile ${s.name}: ${err.message}`);
+    }
   }
 };
 
@@ -201,6 +240,19 @@ const describeDrift = (before, after) => {
   const eth = (s) => s.nmcli.active.filter(probes.isEthernet).map((c) => c.name).sort();
   if (!same(wifi(before), wifi(after))) out.push(`wifi ${wifi(before).join(',') || 'none'} -> ${wifi(after).join(',') || 'none'}`);
   if (!same(eth(before), eth(after))) out.push(`ethernet ${eth(before).join(',') || 'none'} -> ${eth(after).join(',') || 'none'}`);
+  // Saved wifi profiles: name, UUID and autoconnect. Today's miss: Wiffy was
+  // autoconnect=no and came back yes with a new UUID, and nothing said so.
+  const key = (list) => Object.fromEntries((list || []).map((c) => [c.name, c]));
+  const bw = key(before.savedWifi);
+  const aw = key(after.savedWifi);
+  if (before.savedWifi && after.savedWifi) {
+    for (const name of Object.keys(bw)) {
+      if (!aw[name]) { out.push(`wifi profile ${name} is gone`); continue; }
+      if (bw[name].uuid !== aw[name].uuid) out.push(`wifi profile ${name}: uuid ${bw[name].uuid} -> ${aw[name].uuid}`);
+      if (bw[name].autoconnect !== aw[name].autoconnect) out.push(`wifi profile ${name}: autoconnect ${bw[name].autoconnect} -> ${aw[name].autoconnect}`);
+    }
+    for (const name of Object.keys(aw)) if (!bw[name]) out.push(`wifi profile ${name} is new`);
+  }
   if (before.pools && after.pools && !same(before.pools, after.pools)) out.push('pools differ');
   if (before.settings && after.settings) {
     const { id: _a, ...b } = before.settings;

@@ -112,3 +112,26 @@ test('journal analysis: a stop is only good if the script printed its closing li
   assert.deepEqual(p.analyseStops(preFix), { stops: 1, scripts: 0, lastSkipped: true });
   assert.equal(p.analyseStops('apollo-miner.service: Deactivated successfully.').lastSkipped, true);
 });
+
+const ADDR = (eth, wlan) => `1: lo    inet 127.0.0.1/8 scope host lo\n2: eth0    inet ${eth} brd 192.168.86.255 scope global eth0\n3: wlan0    inet ${wlan} brd 192.168.86.255 scope global wlan0`;
+
+test('ARP flux: same subnet with the kernel defaults is unsafe, with ignore>=1 and announce=2 it is not', () => {
+  const same = ADDR('192.168.86.66/24', '192.168.86.35/24');
+  assert.match(p.arpFluxRisk({ addrText: same, arpIgnore: '0', arpAnnounce: '0' }), /eth0.*wlan0.*ARP flux/);
+  assert.match(p.arpFluxRisk({ addrText: same, arpIgnore: '1', arpAnnounce: '0' }), /ARP flux/);
+  assert.match(p.arpFluxRisk({ addrText: same, arpIgnore: '0', arpAnnounce: '2' }), /ARP flux/);
+  assert.equal(p.arpFluxRisk({ addrText: same, arpIgnore: '1', arpAnnounce: '2' }), null);
+  assert.equal(p.arpFluxRisk({ addrText: same, arpIgnore: '2', arpAnnounce: '2' }), null);
+});
+
+test('ARP flux: different subnets, or no wifi address at all, are not a risk', () => {
+  assert.equal(p.arpFluxRisk({ addrText: ADDR('192.168.86.66/24', '10.0.0.4/24'), arpIgnore: '0', arpAnnounce: '0' }), null);
+  assert.equal(p.arpFluxRisk({ addrText: '2: eth0    inet 192.168.86.66/24 brd x', arpIgnore: '0', arpAnnounce: '0' }), null);
+  assert.equal(p.arpFluxRisk({ addrText: '', arpIgnore: '', arpAnnounce: '' }), null);
+  // /16 on one side contains the other host but the networks differ: not "the same subnet"
+  assert.equal(p.arpFluxRisk({ addrText: ADDR('192.168.86.66/24', '192.168.87.35/24'), arpIgnore: '0', arpAnnounce: '0' }), null);
+});
+
+test('saved profiles parse with autoconnect', () => {
+  assert.deepEqual(p.parseNmcliSaved('Wiffy:u1:802-11-wireless:no\nWired connection 1:u2:802-3-ethernet:yes')[0], { name: 'Wiffy', uuid: 'u1', type: '802-11-wireless', autoconnect: 'no' });
+});

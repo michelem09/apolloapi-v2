@@ -14,19 +14,33 @@ const list = () =>
       return { id, name: id.replace(/^\d+-/, ''), file: path.join(SPECS, f) };
     });
 
+// Journeys that are NOT in the default round. The Wi-Fi one takes the radio down
+// and up; on a device with ethernet and wifi on the same subnet (Linux's default
+// ARP behaviour, arp_ignore=0) that can cut the ethernet address too, for minutes,
+// and everything after it fails for that reason. It runs when asked for by name
+// (`--only wifi`) or with `--with wifi`.
+const OPT_IN = new Set(['wifi']);
+
 // Accepts ids ("04-node-software"), short names ("node-software") or a prefix of
 // either ("node"), and refuses a name that matches nothing: a typo that selects
-// zero journeys would be a green run that tested nothing.
-const select = (all, only) => {
-  if (!only) return all;
-  const wanted = only.split(',').map((s) => s.trim()).filter(Boolean);
+// zero journeys would be a green run that tested nothing. With no `only`, the
+// default round is everything except the opt-in journeys, plus those in `extra`.
+const match = (all, w) => {
+  const hits = all.filter((j) => j.id === w || j.name === w || j.name.startsWith(w));
+  if (!hits.length) throw new Error(`no journey named "${w}" — try one of: ${all.map((j) => j.name).join(', ')}`);
+  return hits;
+};
+const names = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
+
+const select = (all, only, extra = null) => {
   const picked = [];
-  for (const w of wanted) {
-    const hits = all.filter((j) => j.id === w || j.name === w || j.name.startsWith(w));
-    if (!hits.length) throw new Error(`no journey named "${w}" — try one of: ${all.map((j) => j.name).join(', ')}`);
-    hits.forEach((h) => { if (!picked.includes(h)) picked.push(h); });
+  const add = (hits) => hits.forEach((h) => { if (!picked.includes(h)) picked.push(h); });
+  if (only) names(only).forEach((w) => add(match(all, w)));
+  else {
+    add(all.filter((j) => !OPT_IN.has(j.name)));
+    names(extra).forEach((w) => add(match(all, w)));
   }
   return all.filter((j) => picked.includes(j));
 };
 
-module.exports = { list, select };
+module.exports = { list, select, OPT_IN };
