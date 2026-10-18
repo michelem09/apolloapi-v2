@@ -4,10 +4,10 @@ const assert = require('node:assert/strict');
 const registry = require('../journeys/registry');
 const report = require('../journeys/report');
 
-test('the journeys are the eleven, in order', () => {
+test('the journeys are the twelve, in order', () => {
   assert.deepEqual(registry.list().map((j) => j.name), [
     'solo', 'pooled', 'padded', 'node-software', 'tor', 'wifi', 'units-timezone', 'password',
-    'stop-during-start', 'early-click', 'edit-during-refetch',
+    'stop-during-start', 'early-click', 'edit-during-refetch', 'save-stopped-miner',
   ]);
 });
 
@@ -16,7 +16,7 @@ test('--only takes short names, ids and prefixes, keeps file order, and refuses 
   assert.deepEqual(registry.select(all, 'password,solo').map((j) => j.name), ['solo', 'password']);
   assert.deepEqual(registry.select(all, '04-node-software').map((j) => j.name), ['node-software']);
   assert.deepEqual(registry.select(all, 'node').map((j) => j.name), ['node-software']);
-  assert.equal(registry.select(all, null).length, 10);
+  assert.equal(registry.select(all, null).length, 11);
   assert.throws(() => registry.select(all, 'sollo'), /no journey named "sollo"/);
 });
 
@@ -88,7 +88,7 @@ test('wifi is opt-in: out of the default round, in with --only or --with', () =>
   assert.ok(!registry.select(all, null).some((j) => j.name === 'wifi'));
   assert.deepEqual(registry.select(all, 'wifi').map((j) => j.name), ['wifi']);
   assert.ok(registry.select(all, null, 'wifi').some((j) => j.name === 'wifi'));
-  assert.equal(registry.select(all, null, 'wifi').length, 11);
+  assert.equal(registry.select(all, null, 'wifi').length, 12);
   assert.ok(registry.select(all, 'solo,wifi').some((j) => j.name === 'wifi'));
   assert.throws(() => registry.select(all, null, 'wifii'), /no journey named "wifii"/);
   assert.ok(registry.OPT_IN.has('wifi'));

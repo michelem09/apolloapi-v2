@@ -74,7 +74,7 @@ more. Run from the Mac; the LAN is not reachable from the cloud.
 
 One command is the whole round. `--only` takes short names (`solo`, `pooled`,
 `padded`, `node-software`, `tor`, `wifi`, `units-timezone`, `password`,
-`stop-during-start`, `early-click`, `edit-during-refetch`), in file
+`stop-during-start`, `early-click`, `edit-during-refetch`, `save-stopped-miner`), in file
 order whatever the order typed; a name that matches nothing is an error. `--bail`
 stops at the first failure. Each journey is one spec in `journeys/specs/`.
 
@@ -128,7 +128,8 @@ nothing is saved. `edit-during-refetch` saves the unit, holds the settings refet
 that follows, picks a time zone meanwhile and expects the pick to survive (finding
 "edit lost during refetch" if not). Every Save waits for the bar to close
 (`j.save`), and a guard records "edit lost before save" instead of saving something
-else. A toast shown twice within 1.5 s is listed under Findings.
+else. `save-stopped-miner` (new behaviour on 2.1.4, expected to FAIL on a build that still says "Save & Restart") stops the miner, changes the worker and expects a button reading exactly "Save", the "The miner is stopped" toast, and the unit still stopped 45 s later with no start in the journal; device only, skipped on a Solo Node.
+A toast shown twice within 1.5 s is listed under Findings.
 
 The API is reached through an ssh tunnel that is watched (ServerAlive keepalives; a
 dead one is reopened with backoff and its exit and stderr go in the report under
