@@ -240,3 +240,21 @@ describe('configurator — Apollo III', () => {
     expect(writtenFiles().config3).toContain('-fan_pwm 10');
   });
 });
+
+describe('configurator — whitespace at the edges of a stored pool', () => {
+  it('writes the trimmed url and worker for the primary and the backup pool', async () => {
+    await generate(
+      [
+        pool({ url: '  stratum+tcp://pool.example.com:3333 ', username: ' wallet.worker  ', index: 1 }),
+        pool({ url: ' backup.example.com:4444\n', username: '\tw2 ', index: 2 }),
+      ],
+      baseSettings()
+    );
+    const { config, config3 } = writtenFiles();
+    expect(config).toBe('-host pool.example.com -port 3333 -user wallet.worker -pswd x -powermode balanced');
+    expect(config3).toBe(
+      '-host pool.example.com -port 3333 -user wallet.worker -pswd x' +
+        ' -host2 backup.example.com -port2 4444 -user2 w2 -pswd2 x -powermode balanced'
+    );
+  });
+});

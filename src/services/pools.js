@@ -1,6 +1,20 @@
 const { GraphQLError } = require('graphql');
 const generateConf = require('../configurator');
 
+// A pasted URL or worker name often carries a stray space or newline at an edge.
+// The miner tolerates it only by accident of shell word-splitting, and the pool
+// sees a different worker name, so the edges are cut on every way in. The
+// password is left alone: it may legitimately start or end with a space.
+const trimEdges = (value) => (typeof value === 'string' ? value.trim() : value);
+
+const normalizePool = (pool) => {
+  if (!pool || typeof pool !== 'object') return pool;
+  const normalized = { ...pool };
+  if ('url' in normalized) normalized.url = trimEdges(normalized.url);
+  if ('username' in normalized) normalized.username = trimEdges(normalized.username);
+  return normalized;
+};
+
 class PoolsService {
   constructor(knex, utils) {
     this.knex = knex;
@@ -161,7 +175,7 @@ class PoolsService {
       await trx.delete().from('pools');
 
       // Then, insert all new pools
-      await trx.insert(poolsData).into('pools');
+      await trx.insert(poolsData.map(normalizePool)).into('pools');
     });
   }
 
@@ -196,7 +210,7 @@ class PoolsService {
       }
     });
 
-    return preparedData;
+    return normalizePool(preparedData);
   }
 }
 

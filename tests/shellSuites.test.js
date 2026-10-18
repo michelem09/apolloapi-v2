@@ -12,6 +12,7 @@ const suites = [
   'node_datadir.test.sh',
   'ckpool_scripts.test.sh',
   'node_runtime.test.sh',
+  'miner_scripts.test.sh',
 ];
 
 describe.each(suites)('%s', (suite) => {
