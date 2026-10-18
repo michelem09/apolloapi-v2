@@ -40,14 +40,35 @@ const openTunnel = async (profile, remotePort, localPort = null) => {
     '-o', 'StrictHostKeyChecking=no',
     '-o', 'BatchMode=yes',
     '-o', 'ExitOnForwardFailure=yes',
+    // A tunnel that dies silently was the end of a whole round: ssh now notices a
+    // dead path in ~45 s and exits, so whoever holds the tunnel can see it and
+    // open another.
+    '-o', 'ServerAliveInterval=15',
+    '-o', 'ServerAliveCountMax=3',
     '-L', `${port}:127.0.0.1:${remotePort}`,
     `${profile.user}@${profile.host}`,
-  ], { stdio: 'ignore' });
+  ], { stdio: ['ignore', 'ignore', 'pipe'] });
 
-  child.on('exit', () => {});
-  await waitForPort(port);
+  // What ssh said when it died is the only evidence of why.
+  let stderr = '';
+  let exit = null;
+  child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-4000); });
+  child.on('exit', (code, signal) => { exit = { code, signal, at: new Date().toISOString() }; });
+  child.on('error', (err) => { exit = { error: err.message, at: new Date().toISOString() }; });
+  try {
+    await waitForPort(port);
+  } catch (err) {
+    child.kill();
+    throw err;
+  }
 
-  return { port, close: () => child.kill() };
+  return {
+    port,
+    close: () => child.kill(),
+    alive: () => exit === null,
+    stderr: () => stderr.trim(),
+    exit: () => exit,
+  };
 };
 
 module.exports = { openTunnel };

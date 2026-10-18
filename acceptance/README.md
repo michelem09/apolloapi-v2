@@ -119,6 +119,13 @@ that follows, picks a time zone meanwhile and expects the pick to survive (findi
 (`j.save`), and a guard records "edit lost before save" instead of saving something
 else. A toast shown twice within 1.5 s is listed under Findings.
 
+The API is reached through an ssh tunnel that is watched (ServerAlive keepalives; a
+dead one is reopened with backoff and its exit and stderr go in the report under
+"API transport") and, when it cannot be, over the LAN at `http://<host>:<apiPort>`.
+The end of a round does not depend on the tunnel: the miner is stopped with
+`systemctl` if the API will not do it, and the last line of the report is always
+`LEFT TO DO BY HAND: …` (or `nothing`).
+
 Offline: `node --test acceptance/test/*.test.js` covers the snapshot/restore logic,
 the ordering of the end-of-round steps when a journey (or the restore) throws, and
 the parsers. A local dev backend and UI can run the UI half of most journeys:

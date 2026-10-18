@@ -7,6 +7,7 @@ const { waitUntil } = require('../lib/wait');
 const { devicePassword } = require('../lib/secrets');
 const probes = require('./probes');
 const { doSave } = require('./save');
+const { createTransport, through } = require('./transport');
 
 // What every journey shares: the way onto the device, the way into the UI, and
 // the recorder that turns a run into a report.
@@ -85,6 +86,8 @@ const test = base.test.extend({
       return (await sshExec(profile, command, opts)).stdout;
     };
     const token = ctx.token;
+    // If the parent's tunnel dies, the spec carries on over the LAN.
+    const transport = createTransport({ profile, directBase: ctx.directBase });
 
     const j = {
       id,
@@ -95,8 +98,7 @@ const test = base.test.extend({
       kind: ctx.deviceKind,
       cfg: ctx.journeys || {},
       ssh,
-      gql: (doc, vars) => api.gql(profile, token, doc, vars),
-      gqlWrite: (doc, vars) => api.gqlWrite(profile, token, doc, vars),
+      ...through(transport, api, profile, token),
       waitUntil,
       probes,
       password: devicePassword,
@@ -242,6 +244,7 @@ const test = base.test.extend({
       rec.ok = testInfo.status === 'passed';
       if (testInfo.status === 'skipped' && !rec.skipped) rec.skipped = 'skipped';
       rec.error = testInfo.error?.message ? plain(testInfo.error.message).split('\n')[0] : null;
+      rec.transport = transport.events;
       rec.durationMs = Date.now() - started;
       fs.mkdirSync(ctx.out, { recursive: true });
       fs.writeFileSync(path.join(ctx.out, `${id}.json`), JSON.stringify(rec, null, 2));

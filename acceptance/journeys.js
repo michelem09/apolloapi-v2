@@ -20,6 +20,7 @@ const { runRound } = require('./journeys/round');
 const report = require('./journeys/report');
 const defaults = require('./journeys/defaults');
 const { buildDeps, localDeps } = require('./journeys/deps');
+const { createTransport, through } = require('./journeys/transport');
 const { devicePassword, howToStore } = require('./lib/secrets');
 
 const arg = (name, fallback = null) => {
@@ -60,6 +61,7 @@ const main = async () => {
   let deps;
   let meta;
   let closers = [];
+  let transport = null;
 
   if (flag('local')) {
     // ---- local: a dev backend and UI, no device. Device checks are recorded as skipped.
@@ -107,8 +109,14 @@ const main = async () => {
     console.log(`device:   ${hostname} (${profile.host}) — ${device.kind}`);
 
     const tunnel = await openTunnel(profile, profile.apiPort);
-    closers.push(() => tunnel.close());
     profile.apiBase = `http://127.0.0.1:${tunnel.port}`;
+    // The API also listens on the LAN: the way round when the tunnel is gone.
+    const directBase = `http://${profile.host}:${profile.apiPort}`;
+    transport = createTransport({
+      profile, directBase, tunnel,
+      openTunnel: () => openTunnel(profile, profile.apiPort),
+    });
+    closers.push(() => transport.close());
 
     const token = await api.mintToken(profile);
     const ui = await openUiBase(profile);
@@ -120,6 +128,7 @@ const main = async () => {
       local: false,
       profile: { ...profile, wifi: { ssid: profile.wifi?.ssid } }, // never the passphrase
       token,
+      directBase,
       out,
       deviceKind: device.kind,
       journeys: defaults(hostname, profile.journeys),
@@ -129,8 +138,7 @@ const main = async () => {
 
     const io = {
       ssh: async (command, opts) => (await sshExec(profile, command, opts)).stdout,
-      gql: (doc, vars) => api.gql(profile, token, doc, vars),
-      gqlWrite: (doc, vars) => api.gqlWrite(profile, token, doc, vars),
+      ...through(transport, api, profile, token),
       waitUntil,
       base: snapshotLib,
     };
@@ -157,12 +165,14 @@ const main = async () => {
     closers.forEach((c) => { try { c(); } catch { /* already gone */ } });
   }
 
+  result.transport = transport?.events ?? [];
   meta = { ...meta, startedAt: new Date(started).toISOString(), durationMs: Date.now() - started };
   if (state.interrupted) result.exitCode = 130;
   // A local run proved nothing about a device, whatever passed in the browser.
   if (meta.local && result.exitCode === 0) result.exitCode = 3;
   const files = report.write(out, result, meta);
-  console.log(`\n${fs.readFileSync(files.md, 'utf8').split('\n').slice(0, 14).join('\n')}`);
+  const md = fs.readFileSync(files.md, 'utf8').trim().split('\n');
+  console.log(`\n${md.slice(0, 14).join('\n')}\n…\n${md.at(-1)}`);
   console.log(`report:   ${files.md}\n          ${files.json}`);
   return result.exitCode;
 };

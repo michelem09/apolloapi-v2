@@ -35,6 +35,30 @@ const duplicateToasts = (toasts, windowMs = 1500) => {
   return out;
 };
 
+// What a person still has to do on the device after the round, said plainly. The
+// last line of the report: whoever reads only that must know whether the device is
+// safe. Empty is the only good answer.
+const leftToDo = (report, meta = {}) => {
+  if (meta.local) return [];
+  const host = meta.host || '<device>';
+  const todo = [];
+  const m = report.miner || {};
+  if (m.off !== true) {
+    todo.push(`the miner may be running: ssh ${host} "sudo systemctl stop apollo-miner && sudo /opt/apolloapi/backend/apollo-miner/miner_stop.sh"`);
+  } else if (m.scriptRan === false && !m.remedied) {
+    todo.push(`run miner_stop.sh by hand (the board was not reset): ssh ${host} "sudo /opt/apolloapi/backend/apollo-miner/miner_stop.sh"`);
+  }
+  const p = report.password || {};
+  if (p.loginOk !== true || p.linuxOk === false || (report.password === null || report.password?.threw)) {
+    todo.push('the original password is NOT confirmed: check the dashboard login and `ssh` with it; if wrong, set it again (Settings → System, or the API with a minted token)');
+  }
+  if ((report.drift || []).length) todo.push(`undo the drift: ${report.drift.join('; ')}`);
+  const restoreErrors = report.restore?.errors || [];
+  if (report.restore?.threw || restoreErrors.length) todo.push(`the restore did not finish cleanly: ${[...restoreErrors].join('; ') || 'it threw'}`);
+  if (report.final?.threw) todo.push('the final check did not run: verify the device by hand');
+  return todo;
+};
+
 const toMarkdown = (report, meta = {}) => {
   const L = [];
   L.push(`# Journey round — ${meta.host || 'device'} — ${meta.startedAt || ''}`);
@@ -84,10 +108,15 @@ const toMarkdown = (report, meta = {}) => {
   for (const n of report.restore?.notes || []) L.push(`- restore: ${n}`);
   if (report.drift.length) L.push(`- DRIFT after restore: ${report.drift.join('; ')}`);
   else L.push('- no drift: services, wifi, ethernet, pools, settings and config files match the start');
+  if ((report.transport || []).length) {
+    L.push('', '### API transport');
+    for (const e of report.transport) L.push(`- ${e.at}: ${e.what}${e.detail ? ` — ${e.detail}` : ''}`);
+  }
   if (report.errors.length) {
     L.push('', '### Errors');
     for (const e of report.errors) L.push(`- ${e}`);
   }
+  L.push('', `LEFT TO DO BY HAND: ${leftToDo(report, meta).join(' | ') || 'nothing'}`);
   return `${L.join('\n')}\n`;
 };
 
@@ -100,4 +129,4 @@ const write = (dir, report, meta) => {
   return { json, md };
 };
 
-module.exports = { toMarkdown, write, duplicateToasts };
+module.exports = { toMarkdown, write, duplicateToasts, leftToDo };

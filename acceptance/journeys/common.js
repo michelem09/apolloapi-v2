@@ -26,6 +26,9 @@ const waitNodeAnswering = async (j, timeoutMs = 300000) => {
   const r = await j.waitUntil(async () => {
     try { return (await nodeNetwork(j)).blocks > 0; } catch (err) {
       if (err.malformed) throw err;
+      // The API itself unreachable (tunnel and LAN both) says nothing about the
+      // node: say so, instead of reporting a node that did not answer.
+      if (err.transport) throw new Error(`the API was unreachable from here (tunnel and LAN both failed): ${err.message} — this is not evidence about the node`);
       return false;
     }
   }, { timeoutMs, everyMs: 10000 });

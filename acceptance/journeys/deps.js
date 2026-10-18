@@ -77,9 +77,19 @@ const buildDeps = ({ profile, io, out, ctxFile, uiBase, original, wifi, spawnImp
       ensureMinerOff({
         state: () => probes.unitState(ssh, 'apollo-miner'),
         stop: async () => {
-          const r = await gqlWrite('mutation { Miner { stop { error { message } } } }');
-          const err = r?.Miner?.stop?.error?.message;
-          if (err) throw new Error(err);
+          // Through the API when it answers (it records that offline was
+          // requested); by systemd when it does not — the miner must be off even
+          // with no API at all. ExecStop still runs, and the journal check after
+          // it confirms miner_stop.sh did.
+          try {
+            const r = await gqlWrite('mutation { Miner { stop { error { message } } } }');
+            const err = r?.Miner?.stop?.error?.message;
+            if (err) throw new Error(err);
+            return null;
+          } catch (apiErr) {
+            await ssh('sudo systemctl stop apollo-miner', { timeoutMs: 150000 });
+            return `Miner.stop through the API failed (${apiErr.message}): stopped with systemctl instead`;
+          }
         },
         waitUntil,
         deviceEpoch: () => ssh('date +%s'),

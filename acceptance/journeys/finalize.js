@@ -41,7 +41,8 @@ const ensureMinerOff = async ({
     off = true;
   } else {
     try {
-      await stop();
+      const how = await stop();
+      if (typeof how === 'string') result.notes.push(how);
     } catch (err) {
       result.errors.push(`Miner.stop: ${err.message}`);
     }
