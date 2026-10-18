@@ -31,7 +31,7 @@ test('padded url and worker are cleaned', async ({ j }) => {
     j.must((await j.page.getByText(/Invalid pool URL/i).count()) === 0, 'the page says "Invalid pool URL"');
   });
   await j.step('save', async () => {
-    await P.saveAndWait(j);
+    await P.saveAndWait(j, { label: 'worker', stillThere: async () => (await P.userInput(j.page).inputValue()) === paddedWorker });
     j.must(!j.toasts().some((t) => /invalid|error|fail/i.test(t)), `an error toast appeared: ${JSON.stringify(j.toasts())}`);
     await j.shot('saved');
   });
@@ -44,7 +44,9 @@ test('padded url and worker are cleaned', async ({ j }) => {
   });
 
   await j.verify('the API holds no spaces', async () => {
-    const [main] = (await poolList(j)).sort((a, b) => a.index - b.index);
+    const mainPool = async () => (await poolList(j)).sort((a, b) => a.index - b.index)[0];
+    await j.waitUntil(async () => (await mainPool())?.username === paddedWorker, { timeoutMs: 30000, everyMs: 1000 });
+    const main = await mainPool();
     j.must(main.url === paddedUrl, `url is ${JSON.stringify(main.url)}`);
     j.must(main.username === paddedWorker, `username is ${JSON.stringify(main.username)}`);
   });

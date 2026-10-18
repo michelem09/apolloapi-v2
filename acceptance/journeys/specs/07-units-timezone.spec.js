@@ -12,26 +12,30 @@ const zoneSelect = (page) =>
 test('temperature unit and time zone', async ({ j }) => {
   await j.step('sign in', () => j.signIn());
 
+  const want = { f: /Fahrenheit/, c: /Celsius/ };
   const startUnit = (await C.currentSettings(j))?.temperatureUnit;
   // The device's own answer when there is one; the page's, when there is not.
   let startZone = j.local ? null : await j.probes.timezone(j.ssh);
   j.note('start', { unit: startUnit, zone: startZone });
 
-  const saveBar = async () => {
+  const saveBar = async (guard) => {
     const since = j.toastCount();
-    await j.save();
+    await j.save(guard);
     await j.settle(since, 12000);
   };
+  const unitGuard = (u) => ({
+    label: `unit ${u}`,
+    stillThere: () => j.page.getByLabel(want[u]).isChecked().catch(() => false),
+  });
 
   try {
     // ---- temperature unit
     const flipped = startUnit === 'f' ? 'c' : 'f';
-    const want = { f: /Fahrenheit/, c: /Celsius/ };
     await j.step(`switch the unit to ${flipped === 'f' ? '°F' : '°C'} and save`, async () => {
       await j.open('/settings/system');
       await j.page.getByLabel(want[flipped]).check({ force: true });
       await j.shot('unit-picked');
-      await saveBar();
+      await saveBar(unitGuard(flipped));
     });
     await j.verify(`the API holds temperatureUnit=${flipped}`, async () => {
       j.must((await C.currentSettings(j)).temperatureUnit === flipped, 'Settings.temperatureUnit did not change');
@@ -47,8 +51,9 @@ test('temperature unit and time zone', async ({ j }) => {
     });
     await j.step('put the unit back', async () => {
       await j.open('/settings/system');
-      await j.page.getByLabel(want[flipped === 'f' ? 'c' : 'f']).check({ force: true });
-      await saveBar();
+      const back = flipped === 'f' ? 'c' : 'f';
+      await j.page.getByLabel(want[back]).check({ force: true });
+      await saveBar(unitGuard(back));
     });
     await j.verify('the API holds the original unit', async () => {
       j.must((await C.currentSettings(j)).temperatureUnit === startUnit, 'the unit did not go back');
@@ -67,11 +72,10 @@ test('temperature unit and time zone', async ({ j }) => {
       target = values.find((v) => v && v !== current && v !== 'UTC') || values.find((v) => v && v !== current);
       await select.selectOption(target);
       await j.shot('zone-picked');
-      const bar = j.page.getByRole('button', { name: /^Save/ }).first();
-      await expect(bar).toBeVisible();
-      await bar.click();
+      await expect(j.page.getByRole('button', { name: /^Save/ }).first()).toBeVisible();
       // The bar has to close by itself; it once stayed lit on an applied change.
-      await expect(bar).toBeHidden({ timeout: 30000 });
+      const closed = await j.save({ label: `time zone ${target}`, stillThere: async () => (await select.inputValue()) === target, timeoutMs: 30000 });
+      j.must(closed, 'the save bar did not close after saving the time zone');
       await j.shot('zone-saved');
     });
     await j.verify('timedatectl follows the choice', async () => {
@@ -83,9 +87,7 @@ test('temperature unit and time zone', async ({ j }) => {
       const select = zoneSelect(j.page);
       if ((await select.inputValue()) !== startZone && startZone) {
         await select.selectOption(startZone);
-        const bar = j.page.getByRole('button', { name: /^Save/ }).first();
-        await bar.click();
-        await expect(bar).toBeHidden({ timeout: 30000 });
+        await j.save({ label: `time zone ${startZone}`, stillThere: async () => (await select.inputValue()) === startZone, timeoutMs: 30000 });
       }
     });
     await j.verify('timedatectl is back on the original zone', async () => {

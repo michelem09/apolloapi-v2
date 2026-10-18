@@ -31,9 +31,9 @@ const setSolo = async (j, on) => {
 // the wording differs between releases ("Settings saved." on 2.1.4, "Starting
 // miner…" on 2.2), and the report lists them for a human to read. What the device
 // did is the caller's to verify; a toast only says the front end got an answer.
-const saveAndWait = async (j) => {
+const saveAndWait = async (j, guard) => {
   const since = j.toastCount();
-  await j.save();
+  await j.save(guard);
   await j.settle(since, 12000);
   return since;
 };

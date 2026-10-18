@@ -74,7 +74,7 @@ more. Run from the Mac; the LAN is not reachable from the cloud.
 
 One command is the whole round. `--only` takes short names (`solo`, `pooled`,
 `padded`, `node-software`, `tor`, `wifi`, `units-timezone`, `password`,
-`stop-during-start`, `early-click`), in file
+`stop-during-start`, `early-click`, `edit-during-refetch`), in file
 order whatever the order typed; a name that matches nothing is an error. `--bail`
 stops at the first failure. Each journey is one spec in `journeys/specs/`.
 
@@ -113,7 +113,11 @@ Regression journeys: `stop-during-start` presses Stop while systemd still says
 script was skipped, the end of the round runs it by hand and the report says so.
 `early-click` holds the settings response for 4 s with a route, clicks a node
 software at once, and expects the pick and the Save bar to survive its arrival;
-nothing is saved. A toast shown twice within 1.5 s is listed under Findings.
+nothing is saved. `edit-during-refetch` saves the unit, holds the settings refetch
+that follows, picks a time zone meanwhile and expects the pick to survive (finding
+"edit lost during refetch" if not). Every Save waits for the bar to close
+(`j.save`), and a guard records "edit lost before save" instead of saving something
+else. A toast shown twice within 1.5 s is listed under Findings.
 
 Offline: `node --test acceptance/test/*.test.js` covers the snapshot/restore logic,
 the ordering of the end-of-round steps when a journey (or the restore) throws, and

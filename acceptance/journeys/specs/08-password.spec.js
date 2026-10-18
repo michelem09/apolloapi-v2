@@ -39,7 +39,7 @@ test('password: change, sign in, change back', async ({ j }) => {
     // The password save gave no toast at all on 2.1.4, so the response is what
     // says it went through; toasts, if any, are only recorded.
     const answered = j.page.waitForResponse((r) => /changePassword/.test(r.request().postData() || ''), { timeout: 30000 });
-    await j.save();
+    await j.save({ label: 'password', stillThere: async () => (await inputs.nth(0).inputValue()) === pw && (await inputs.nth(1).inputValue()) === pw });
     const res = await answered;
     j.must(!(await res.json()).data?.Auth?.changePassword?.error, 'Auth.changePassword answered with an error');
     await j.settle(since, 8000);

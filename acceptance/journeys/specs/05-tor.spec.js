@@ -27,7 +27,7 @@ test('tor on and off', async ({ j }) => {
     j.must(before !== null && before !== after, `the Tor switch did not move (${before} → ${after})`);
     await j.shot(`tor-${label}`);
     const since = j.toastCount();
-    await j.save();
+    await j.save({ label: 'Tor switch', stillThere: async () => (await input.isChecked().catch(() => null)) === after });
     await j.settle(since, 12000);
   };
 

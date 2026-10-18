@@ -4,10 +4,10 @@ const assert = require('node:assert/strict');
 const registry = require('../journeys/registry');
 const report = require('../journeys/report');
 
-test('the journeys are the ten, in order', () => {
+test('the journeys are the eleven, in order', () => {
   assert.deepEqual(registry.list().map((j) => j.name), [
     'solo', 'pooled', 'padded', 'node-software', 'tor', 'wifi', 'units-timezone', 'password',
-    'stop-during-start', 'early-click',
+    'stop-during-start', 'early-click', 'edit-during-refetch',
   ]);
 });
 
@@ -16,7 +16,7 @@ test('--only takes short names, ids and prefixes, keeps file order, and refuses 
   assert.deepEqual(registry.select(all, 'password,solo').map((j) => j.name), ['solo', 'password']);
   assert.deepEqual(registry.select(all, '04-node-software').map((j) => j.name), ['node-software']);
   assert.deepEqual(registry.select(all, 'node').map((j) => j.name), ['node-software']);
-  assert.equal(registry.select(all, null).length, 10);
+  assert.equal(registry.select(all, null).length, 11);
   assert.throws(() => registry.select(all, 'sollo'), /no journey named "sollo"/);
 });
 

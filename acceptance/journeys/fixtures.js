@@ -6,6 +6,7 @@ const api = require('../lib/api');
 const { waitUntil } = require('../lib/wait');
 const { devicePassword } = require('../lib/secrets');
 const probes = require('./probes');
+const { doSave } = require('./save');
 
 // What every journey shares: the way onto the device, the way into the UI, and
 // the recorder that turns a run into a report.
@@ -205,8 +206,29 @@ const test = base.test.extend({
         await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
       },
 
-      save: async () => {
-        await page.getByRole('button', { name: /^Save/ }).first().click();
+      // Save, and wait until the save is DONE: no "Save"/"Saving…" button left and
+      // no "Saving" text. Anything checked on the device, or any next move on the
+      // page, before that races the save and its refetch (a check 0.1 s after the
+      // click read the old value; a time zone picked during the refetch was lost).
+      //
+      // `stillThere` is the guard against the second race: an async function that
+      // says whether the edit is still in the form. If it is not, the edit was lost
+      // before Save and saving would write something else: record the finding and
+      // stop, instead of saving a different thing and failing later for a reason
+      // nobody can see. A bar that never closes is a finding too, not a failure: the
+      // device decides whether the save happened.
+      save: ({ stillThere, label, timeoutMs } = {}) => {
+        const busy = page.getByRole('button', { name: /^Sav(e|ing)/ }).or(page.getByText(/^Saving/));
+        return doSave({
+          click: () => page.getByRole('button', { name: /^Save/ }).first().click(),
+          isBusy: async () => (await busy.count()) > 0 && (await busy.first().isVisible().catch(() => false)),
+          stillThere,
+          label,
+          timeoutMs,
+          waitUntil,
+          findings: rec.findings,
+          stepNo: () => rec.steps.length,
+        });
       },
     };
 

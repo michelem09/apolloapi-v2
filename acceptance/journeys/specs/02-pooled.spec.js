@@ -21,13 +21,14 @@ test('pooled mining with a changed worker', async ({ j }) => {
     await j.shot('pooled-filled');
   });
   await j.step('save', async () => {
-    await P.saveAndWait(j);
+    await P.saveAndWait(j, { label: 'worker', stillThere: async () => (await P.userInput(j.page).inputValue()) === worker });
     await j.shot('saved');
   });
 
   await j.verify('the API holds the worker', async () => {
-    const [main] = (await poolList(j)).sort((a, b) => a.index - b.index);
-    j.must(main?.username === worker, `Pool.list username is ${JSON.stringify(main?.username)}`);
+    const mainPool = async () => (await poolList(j)).sort((a, b) => a.index - b.index)[0];
+    const r = await j.waitUntil(async () => (await mainPool())?.username === worker, { timeoutMs: 30000, everyMs: 1000 });
+    j.must(r.ok, `Pool.list username is ${JSON.stringify((await mainPool())?.username)}`);
   });
   await j.verify('miner_config carries the pool and the worker', async () => {
     const r = await j.waitUntil(async () => {
