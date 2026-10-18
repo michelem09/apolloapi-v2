@@ -136,19 +136,45 @@ const parseShow = (text) =>
 // ran the script — which is what a stop of a unit still `activating` does.
 // `lastSkipped` is about the LAST stop only: that is the one that decides whether
 // the board was left reset.
+// A stop is good when miner_stop.sh printed its closing line during it. A stop
+// does not always log "Stopping apollo-miner": one that lands while the unit is
+// still activating goes straight to the kill, and since the fix the script runs
+// as ExecStopPost and prints BEFORE "Deactivated". So a stop is the span from
+// "Stopping" (or the first sign of one) to "Stopped apollo-miner." / a failure,
+// and the script line counts for the stop it falls in.
 const analyseStops = (text) => {
   let stops = 0;
   let scripts = 0;
-  let pending = false;
+  let lastSkipped = false;
+  let open = false;
+  let seen = false;
+  const close = () => {
+    if (!open) return;
+    stops += 1;
+    if (seen) scripts += 1;
+    lastSkipped = !seen;
+    open = false;
+    seen = false;
+  };
   for (const raw of String(text || '').split('\n')) {
     const line = raw.trim();
-    if (/^Stopping apollo-miner|Deactivated successfully|Failed with result/.test(line) || /apollo-miner\.service: Deactivated/.test(line)) {
-      if (!pending) { stops += 1; pending = true; }
+    if (/^Stopping apollo-miner/.test(line)) {
+      close();
+      open = true;
     } else if (line === 'Stopped' || /^Killing session/.test(line)) {
-      if (pending) { scripts += 1; pending = false; }
+      open = true;
+      seen = true;
+    } else if (/Deactivated successfully|apollo-miner\.service: Deactivated/.test(line)) {
+      open = true;
+    } else if (/^Stopped apollo-miner\b|Failed with result/.test(line)) {
+      open = true;
+      close();
+    } else if (/^Start(ing|ed) apollo-miner/.test(line)) {
+      close();
     }
   }
-  return { stops, scripts, lastSkipped: pending };
+  close();
+  return { stops, scripts, lastSkipped };
 };
 
 // ---------------------------------------------------------------- probes

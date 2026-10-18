@@ -103,5 +103,12 @@ test('journal analysis: a stop is only good if the script printed its closing li
   // the script of an earlier stop does not count for a later one
   assert.equal(p.analyseStops('Stopped\nStopping apollo-miner.').lastSkipped, true);
   assert.deepEqual(p.analyseStops(''), { stops: 0, scripts: 0, lastSkipped: false });
+  // seen on apollo2 with the fixed unit: a stop while activating logs no
+  // "Stopping", and ExecStopPost prints before "Deactivated"
+  const postFix = 'Starting apollo-miner...\nStopped\napollo-miner.service: Killing process 230275 (sleep) with signal SIGKILL.\napollo-miner.service: Deactivated successfully.\nStopped apollo-miner.';
+  assert.deepEqual(p.analyseStops(postFix), { stops: 1, scripts: 1, lastSkipped: false });
+  // and before the fix: the same stop with no script at all
+  const preFix = 'Starting apollo-miner...\napollo-miner.service: Deactivated successfully.\nStopped apollo-miner.';
+  assert.deepEqual(p.analyseStops(preFix), { stops: 1, scripts: 0, lastSkipped: true });
   assert.equal(p.analyseStops('apollo-miner.service: Deactivated successfully.').lastSkipped, true);
 });
