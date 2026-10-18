@@ -60,7 +60,8 @@ green light.
 
 The checks above drive the API and a few UI specs. The journeys drive the UI the
 way a person does — solo on with an address, a pooled worker, padded input, node
-software, Tor, Wi-Fi, units and time zone, the password — and then ask the
+software, Tor, Wi-Fi, units and time zone, the password — plus two regression
+journeys that are meant to FAIL on a build with a known defect — and then ask the
 **device** whether it happened (`systemctl`, the miner's `miner_config` and stat
 file, ckpool's `pool.status`, `bitcoind -version`, `nmcli`, `timedatectl`, the
 shadow file). A toast that says "saved" proves the page got an answer, nothing
@@ -72,7 +73,8 @@ more. Run from the Mac; the LAN is not reachable from the cloud.
     yarn --cwd acceptance journeys --profile profiles/apollo2.json    # same thing
 
 One command is the whole round. `--only` takes short names (`solo`, `pooled`,
-`padded`, `node-software`, `tor`, `wifi`, `units-timezone`, `password`), in file
+`padded`, `node-software`, `tor`, `wifi`, `units-timezone`, `password`,
+`stop-during-start`, `early-click`), in file
 order whatever the order typed; a name that matches nothing is an error. `--bail`
 stops at the first failure. Each journey is one spec in `journeys/specs/`.
 
@@ -104,6 +106,14 @@ order (a toast shown twice, or an empty one, is called out), console errors,
 findings (a save that said nothing), and a screenshot per step, plus a failure
 shot. Exit codes as above: `0` clean, `1` failure or drift, `2` never started,
 `3` something skipped.
+
+Regression journeys: `stop-during-start` presses Stop while systemd still says
+`activating` and reads the journal for miner_stop.sh's closing line (not
+`activating` at the click means *inconclusive*, a skip, never green); if the stop
+script was skipped, the end of the round runs it by hand and the report says so.
+`early-click` holds the settings response for 4 s with a route, clicks a node
+software at once, and expects the pick and the Save bar to survive its arrival;
+nothing is saved. A toast shown twice within 1.5 s is listed under Findings.
 
 Offline: `node --test acceptance/test/*.test.js` covers the snapshot/restore logic,
 the ordering of the end-of-round steps when a journey (or the restore) throws, and

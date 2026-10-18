@@ -71,7 +71,7 @@ const test = base.test.extend({
     let shotNo = 0;
     const at = () => `t+${((Date.now() - started) / 1000).toFixed(1)}s`;
 
-    await page.exposeFunction('__reportToast', (text) => rec.toasts.push({ at: at(), text }));
+    await page.exposeFunction('__reportToast', (text) => rec.toasts.push({ at: at(), ms: Date.now() - started, text }));
     await page.addInitScript(TOAST_OBSERVER);
     page.on('console', (m) => {
       if (m.type() === 'error') rec.consoleErrors.push(m.text().slice(0, 300));

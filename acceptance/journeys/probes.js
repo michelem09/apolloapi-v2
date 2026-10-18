@@ -128,6 +128,29 @@ const parseShow = (text) =>
     })
   );
 
+// What the journal of apollo-miner says about its stops.
+//
+// A stop is "Stopping apollo-miner." (or the unit's "Deactivated"); when systemd
+// runs ExecStop, miner_stop.sh prints its closing "Stopped" on a line of its own
+// (not systemd's "Stopped apollo-miner."). A stop with no such line after it never
+// ran the script — which is what a stop of a unit still `activating` does.
+// `lastSkipped` is about the LAST stop only: that is the one that decides whether
+// the board was left reset.
+const analyseStops = (text) => {
+  let stops = 0;
+  let scripts = 0;
+  let pending = false;
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    if (/^Stopping apollo-miner|Deactivated successfully|Failed with result/.test(line) || /apollo-miner\.service: Deactivated/.test(line)) {
+      if (!pending) { stops += 1; pending = true; }
+    } else if (line === 'Stopped' || /^Killing session/.test(line)) {
+      if (pending) { scripts += 1; pending = false; }
+    }
+  }
+  return { stops, scripts, lastSkipped: pending };
+};
+
 // ---------------------------------------------------------------- probes
 
 const unitState = async (ssh, unit) =>
@@ -204,6 +227,7 @@ module.exports = {
   devicesOfDefaultRoutes,
   parseSystemdTime,
   parseShow,
+  analyseStops,
   unitState,
   readFile,
   poolStatus,

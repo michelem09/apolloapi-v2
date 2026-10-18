@@ -4,9 +4,10 @@ const assert = require('node:assert/strict');
 const registry = require('../journeys/registry');
 const report = require('../journeys/report');
 
-test('the journeys are the eight, in order', () => {
+test('the journeys are the ten, in order', () => {
   assert.deepEqual(registry.list().map((j) => j.name), [
     'solo', 'pooled', 'padded', 'node-software', 'tor', 'wifi', 'units-timezone', 'password',
+    'stop-during-start', 'early-click',
   ]);
 });
 
@@ -15,7 +16,7 @@ test('--only takes short names, ids and prefixes, keeps file order, and refuses 
   assert.deepEqual(registry.select(all, 'password,solo').map((j) => j.name), ['solo', 'password']);
   assert.deepEqual(registry.select(all, '04-node-software').map((j) => j.name), ['node-software']);
   assert.deepEqual(registry.select(all, 'node').map((j) => j.name), ['node-software']);
-  assert.equal(registry.select(all, null).length, 8);
+  assert.equal(registry.select(all, null).length, 10);
   assert.throws(() => registry.select(all, 'sollo'), /no journey named "sollo"/);
 });
 
@@ -41,7 +42,7 @@ const sample = () => ({
 test('a toast shown twice is called out, and so are empty ones and console errors', () => {
   assert.deepEqual(report.duplicateToasts(sample().journeys[0].toasts), [{ text: 'Settings saved.', count: 2 }]);
   const md = report.toMarkdown(sample(), { host: 'apollo2', durationMs: 5000 });
-  assert.match(md, /2x "Settings saved\."/);
+  assert.match(md, /Findings:\n(- .*\n)*- toast shown 2x at the same moment: "Settings saved\."/);
   assert.match(md, /\(empty toast\)/);
   assert.match(md, /Console errors:\n- boom/);
   assert.match(md, /02-pooled-01-saved\.png/);
@@ -70,4 +71,14 @@ test('a device check that did not run is shown as skipped, never as a pass', () 
   const md = report.toMarkdown(r, {});
   assert.match(md, /- – \[device\] miner_config/);
   assert.ok(!/- ✓ \[device\] miner_config/.test(md));
+});
+
+test('the same toast at the same instant is a finding; minutes apart it is the same event again', () => {
+  const at = (ms, text) => ({ at: '', ms, text });
+  assert.deepEqual(report.duplicateToasts([at(1000, 'Saved'), at(1200, 'Saved')]), [{ text: 'Saved', count: 2 }]);
+  assert.deepEqual(report.duplicateToasts([at(1000, 'Saved'), at(61000, 'Saved')]), []);
+  assert.deepEqual(report.duplicateToasts([at(1000, 'A'), at(1200, 'B')]), []);
+  const r = sample();
+  r.journeys[0].toasts = [at(1000, 'Settings saved.'), at(1100, 'Settings saved.')];
+  assert.match(report.toMarkdown(r, {}), /toast shown 2x at the same moment/);
 });

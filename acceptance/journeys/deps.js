@@ -3,7 +3,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const probes = require('./probes');
 const { takeStateSnapshot, restoreState, capture, describeDrift } = require('./state');
-const { ensureMinerOff, ensurePassword, CHECK_JOURNAL } = require('./finalize');
+const { ensureMinerOff, ensurePassword, JOURNAL } = require('./finalize');
 
 const LOGIN = `query($input: AuthLoginInput!) {
   Auth { login(input: $input) { result { accessToken } error { message } } }
@@ -25,7 +25,12 @@ const buildDeps = ({ profile, io, out, ctxFile, uiBase, original, wifi, spawnImp
   const login = async (pw) => !!(await gql(LOGIN, { input: { password: pw } })).Auth.login.result?.accessToken;
 
   return {
-    snapshot: () => takeStateSnapshot({ profile, ssh, gql, base }),
+    snapshot: async () => {
+      // The journal is read from here on: a stop that skipped its script
+      // anywhere in the round is found at the end, whichever journey caused it.
+      state.roundSince = Number(await ssh('date +%s'));
+      return takeStateSnapshot({ profile, ssh, gql, base });
+    },
 
     runJourney: async (journey) => {
       const record = path.join(out, `${journey.id}.json`);
@@ -78,7 +83,9 @@ const buildDeps = ({ profile, io, out, ctxFile, uiBase, original, wifi, spawnImp
         },
         waitUntil,
         deviceEpoch: () => ssh('date +%s'),
-        journalCount: (since) => ssh(CHECK_JOURNAL(since)),
+        journal: (since) => ssh(JOURNAL(since)),
+        roundSince: state.roundSince ?? null,
+        runStopScript: () => ssh('sudo /opt/apolloapi/backend/apollo-miner/miner_stop.sh', { timeoutMs: 120000 }),
       }),
 
     finalCheck: async (snap) => {

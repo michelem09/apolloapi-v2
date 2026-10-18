@@ -92,3 +92,16 @@ test('the stat files asked for are the ones the miner writes, not every apollo-m
   assert.deepEqual(r, { 'michelem09.x-test': true, nope: false });
   assert.equal(seen[0], cmd);
 });
+
+test('journal analysis: a stop is only good if the script printed its closing line after it', () => {
+  const ok = 'Stopping apollo-miner.\nKilling session: miner\nStopped\nStopped apollo-miner.';
+  assert.deepEqual(p.analyseStops(ok), { stops: 1, scripts: 1, lastSkipped: false });
+  const skipped = 'Starting apollo-miner.\nStopping apollo-miner.\nStopped apollo-miner.';
+  assert.deepEqual(p.analyseStops(skipped), { stops: 1, scripts: 0, lastSkipped: true });
+  // an earlier good stop does not excuse the last one skipping it
+  assert.equal(p.analyseStops(ok + '\nStarted apollo-miner.\n' + skipped).lastSkipped, true);
+  // the script of an earlier stop does not count for a later one
+  assert.equal(p.analyseStops('Stopped\nStopping apollo-miner.').lastSkipped, true);
+  assert.deepEqual(p.analyseStops(''), { stops: 0, scripts: 0, lastSkipped: false });
+  assert.equal(p.analyseStops('apollo-miner.service: Deactivated successfully.').lastSkipped, true);
+});

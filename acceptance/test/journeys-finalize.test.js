@@ -6,13 +6,15 @@ const { ensureMinerOff, ensurePassword } = require('../journeys/finalize');
 // A miner as systemd treats it: stopping a unit that is still `activating` does
 // NOT run ExecStop, so miner_stop.sh never logs its closing line.
 const model = ({ start, activatingPolls = 2, stopRefused = false }) => {
-  const m = { s: start, polls: 0, log: [], journal: 0, stopCalls: 0 };
+  const m = { s: start, polls: 0, log: [], lines: [], stopCalls: 0, manual: 0 };
   m.state = async () => m.s;
   m.stop = async () => {
     m.stopCalls += 1;
     m.log.push(`stop while ${m.s}`);
     if (stopRefused) return;
-    if (m.s === 'active') m.journal += 1; // ExecStop ran
+    m.lines.push('Stopping apollo-miner.');
+    if (m.s === 'active') m.lines.push('Stopped'); // ExecStop ran: the script's closing line
+    m.lines.push('Stopped apollo-miner.');
     m.s = 'inactive';
   };
   // Polling advances the model: activating settles into active after a few polls.
@@ -28,7 +30,8 @@ const model = ({ start, activatingPolls = 2, stopRefused = false }) => {
     stop: m.stop,
     waitUntil: m.waitUntil,
     deviceEpoch: async () => 1000,
-    journalCount: async () => m.journal,
+    journal: async () => m.lines.join('\n'),
+    runStopScript: async () => { m.manual += 1; },
   });
   return m;
 };
@@ -49,7 +52,45 @@ test('a stop that lands on an activating unit is caught: the stop script did not
   const r = await ensureMinerOff(m.args());
   assert.equal(m.log[0], 'stop while activating');
   assert.equal(r.scriptRan, false);
+  // The device is left reset anyway: the script is run by hand, and the report says so.
+  assert.equal(m.manual, 1);
+  assert.equal(r.remedied, true);
+  assert.match(r.notes.join(), /ran miner_stop\.sh by hand/);
+  assert.deepEqual(r.errors, []);
+});
+
+test('without a way to run the script by hand, a skipped stop script is an error', async () => {
+  const m = model({ start: 'activating' });
+  m.waitUntil = async (probe) => ((await probe()) ? { ok: true, waitedMs: 0 } : { ok: false, waitedMs: 0 });
+  const args = m.args();
+  delete args.runStopScript;
+  const r = await ensureMinerOff(args);
   assert.match(r.errors.join(), /miner_stop\.sh did not log/);
+});
+
+test('a miner already stopped by a journey that skipped the script is still remedied', async () => {
+  // The defect happened mid-round (journey 9); by the end the unit is inactive.
+  const m = model({ start: 'inactive' });
+  m.lines.push('Stopping apollo-miner.', 'Stopped apollo-miner.');
+  const r = await ensureMinerOff({ ...m.args(), roundSince: 500 });
+  assert.equal(m.stopCalls, 0);
+  assert.equal(m.manual, 1);
+  assert.equal(r.remedied, true);
+});
+
+test('a stop whose script did run is not remedied', async () => {
+  const m = model({ start: 'inactive' });
+  m.lines.push('Stopping apollo-miner.', 'Stopped', 'Stopped apollo-miner.');
+  const r = await ensureMinerOff({ ...m.args(), roundSince: 500 });
+  assert.equal(m.manual, 0);
+  assert.equal(r.scriptRan, true);
+});
+
+test('running the script by hand failing is an error', async () => {
+  const m = model({ start: 'inactive' });
+  m.lines.push('Stopping apollo-miner.', 'Stopped apollo-miner.');
+  const r = await ensureMinerOff({ ...m.args(), runStopScript: async () => { throw new Error('boom'); } });
+  assert.match(r.errors.join(), /by hand failed: boom/);
 });
 
 test('an active miner is stopped and its stop script is confirmed', async () => {

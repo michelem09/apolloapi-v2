@@ -10,11 +10,29 @@ const path = require('path');
 const mark = (ok) => (ok ? 'PASS' : 'FAIL');
 const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
 
-// The same toast text twice in a row is a finding, not noise.
-const duplicateToasts = (toasts) => {
-  const seen = new Map();
-  for (const t of toasts) seen.set(t.text, (seen.get(t.text) || 0) + 1);
-  return [...seen].filter(([, n]) => n > 1).map(([text, n]) => ({ text, count: n }));
+// The same toast text twice at the same moment is a finding, not noise: the app
+// fired the notification twice. `windowMs` is "the same moment"; the same text
+// minutes apart is just the same event happening again. Without timestamps every
+// repeat counts.
+const duplicateToasts = (toasts, windowMs = 1500) => {
+  const groups = new Map();
+  for (const t of toasts) {
+    const list = groups.get(t.text) || [];
+    list.push(t);
+    groups.set(t.text, list);
+  }
+  const out = [];
+  for (const [text, list] of groups) {
+    let best = 1;
+    let run = 1;
+    for (let i = 1; i < list.length; i += 1) {
+      const close = list[i].ms === undefined || list[i - 1].ms === undefined || list[i].ms - list[i - 1].ms <= windowMs;
+      run = close ? run + 1 : 1;
+      best = Math.max(best, run);
+    }
+    if (best > 1) out.push({ text, count: best });
+  }
+  return out;
 };
 
 const toMarkdown = (report, meta = {}) => {
@@ -43,13 +61,13 @@ const toMarkdown = (report, meta = {}) => {
       L.push('', 'Toasts, in order:');
       for (const t of j.toasts) L.push(`- ${t.at}: ${t.text}`);
     }
-    if (dups.length) {
-      L.push('', 'Same toast shown more than once:');
-      for (const d of dups) L.push(`- ${d.count}x "${d.text}"`);
-    }
-    if ((j.findings || []).length) {
+    const findings = [
+      ...(j.findings || []),
+      ...dups.map((d) => `toast shown ${d.count}x at the same moment: "${d.text}"`),
+    ];
+    if (findings.length) {
       L.push('', 'Findings:');
-      for (const f of j.findings) L.push(`- ${f}`);
+      for (const f of findings) L.push(`- ${f}`);
     }
     if ((j.consoleErrors || []).length) {
       L.push('', 'Console errors:');
@@ -59,7 +77,8 @@ const toMarkdown = (report, meta = {}) => {
   }
   L.push('', '## End of round');
   const m = report.miner || {};
-  L.push(`- miner: ${m.off === null || m.off === undefined ? 'n/a (not checked in a local run)' : m.off ? 'OFF' : 'NOT OFF'}${m.was ? ` (was ${m.was})` : ''}; miner_stop.sh ${m.scriptRan === null || m.scriptRan === undefined ? 'n/a' : m.scriptRan ? 'ran' : 'DID NOT RUN'}`);
+  L.push(`- miner: ${m.off === null || m.off === undefined ? 'n/a (not checked in a local run)' : m.off ? 'OFF' : 'NOT OFF'}${m.was ? ` (was ${m.was})` : ''}; miner_stop.sh ${m.scriptRan === null || m.scriptRan === undefined ? 'n/a' : m.scriptRan ? 'ran' : m.remedied ? 'DID NOT RUN on the last stop — run by hand at the end, board reset' : 'DID NOT RUN'}`);
+  for (const n of m.notes || []) L.push(`  - ${n}`);
   const p = report.password || {};
   L.push(`- password: original ${p.loginOk === undefined ? 'not checked in a local run' : p.loginOk ? 'logs in' : 'DOES NOT LOG IN'}; Linux user ${p.linuxOk === null || p.linuxOk === undefined ? 'unchecked' : p.linuxOk ? 'matches' : 'DOES NOT MATCH'}${p.reset ? ' (set again through the API)' : ''}`);
   for (const n of report.restore?.notes || []) L.push(`- restore: ${n}`);
