@@ -1,11 +1,16 @@
 #!/bin/bash
 
-cd /opt/apolloapi/backend/apollo-miner || exit 1
+# Paths are overridable so tests/miner_scripts.test.sh can run the script for real.
+cd "${APOLLO_MINER_DIR:-/opt/apolloapi/backend/apollo-miner}" || exit 1
 
-ARMBIAN_RELEASE="/etc/armbian-release"
+ARMBIAN_RELEASE="${ARMBIAN_RELEASE_FILE:-/etc/armbian-release}"
 if [[ -r "$ARMBIAN_RELEASE" ]]; then
     . "$ARMBIAN_RELEASE"
 fi
+
+# A start means a full shutdown is owed again: miner_stop.sh --if-owed (the unit's
+# ExecStopPost) skips itself when the marker says one already ran since this start.
+rm -f "${MINER_STOPPED_MARKER:-/run/apollo-miner.stopped}"
 
 settings=""
 settings3=""

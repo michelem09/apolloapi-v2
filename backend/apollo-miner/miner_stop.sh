@@ -1,8 +1,21 @@
 #!/bin/bash
 
-cd /opt/apolloapi/backend/apollo-miner || exit 1
+# Paths are overridable so tests/miner_scripts.test.sh can run the script for real.
+MINER_DIR="${APOLLO_MINER_DIR:-/opt/apolloapi/backend/apollo-miner}"
+STOPPED_MARKER="${MINER_STOPPED_MARKER:-/run/apollo-miner.stopped}"
 
-ARMBIAN_RELEASE="/etc/armbian-release"
+# The unit runs this twice per stop: as ExecStop, and as ExecStopPost with
+# --if-owed. ExecStop is skipped when the stop lands while miner_start.sh is still
+# running (the unit is "activating" for ~35s) and after a crash, ExecStopPost never
+# is, so between them every stop gets the full shutdown once: a shutdown that
+# already ran since the last start leaves the marker, and the second call is a no-op.
+if [[ "${1:-}" == "--if-owed" && -e "$STOPPED_MARKER" ]]; then
+    exit 0
+fi
+
+cd "$MINER_DIR" || exit 1
+
+ARMBIAN_RELEASE="${ARMBIAN_RELEASE_FILE:-/etc/armbian-release}"
 if [[ -r "$ARMBIAN_RELEASE" ]]; then
     . "$ARMBIAN_RELEASE"
 fi
@@ -26,7 +39,7 @@ reset_external_hashboards()
 
 stop_apollo3_miner()
 {
-    local pattern='^(\./|/opt/apolloapi/backend/apollo-miner/)futurebit-miner-v3([[:space:]]|$)'
+    local pattern="^(\\./|${MINER_DIR}/)futurebit-miner-v3([[:space:]]|\$)"
     local timeout=60
     local waited=0
 
@@ -76,5 +89,8 @@ esac
 
 # Find and reset external hashboards.
 reset_external_hashboards
+
+# Written last: a stop that died half-way is owed again.
+touch "$STOPPED_MARKER"
 
 echo "Stopped"
