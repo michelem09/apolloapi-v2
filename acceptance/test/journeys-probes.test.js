@@ -80,3 +80,15 @@ test('probes ask the device with the commands they claim to', async () => {
   assert.equal(await p.torEnabled(async () => 'listen=1\nonlynet=onion\n'), true);
   assert.equal(await p.torEnabled(async () => 'listen=1\n# onlynet=onion\n'), false);
 });
+
+test('the stat files asked for are the ones the miner writes, not every apollo-miner* in the directory', async () => {
+  const cmd = p.statFilesCommand();
+  assert.match(cmd, /apollo-miner\.\*/);
+  assert.match(cmd, /apollo-miner-v\*\.\*/);
+  assert.match(cmd, /apollo-miner-3\.json/);
+  assert.ok(!/apollo-miner\*/.test(cmd), 'a bare apollo-miner* would read the helper binaries');
+  const seen = [];
+  const r = await p.statFileMentions(async (c) => { seen.push(c); return '{"pool":"michelem09.x-test"}'; }, ['michelem09.x-test', 'nope']);
+  assert.deepEqual(r, { 'michelem09.x-test': true, nope: false });
+  assert.equal(seen[0], cmd);
+});

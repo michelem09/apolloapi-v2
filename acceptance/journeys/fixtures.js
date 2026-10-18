@@ -119,7 +119,7 @@ const test = base.test.extend({
       // skipped, and the round exits 3.
       verify: async (name, fn) => {
         if (j.local) {
-          rec.steps.push({ name, ok: true, device: true, ms: 0, detail: 'SKIPPED — no device in a local run' });
+          rec.steps.push({ name, ok: null, device: true, ms: 0, detail: 'SKIPPED — no device in a local run' });
           rec.localSkips = (rec.localSkips || 0) + 1;
           return null;
         }

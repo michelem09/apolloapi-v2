@@ -146,7 +146,7 @@ const main = async () => {
     ...deps,
     runJourney: async (j) =>
       state.interrupted
-        ? { id: j.id, name: j.name, ok: false, durationMs: 0, error: 'interrupted before it started' }
+        ? { id: j.id, name: j.name, ok: false, skipped: 'interrupted before it started', durationMs: 0 }
         : deps.runJourney(j),
   };
 
@@ -158,6 +158,7 @@ const main = async () => {
   }
 
   meta = { ...meta, startedAt: new Date(started).toISOString(), durationMs: Date.now() - started };
+  if (state.interrupted) result.exitCode = 130;
   // A local run proved nothing about a device, whatever passed in the browser.
   if (meta.local && result.exitCode === 0) result.exitCode = 3;
   const files = report.write(out, result, meta);

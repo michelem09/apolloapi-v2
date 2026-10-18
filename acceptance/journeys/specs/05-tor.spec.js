@@ -7,6 +7,9 @@ const C = require('../common');
 // advertises a .onion address. Off: the line is gone and so is the address.
 // Bootstrapping takes minutes, so the deadline is explicit and generous.
 test('tor on and off', async ({ j }) => {
+  // Three node restarts (stop alone can take 10 minutes), or Tor's bootstrap on top of
+  // two. If the test timed out, its finally — the undo — would not complete.
+  test.setTimeout(60 * 60 * 1000);
   if ((await C.unit(j, 'node')) !== 'active') {
     j.skip('the node is not running (a device with no blockchain drive keeps it stopped on purpose)');
   }

@@ -63,3 +63,11 @@ test('the report says plainly what the end of the round found', () => {
   assert.match(md2, /DOES NOT LOG IN/);
   assert.match(md2, /DOES NOT MATCH/);
 });
+
+test('a device check that did not run is shown as skipped, never as a pass', () => {
+  const r = sample();
+  r.journeys[0].steps = [{ name: 'miner_config', ok: null, device: true, ms: 0, detail: 'SKIPPED — no device in a local run' }];
+  const md = report.toMarkdown(r, {});
+  assert.match(md, /- – \[device\] miner_config/);
+  assert.ok(!/- ✓ \[device\] miner_config/.test(md));
+});

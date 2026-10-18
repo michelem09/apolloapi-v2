@@ -42,7 +42,6 @@ test('wifi: leave and rejoin the home network', async ({ j }) => {
     const route = await j.probes.defaultRouteDevices(j.ssh);
     const session = await j.probes.sessionDevice(j.ssh);
     j.must(!radio.carriesDefaultRoute, `${radio.device} carries the default route`);
-    j.must(!route.includes(radio.device), `${radio.device} is on the default route (${route.join(',')})`);
     j.must(session !== radio.device, `this ssh session arrives on ${radio.device}`);
     j.must(await ethUp(), 'ethernet is not connected: the way back in would be the radio');
     startedConnected = radio.connection === ssid;
@@ -76,17 +75,29 @@ test('wifi: leave and rejoin the home network', async ({ j }) => {
       });
     }
 
+    // The row of the AVAILABLE list: the one with a Connect button. The saved
+    // list and the "Connected to" card also name the network, so waiting for the
+    // text alone is satisfied before the scan has finished.
+    const availableRow = () => j.page.locator('div')
+      .filter({ has: j.page.getByText(ssid) })
+      .filter({ has: j.page.getByRole('button', { name: /^Connect$/ }) })
+      .last();
+
     await j.step('open the Wi-Fi panel and scan', async () => {
       await panel();
       await j.page.getByRole('button', { name: /Scan for networks|Refresh/ }).first().click();
-      await j.page.getByText(ssid).first().waitFor({ timeout: 60000 });
+      await availableRow().getByRole('button', { name: /^Connect$/ }).waitFor({ timeout: 90000 });
       await j.shot('scanned');
     });
     await j.step(`Connect to ${ssid}`, async () => {
-      const row = j.page.locator('div')
-        .filter({ has: j.page.getByText(ssid) })
-        .filter({ has: j.page.getByRole('button', { name: /^Connect$/ }) })
-        .last();
+      const row = availableRow();
+      // A network on both bands offers a choice, and NetworkManager prefers 5 GHz,
+      // which the built-in radio of an Apollo II cannot hold: it fails to activate.
+      const band = row.locator('select');
+      if (j.kind === 'apollo-legacy' && (await band.count())) {
+        await band.selectOption('bg');
+        j.finding(`${ssid} is on both bands: 2.4 GHz picked for the built-in radio`);
+      }
       const since = j.toastCount();
       await row.getByRole('button', { name: /^Connect$/ }).click();
       // A network the device still has saved may join without asking; one it

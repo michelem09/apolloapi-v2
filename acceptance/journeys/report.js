@@ -36,7 +36,7 @@ const toMarkdown = (report, meta = {}) => {
     if (j.error) L.push(`\n> ${String(j.error).split('\n')[0]}`);
     if (j.skipped) L.push(`\nSkipped: ${j.skipped}`);
     for (const s of j.steps || []) {
-      L.push(`- ${s.ok ? '✓' : '✗'} ${s.device ? '[device] ' : ''}${s.name} (${secs(s.ms || 0)})${s.detail ? ` — ${s.detail}` : ''}`);
+      L.push(`- ${s.ok === null ? '–' : s.ok ? '✓' : '✗'} ${s.device ? '[device] ' : ''}${s.name} (${secs(s.ms || 0)})${s.detail ? ` — ${s.detail}` : ''}`);
     }
     const dups = duplicateToasts(j.toasts || []);
     if ((j.toasts || []).length) {

@@ -10,6 +10,9 @@ const ENUM = { core: { '28.1': 'core_28_1' }, knots: { '29.3': 'knots_29_3' } };
 // running bitcoind reports over RPC, and by the setting the API now holds — the
 // last one is what catches a selection the page silently undid.
 test('node software: core → knots → core', async ({ j }) => {
+  // Three node restarts (stop alone can take 10 minutes), or Tor's bootstrap on top of
+  // two. If the test timed out, its finally — the undo — would not complete.
+  test.setTimeout(60 * 60 * 1000);
   const { core, knots } = j.cfg.nodeLegs;
 
   if (!j.local && (await C.unit(j, 'node')) !== 'active') {

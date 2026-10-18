@@ -147,9 +147,16 @@ const minerArgs = async (ssh) => ({
 
 // The stat file the miner writes carries the pool it is on: look for the strings
 // rather than a schema, which differs between the Apollo II and III files.
+// The USB boards write `apollo-miner.<uid>` / `apollo-miner-v<n>.<uid>` and the
+// Apollo III `apollo-miner-3.json` (see services/miner.js); a bare `apollo-miner*`
+// would also pick up the helper binaries that live in the same directory.
+const STAT_FILES = ['apollo-miner.*', 'apollo-miner-v*.*', 'apollo-miner-3.json'];
+const statFilesCommand = () =>
+  `cd ${PATHS.minerDir} && sudo cat ${STAT_FILES.join(' ')} 2>/dev/null || true`;
+
 // Returns which of `needles` appear in any stat file.
 const statFileMentions = async (ssh, needles) => {
-  const text = await ssh(`sudo cat ${PATHS.minerDir}/apollo-miner*.json 2>/dev/null || true`);
+  const text = await ssh(statFilesCommand());
   return Object.fromEntries(needles.map((n) => [n, text.includes(n)]));
 };
 
@@ -203,6 +210,7 @@ module.exports = {
   bitcoindVersion,
   minerArgs,
   statFileMentions,
+  statFilesCommand,
   nmcliState,
   defaultRouteDevices,
   sessionDevice,

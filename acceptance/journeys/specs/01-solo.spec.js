@@ -31,9 +31,15 @@ test('solo mining with an address', async ({ j }) => {
     const ms = await waitUnit(j, 'ckpool', true, 180000);
     return `active after ${Math.round(ms / 1000)} s`;
   });
-  await j.verify('ckpool.conf carries the address', async () => {
+  await j.verify('the address is what the device mines to', async () => {
+    // ckpool.conf, or the miner's user name (solo pays to the user it is given).
     const conf = await j.probes.readFile(j.ssh, j.probes.PATHS.ckpoolConf);
-    j.must(conf.includes(soloAddress), 'the address is not in ckpool.conf');
+    const args = await j.probes.minerArgs(j.ssh);
+    const where = conf.includes(soloAddress) ? 'ckpool.conf'
+      : [args.usb.user, args.iii.user].some((u) => (u || '').startsWith(soloAddress)) ? 'miner_config'
+        : null;
+    j.must(where, 'the address is in neither ckpool.conf nor miner_config');
+    return `found in ${where}`;
   });
   await j.verify('the miner is running', async () => {
     const ms = await waitUnit(j, 'apollo-miner', true, 240000);
