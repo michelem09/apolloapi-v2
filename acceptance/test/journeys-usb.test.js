@@ -1,5 +1,6 @@
-// Offline tier: the usb-miner journey's rules — above all, that the sysfs write
-// can only ever land on the board's own USB device, never on the hub above it.
+// Offline tier: the usb-miner journey's rules — above all, that the driver unbind
+// can only ever land on the board's own USB interface, never on the hub above it,
+// and that `authorized` is never written to 0.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -41,27 +42,43 @@ test('only 0483:5740 is a board; the hub is not', () => {
   assert.ok(!U.isApolloBoard(U.parseIds('')));
 });
 
-test('the write command checks the ids itself when disabling, and only takes a device dir', () => {
-  const off = U.authorizeCommand(DEVICE, 0);
-  assert.match(off, /apollo-miner -p ActiveState.*= active \].*not active.*idVendor.*0483:5740.*\*SLV\*\) ;;.*not SLV.*echo 0 \| sudo -n tee/);
-  assert.doesNotMatch(off, /sn\b.*=.*\$sn.*chosen/);
-  const withSerial = U.authorizeCommand(DEVICE, 0, { serial: '3100' });
-  assert.match(withSerial, /\[ "\$sn" = '3100' \]/);
-  // Syntax of what is sent to the device's shell, refusal messages included.
-  for (const cmd of [off, withSerial, U.authorizeCommand(DEVICE, 1)]) {
-    require('child_process').execFileSync('sh', ['-n', '-c', cmd]);
-  }
+test('authorized can only be enabled; a deauthorize is not expressible', () => {
   const on = U.authorizeCommand(DEVICE, 1);
   assert.match(on, /echo 1 \| sudo -n tee/);
-  assert.doesNotMatch(on, /idVendor/);
-  assert.throws(() => U.authorizeCommand(`${DEVICE}:1.0`, 0), /not a USB device directory/);
-  assert.throws(() => U.authorizeCommand('/sys/devices/x/usb3', 0), /not a USB device directory/);
+  require('child_process').execFileSync('sh', ['-n', '-c', on]);
+  assert.throws(() => U.authorizeCommand(DEVICE, 0), /never writes authorized=0/);
+  assert.throws(() => U.authorizeCommand(`${DEVICE}:1.0`, 1), /not a USB device directory/);
+  assert.throws(() => U.authorizeCommand('/sys/devices/x/usb3', 1), /not a USB device directory/);
   assert.throws(() => U.authorizeCommand(`${DEVICE}'; reboot; '`, 1), /not a USB device directory/);
-  assert.throws(() => U.authorizeCommand(DEVICE, 2), /0 or 1/);
+  // Nothing the journey builds can write a 0.
+  for (const cmd of [on, U.bindCommand('3-1.1:1.0'), U.unbindCommand('3-1.1:1.0', { serial: 'S' })]) {
+    assert.doesNotMatch(cmd, /echo 0 \|/);
+  }
 });
 
-// A fake device: answers the three kinds of command the rig issues.
-const device = ({ iface = IFACE, ids = '0483\n5740', product = 'BCO SLV #310059000850393855313720', failWrite = false, minerState = 'active' } = {}) => {
+test('the unbind command checks, in the shell, everything the JS checked; bind is idempotent', () => {
+  const off = U.unbindCommand('3-1.1:1.0', { serial: '3100' });
+  assert.match(off, /apollo-miner -p ActiveState.*= active \].*not active.*idVendor.*0483:5740.*\*SLV\*\) ;;.*not SLV.*\[ "\$sn" = '3100' \].*is not bound to cdc_acm.*cdc_acm\/unbind/);
+  assert.doesNotMatch(U.unbindCommand('3-1.1:1.0'), /\$sn" =/);
+  const on = U.bindCommand('3-1.1:1.0');
+  assert.match(on, /\[ -e \/sys\/bus\/usb\/drivers\/cdc_acm\/\$i \] && \{ echo bound; exit 0; \}/);
+  assert.match(on, /0483:5740/);
+  // Syntax of what is sent to the device's shell, refusal messages included.
+  for (const cmd of [off, on, U.unbindCommand('3-1.1:1.0'), U.IFACE_SCAN_CMD, U.USB_SCAN_CMD, U.PORT_LIST_CMD, U.MANUAL_RESTORE]) {
+    require('child_process').execFileSync('sh', ['-n', '-c', cmd]);
+  }
+  // Only an interface name goes in: not a device, a hub, a path, shell.
+  for (const bad of ['3-1.1', 'usb3', '3-1.1:1.0; reboot', '../3-1:1.0', '', '3-1.1:1']) {
+    assert.throws(() => U.unbindCommand(bad), /not a USB interface name/, bad);
+    assert.throws(() => U.bindCommand(bad), /not a USB interface name/, bad);
+  }
+  assert.ok(U.isIfaceName('3-1.1:1.0'));
+  assert.ok(U.isIfaceName('12-3.4.5:1.1'));
+});
+
+// A fake device: answers the commands the rig issues.
+const IFNAME = '3-1.1:1.0';
+const device = ({ iface = IFACE, ids = '0483\n5740', product = 'BCO SLV #310059000850393855313720', failWrite = false, minerState = 'active', bound = true } = {}) => {
   const log = [];
   const ssh = async (cmd) => {
     log.push(cmd);
@@ -72,25 +89,45 @@ const device = ({ iface = IFACE, ids = '0483\n5740', product = 'BCO SLV #3100590
     if (/\/product' 2>/.test(cmd)) return product;
     if (/\/serial' 2>/.test(cmd)) return '310059000850393855313720';
     if (/^cat /.test(cmd)) return ids;
-    if (/sudo -n tee/.test(cmd)) {
+    if (/cdc_acm\/unbind/.test(cmd)) {
       if (failWrite) throw new Error('sudo: a password is required');
-      return /echo 0/.test(cmd) ? '0' : '1';
+      return 'unbound';
     }
+    if (/cdc_acm\/bind/.test(cmd)) {
+      if (failWrite) throw new Error('sudo: a password is required');
+      return 'bound';
+    }
+    if (/sudo -n tee/.test(cmd) && /authorized/.test(cmd)) {
+      if (failWrite) throw new Error('sudo: a password is required');
+      return '1';
+    }
+    if (/^test -e .*cdc_acm/.test(cmd)) return bound ? 'yes' : 'no';
     if (/^test -e/.test(cmd)) return 'yes';
     return '';
   };
-  return { ssh, log, wrote: () => log.filter((c) => /sudo -n tee/.test(c)) };
+  return {
+    ssh,
+    log,
+    // Writes that cut a board off, or enable a device (never a bind).
+    wrote: () => log.filter((c) => /cdc_acm\/unbind|\/authorized/.test(c)),
+    unbinds: () => log.filter((c) => /cdc_acm\/unbind/.test(c)),
+    binds: () => log.filter((c) => /cdc_acm\/bind/.test(c)),
+    authorizes: () => log.filter((c) => /sudo -n tee/.test(c) && /\/authorized/.test(c)),
+  };
 };
 const tmpMarker = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'usb-')), U.MARKER);
 
-test('unplug records the marker first, then writes 0 to the device', async () => {
+test('unplug records the marker first, then unbinds cdc_acm from the board interface', async () => {
   const d = device();
   const markerPath = tmpMarker();
   const rig = U.createUsbRig({ ssh: d.ssh, markerPath });
-  assert.equal(await rig.unplug('ttyACM0'), DEVICE);
-  assert.equal(d.wrote().length, 1);
-  assert.match(d.wrote()[0], new RegExp(DEVICE.replace(/[/.]/g, '\\$&')));
-  assert.deepEqual(U.readMarker(fs, markerPath).dir, DEVICE);
+  assert.equal(await rig.unplug('ttyACM0'), IFNAME);
+  assert.equal(d.unbinds().length, 1);
+  assert.match(d.unbinds()[0], /i='3-1\.1:1\.0'/);
+  assert.equal(d.authorizes().length, 0, 'authorized must never be written');
+  const m = U.readMarker(fs, markerPath);
+  assert.equal(m.iface, IFNAME);
+  assert.equal(m.serial, '310059000850393855313720');
   assert.ok(rig.isUnplugged());
 });
 
@@ -100,6 +137,7 @@ test('a path that is not the board writes nothing and leaves no marker (hub, wro
     ['a readlink that lands on the root hub', device({ iface: '/sys/devices/x/xhci/usb3' }), 'ttyACM0'],
     ['an interface whose device is the hub (1a40)', device({ ids: '1a40\n0101' }), 'ttyACM0'],
     ['a board mid-reset, product reads IAP', device({ product: 'BCO IAP #310059000850393855313720' }), 'ttyACM0'],
+    ['an interface that is not bound to cdc_acm', device({ bound: false }), 'ttyACM0'],
     ['a port that is not ttyACM', device(), 'ttyS1'],
     ['a port with shell in it', device(), 'ttyACM0; reboot'],
   ]) {
@@ -111,7 +149,7 @@ test('a path that is not the board writes nothing and leaves no marker (hub, wro
   }
 });
 
-test('a failed write leaves the marker, so the restore still re-enables', async () => {
+test('a failed unbind leaves the marker, so the restore still binds', async () => {
   const d = device({ failWrite: true });
   const markerPath = tmpMarker();
   const rig = U.createUsbRig({ ssh: d.ssh, markerPath });
@@ -119,41 +157,56 @@ test('a failed write leaves the marker, so the restore still re-enables', async 
   assert.ok(rig.isUnplugged());
 });
 
-test('replug writes 1, waits for the port and clears the marker; no marker is a no-op', async () => {
+test('replug binds the interface, waits for the port and clears the marker; no marker is a no-op', async () => {
   const d = device();
   const markerPath = tmpMarker();
   const rig = U.createUsbRig({ ssh: d.ssh, markerPath, waitUntil: async (p) => ({ ok: await p() }) });
   assert.deepEqual(await rig.replug(), { restored: false, notes: [], errors: [] });
-  assert.equal(d.wrote().length, 0);
+  assert.equal(d.binds().length, 0);
   await rig.unplug('ttyACM0');
   const back = await rig.replug();
   assert.ok(back.restored);
   assert.deepEqual(back.errors, []);
-  assert.match(d.wrote()[1], /echo 1/);
+  assert.equal(d.binds().length, 1);
+  assert.match(d.binds()[0], /i='3-1\.1:1\.0'/);
+  assert.equal(d.authorizes().length, 0);
   assert.ok(!rig.isUnplugged());
 });
 
-test('a marker that does not name a device dir is refused, not written to', async () => {
+test('a marker that does not name an interface is refused, nothing is written', async () => {
   const d = device();
   const markerPath = tmpMarker();
-  fs.writeFileSync(markerPath, JSON.stringify({ dir: HUB.replace('3-1', 'usb3'), tty: 'ttyACM0' }));
-  const back = await U.replugFromMarker({ ssh: d.ssh, markerPath });
-  assert.equal(back.restored, false);
-  assert.match(back.errors[0], /not a USB device directory/);
-  assert.equal(d.wrote().length, 0);
+  for (const m of [{ iface: '../../usb3', tty: 'ttyACM0' }, { iface: '3-1.1', tty: 'ttyACM0' }, { dir: '/sys/devices/x/usb3', tty: 'ttyACM0' }]) {
+    fs.writeFileSync(markerPath, JSON.stringify(m));
+    const back = await U.replugFromMarker({ ssh: d.ssh, markerPath });
+    assert.equal(back.restored, false);
+    assert.match(back.errors[0], /not a USB interface or device/);
+  }
+  assert.equal(d.binds().length + d.authorizes().length, 0);
 });
 
-test('a re-authorize that fails keeps the marker and says how to do it by hand', async () => {
+test('a marker of an older run (authorized=0) is still put back, with authorized=1', async () => {
+  const d = device();
   const markerPath = tmpMarker();
   fs.writeFileSync(markerPath, JSON.stringify({ dir: DEVICE, tty: 'ttyACM0' }));
+  const back = await U.replugFromMarker({ ssh: d.ssh, markerPath });
+  assert.ok(back.restored);
+  assert.equal(d.authorizes().length, 1);
+  assert.match(back.notes[0], /authorized again/);
+});
+
+test('a bind that fails keeps the marker and says how to do it by hand', async () => {
+  const markerPath = tmpMarker();
+  fs.writeFileSync(markerPath, JSON.stringify({ iface: IFNAME, tty: 'ttyACM0' }));
   const d = device({ failWrite: true });
   const back = await U.replugFromMarker({ ssh: d.ssh, markerPath });
   assert.equal(back.restored, false);
   assert.match(back.errors[0], /by hand: for d in \/sys\/bus\/usb\/devices/);
+  assert.match(back.errors[0], /cdc_acm\/bind/);
   assert.ok(fs.existsSync(markerPath));
 });
 
-test("the round's restore re-authorizes from the marker when the journey threw", async () => {
+test("the round's restore binds the interface back from the marker when the journey threw", async () => {
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'usb-round-'));
   const d = device();
   const io = {
@@ -166,13 +219,12 @@ test("the round's restore re-authorizes from the marker when the journey threw",
   const deps = buildDeps({ profile: {}, io, out, ctxFile: 'x', uiBase: 'x', original: 'pw', wifi: {} });
   // restoreState needs a real photograph; the part under test is the USB one.
   const snap = { db: {}, confCopied: [], before: { services: { node: 'inactive', ckpool: 'inactive' }, nmcli: { active: [] } } };
-  fs.writeFileSync(U.markerFile(out), JSON.stringify({ dir: DEVICE, tty: 'ttyACM0' }));
+  // No serial: a serial would also ask for the health check, which waits in real time.
+  fs.writeFileSync(U.markerFile(out), JSON.stringify({ iface: IFNAME, tty: 'ttyACM0' }));
   const result = await deps.restore(snap).catch((e) => ({ errors: [e.message], notes: [] }));
-  assert.ok(result.notes.some((n) => /authorized again/.test(n)), JSON.stringify(result));
-  assert.ok(d.wrote().some((c) => /echo 1/.test(c)));
+  assert.ok(result.notes.some((n) => /bound to cdc_acm again/.test(n)), JSON.stringify(result));
+  assert.equal(d.binds().length, 1);
   assert.ok(!fs.existsSync(U.markerFile(out)));
-  // Wired into the round: restore runs after a journey that threw.
-  assert.equal(typeof runRound, 'function');
 });
 
 test('ps output: the miner binary counts, screen and pgrep lines do not', () => {
@@ -400,6 +452,7 @@ test("the shell's own refusal reaches the report", async () => {
     if (/^readlink/.test(cmd)) return IFACE;
     if (/\/product' 2>/.test(cmd)) return 'BCO SLV #1';
     if (/^cat /.test(cmd)) return /serial/.test(cmd) ? '1' : '0483\n5740';
+    if (/^test -e/.test(cmd)) return 'yes';
     throw Object.assign(new Error('Command failed: ssh'), { stderr: "refused: product reads 'BCO IAP #1', not SLV (mid board-reset?)" });
   };
   await assert.rejects(() => U.createUsbRig({ ssh, markerPath }).unplug('ttyACM0'), /refused: product reads 'BCO IAP #1'/);
@@ -523,7 +576,7 @@ test("the round's snapshot enables an orphaned board before photographing, and r
   await assert.rejects(() => failing.snapshot(), /deauthorized and could not be re-enabled.*for d in \/sys\/bus\/usb/s);
 });
 
-test('no deauthorize while apollo-miner is not active (an idle board wedges), in JS and in the shell', async () => {
+test('no unbind while apollo-miner is not active (an idle board wedges), in JS and in the shell', async () => {
   for (const state of ['inactive', 'activating', 'failed', '']) {
     const d = device({ minerState: state });
     const markerPath = tmpMarker();
@@ -531,9 +584,9 @@ test('no deauthorize while apollo-miner is not active (an idle board wedges), in
     assert.equal(d.wrote().length, 0, state);
     assert.ok(!fs.existsSync(markerPath), state);
   }
-  assert.match(U.authorizeCommand(DEVICE, 0), /systemctl show apollo-miner -p ActiveState --value.*= active/);
-  // Enabling is never refused for it: it is how a stuck board comes back.
-  assert.doesNotMatch(U.authorizeCommand(DEVICE, 1), /apollo-miner/);
+  assert.match(U.unbindCommand('3-1.1:1.0'), /systemctl show apollo-miner -p ActiveState --value.*= active/);
+  // Binding is never refused for it: it is how a cut-off board comes back.
+  assert.doesNotMatch(U.bindCommand('3-1.1:1.0'), /apollo-miner/);
 });
 
 test('reemit: a udev add for the board tty, after checking the tty is the board; never writes authorized', async () => {
@@ -570,4 +623,48 @@ test('a failure-time restore error stays in LEFT TO DO BY HAND even if the final
   // and a clean round still says nothing
   const clean = await runRound({ journeys: [], deps: { ...deps, restore: async () => ({ errors: [] }) } });
   assert.deepEqual(report.leftToDo(clean, { host: 'h' }), []);
+});
+
+test('orphans: an interface left without a driver is bound to cdc_acm again, and only the board', async () => {
+  const scan = [
+    '3-1.1:1.0|0483|5740|SER1|02|0',   // the board, unbound: rescued
+    '3-1.1:1.1|0483|5740|SER1|0a|0',   // its data interface: not touched (class 0a)
+    '3-1:1.0|1a40|0101|HUB|09|1',      // the hub
+    '3-2:1.0|0483|5740|SER2|02|1',     // another board, bound: fine
+    '3-3:1.0|10c4|ea60|X|ff|0',        // a stranger without a driver
+  ].join('\n');
+  const parsed = U.parseIfaceScan(scan);
+  assert.deepEqual(U.unboundIn(parsed).map((x) => x.iface), ['3-1.1:1.0']);
+  const log = [];
+  const ssh = async (cmd) => {
+    log.push(cmd);
+    if (cmd === U.IFACE_SCAN_CMD) return scan;
+    if (/cdc_acm\/bind/.test(cmd)) return 'bound';
+    return '';
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usb-unb-'));
+  const healthPath = path.join(dir, 'usb.health');
+  const r = await U.rescueOrphans({ ssh, healthPath });
+  assert.deepEqual(r.errors, []);
+  assert.match(r.notes[0], /3-1\.1:1\.0.*had no driver.*bound to cdc_acm/);
+  const binds = log.filter((c) => /cdc_acm\/bind/.test(c));
+  assert.equal(binds.length, 1);
+  assert.match(binds[0], /i='3-1\.1:1\.0'/);
+  assert.equal(JSON.parse(fs.readFileSync(healthPath, 'utf8')).serial, 'SER1');
+  const bad = await U.rescueOrphans({ ssh: async (cmd) => { if (cmd === U.IFACE_SCAN_CMD) return scan; if (/cdc_acm\/bind/.test(cmd)) throw new Error('sudo: a password is required'); return ''; } });
+  assert.match(bad.errors[0], /could not be bound.*run: for d in/);
+  // Both names of leftover markers are looked for in earlier runs.
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'usb-mk-'));
+  for (const [d, n] of [['a', U.MARKER], ['b', U.LEGACY_MARKER], ['mine', U.MARKER]]) {
+    fs.mkdirSync(path.join(base, d));
+    fs.writeFileSync(path.join(base, d, n), '{}');
+  }
+  assert.deepEqual(U.leftoverMarkers(path.join(base, 'mine')).map((f) => path.basename(path.dirname(f))).sort(), ['a', 'b']);
+});
+
+test('the journey never emits a deauthorize anywhere: no builder in usb.js produces authorized=0', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'journeys', 'usb.js'), 'utf8');
+  const spec = fs.readFileSync(path.join(__dirname, '..', 'journeys', 'specs', '13-usb-miner.spec.js'), 'utf8');
+  assert.doesNotMatch(src, /echo 0 \|/);
+  assert.doesNotMatch(spec, /authorizeCommand|echo 0/);
 });

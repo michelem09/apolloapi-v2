@@ -15,15 +15,22 @@ const U = require('../usb');
 // case where the internal board must keep mining while the USB one comes and goes.
 // The device must carry /var/lib/apollo/ACCEPTANCE_OK like for every journey.
 //
-// The cable is never touched. An unplug is `echo 0 > …/authorized` on the USB
-// DEVICE, over ssh with `sudo -n`, a replug is `echo 1`. The device directory is
-// the PARENT of the interface directory `readlink -f /sys/class/tty/ttyACMn/device`
-// gives, it must be 0483:5740 (checked before the write, and again by the shell
-// that writes), otherwise the journey FAILS without writing anything: one level
-// higher is the hub, which carries the Bluetooth and Home Assistant sticks. What
-// was deauthorized is recorded in <out>/usb.deauthorized BEFORE the write; the
-// journey re-authorizes in a `finally`, and the round's restore does it again from
-// that file if the journey died (journeys/deps.js).
+// The cable is never touched, and `authorized` is never written (that wedged the
+// board, "Unknown board", until a physical replug). An unplug is a driver unbind:
+// `echo 3-1.1:1.0 > /sys/bus/usb/drivers/cdc_acm/unbind` on the board's USB
+// INTERFACE, over ssh with `sudo -n`; the tty and the miner on it are gone in seconds.
+// A replug is the matching `bind`, and the miner mines again ~20-30 s later. The
+// interface name is the last component of `readlink -f /sys/class/tty/ttyACMn/device`;
+// its PARENT device must be 0483:5740 with the chosen board's serial and a product
+// that reads SLV, apollo-miner must be active, and the interface must be bound to
+// cdc_acm right now (checked here, and again by the shell that writes), otherwise the
+// journey FAILS without writing anything: one level higher is the hub, with the
+// Bluetooth and Home Assistant sticks. The interface is recorded in <out>/usb.unplugged
+// BEFORE the unbind; the journey binds it back in a `finally`, and the round's restore
+// does it again from that file if the journey died (journeys/deps.js). A board left
+// unbound (or authorized=0 by an older run) by a killed run is put back at the start
+// of the next round. A plug while the miner is stopped is not an unbind (an idle
+// board wedges when toggled): the tty's udev add event is emitted again.
 //
 // Skips (never fails): the API has no `Miner.boards` ("feature not on this build"),
 // or no USB board is listed active ("no USB miner attached"). A board that is
@@ -34,7 +41,7 @@ const U = require('../usb');
 // 2 unplug -> disconnected within ~15 s, toast, warning indicator, "Active 0/n",
 // Start/Restart disabled on a Solo Node, the unit gone, the internal board
 // untouched; 3 replug -> mining again, one process, one instance; 4 Stop from the UI,
-// a udev add re-emitted while stopped: it does NOT start, Start from the UI: it mines;
+// a udev add event re-emitted while stopped: it does NOT start, Start from the UI: it mines;
 // 5 (--with usb-expiry) 15 minutes unplugged: the board disappears and a Solo Node
 // UI goes back to solo-only without a reload.
 
@@ -82,10 +89,10 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
   const listed = U.usbBoards(first.boards);
   const chosen = listed.find((b) => b.status === 'active');
   if (!chosen) {
-    // A board a killed run left deauthorized is not "no USB miner attached": say so.
-    const orphans = U.orphansIn(U.parseUsbScan(await j.ssh(U.USB_SCAN_CMD)));
-    j.must(orphans.length === 0,
-      `a 0483:5740 board is deauthorized (authorized=0), probably left by a killed run: ${orphans.map((o) => o.serial || o.dir).join(', ')} — run: ${U.MANUAL_REAUTHORIZE}`);
+    // A board a killed run left unplugged is not "no USB miner attached": say so.
+    const orphans = await U.findOrphans(j.ssh);
+    const left = [...orphans.deauthorized.map((o) => `${o.serial || o.dir} (authorized=0)`), ...orphans.unbound.map((o) => `${o.serial || o.iface} (${o.iface} has no driver)`)];
+    j.must(left.length === 0, `a 0483:5740 board was left unplugged, probably by a killed run: ${left.join(', ')} — run: ${U.MANUAL_RESTORE}`);
     j.skip(`no USB miner attached (USB boards listed: ${listed.length ? listed.map((b) => `${b.id} ${b.status}`).join(', ') : 'none'})`);
   }
   const boardId = chosen.id;
@@ -135,7 +142,7 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
     }, { timeoutMs, everyMs });
     return { ok: r.ok, last, waitedMs: r.waitedMs };
   };
-  // The reset cycle of a stop: IAP at once, SLV ~30 s later. Nothing is deauthorized
+  // The reset cycle of a stop: IAP at once, SLV ~30 s later. Nothing is unplugged
   // before the board reads SLV and has been stable for 5 s (`since`: the stop).
   const settled = async (since, minMs) => {
     const r = await U.waitSlvStable({ read: readPort, since, minMs, timeoutMs: 90 * MS });
@@ -278,15 +285,15 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
     await j.verify('the board is in its miner firmware (SLV) and stable', () => settled(Date.now(), 0));
     let at = 0;
     let since = 0;
-    await j.step('unplug: authorized=0 on the USB device', async () => {
+    await j.step('unplug: cdc_acm unbind of the board interface', async () => {
       since = j.toastCount();
       at = Date.now();
       const dir = await rig.unplug(tty, serial);
-      j.note('deauthorized', dir);
+      j.note('unboundInterface', dir);
     });
-    await j.verify('the kernel dropped the port, the device is deauthorized', async () => {
+    await j.verify('the tty is gone: the driver let go of the board', async () => {
       const gone = await j.waitUntil(async () => !(await boardOnBus()), { timeoutMs: 15 * MS, everyMs: 1000 });
-      j.must(gone.ok, `/dev/${tty} is still there 15 s after authorized=0`);
+      j.must(gone.ok, `/dev/${tty} is still there 15 s after the unbind`);
       return `/dev/${tty} gone after ${Math.round(gone.waitedMs / MS)} s`;
     });
     await j.verify('the API lists the board as disconnected, expiring in ~15 minutes', async () => {
@@ -332,10 +339,10 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
     }
 
     // ---------------------------------------------------------------- 3: replug
-    await j.step('replug: authorized=1', async () => {
+    await j.step('replug: cdc_acm bind of the board interface', async () => {
       const back = await rig.replug();
       j.must(back.errors.length === 0, back.errors.join('; '));
-      j.must(back.restored, 'nothing was recorded as deauthorized');
+      j.must(back.restored, 'nothing was recorded as unbound');
     });
     await j.verify('the API: active and mining again within 60 s', async () => {
       const r = await waitBoard((b) => !!b && b.status === 'active' && b.mining, { timeoutMs: 60 * MS, everyMs: 2000 });
@@ -373,11 +380,11 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
       const m = await j.waitUntil(async () => ['inactive', 'failed'].includes(await minerUnit()), { timeoutMs: 120 * MS, everyMs: 3000 });
       j.must(m.ok, `apollo-miner is ${await minerUnit()} after Stop`);
     });
-    // The stop reset the board: IAP now, SLV in ~30 s. Deauthorizing inside that
+    // The stop reset the board: IAP now, SLV in ~30 s. Unplugging inside that
     // window leaves it wedged until it is physically replugged.
     await j.verify('the board finished the reset the stop caused (SLV, stable, ~35 s after the stop)', () => settled(stopAt, 35 * MS));
-    // NOT a deauthorize: toggling `authorized` on an idle board (miner stopped, after
-    // miner_stop's reset) wedges it until a physical replug, a simulation artifact.
+    // NOT an unbind: toggling an idle board (miner stopped, after miner_stop's reset)
+    // wedges it until a physical replug, a simulation artifact.
     // The plug is simulated for udev only: the tty's add event is emitted again.
     await j.step('a plug event while stopped (udev add re-emitted for the board)', async () => {
       await refreshTty();
@@ -482,7 +489,7 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
       });
       await j.step('replug after the expiry', async () => {
         const back = await rig.replug();
-        j.must(back.errors.length === 0 && back.restored, back.errors.join('; ') || 'nothing was recorded as deauthorized');
+        j.must(back.errors.length === 0 && back.restored, back.errors.join('; ') || 'nothing was recorded as unbound');
       });
       await j.verify('the board comes back and mines (the miner was running)', async () => {
         const r = await waitBoard((b) => !!b && b.status === 'active' && b.mining, { timeoutMs: 120 * MS, everyMs: 3000 });
@@ -496,13 +503,13 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
       });
     }
   } finally {
-    // Whatever happened above, the board is authorized again. The round's restore
+    // Whatever happened above, the board is bound again. The round's restore
     // does the same from the marker file if this process did not get here.
     if (!j.local) {
       try {
         const back = await rig.replug();
         if (back.errors.length) j.note('undoFailed', back.errors.join('; '));
-        else if (back.restored) j.note('reauthorizedInFinally', true);
+        else if (back.restored) j.note('reboundInFinally', true);
       } catch (err) {
         j.note('undoFailed', err.message);
       }

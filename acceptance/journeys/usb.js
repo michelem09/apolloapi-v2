@@ -1,15 +1,21 @@
 // Helpers for the usb-miner journey: simulating an unplug without touching the
 // cable, and putting it back.
 //
-// An unplug is simulated by writing 0 to the `authorized` attribute of the USB
-// DEVICE. Getting the device wrong is not a failed test, it is damage:
-// `readlink -f /sys/class/tty/ttyACMn/device` is the INTERFACE directory
-// (…/3-1.1/3-1.1:1.0); the device is its parent (…/3-1.1); one level further up
-// is the HUB (idVendor 1a40), and deauthorizing it drops everything else on it
-// (Bluetooth, the Home Assistant sticks). That happened once, by hand. So the
-// path is derived by a strict rule, the vendor/product is read and checked
-// before anything is written, and the shell command that writes checks them
-// again itself.
+// An unplug is simulated by unbinding the cdc_acm driver from the board's USB
+// INTERFACE (`echo 3-1.1:1.0 > /sys/bus/usb/drivers/cdc_acm/unbind`): the tty and
+// the miner on it vanish in seconds, and `bind` brings them back, with the miner
+// mining again ~20-30 s later. This replaces writing `authorized`, which wedged the
+// board ("Unknown board") until a physical replug, on this hardware, more than once:
+// the journey never writes `authorized` any more.
+//
+// Getting the interface wrong is not a failed test, it is damage, so every step is
+// guarded: the name comes from `readlink -f /sys/class/tty/ttyACMn/device` and must
+// look like `<bus>-<port>:<cfg>.<if>`; the PARENT device must be 0483:5740 (a level
+// higher is the hub, 1a40, with the Bluetooth and Home Assistant sticks); its product
+// must read SLV (not the bootloader), its serial must be the chosen board's,
+// apollo-miner must be active (an idle board wedges when toggled) and the interface
+// must currently be bound to cdc_acm. The shell command that writes checks the same
+// again, at the moment of the write.
 //
 // Everything here is pure or takes its collaborators (`ssh`, `fs`), so the rules
 // are tested with fixture paths (test/journeys-usb.test.js).
@@ -18,10 +24,12 @@ const fs = require('fs');
 const path = require('path');
 
 const BOARD = { vendor: '0483', product: '5740' };
-// The state file the spec writes BEFORE it deauthorizes and the parent reads when
-// it puts the device back (the spec runs in its own process: a file is the only
+// The state file the spec writes BEFORE it unbinds and the parent reads when
+// it puts the board back (the spec runs in its own process: a file is the only
 // shared state). It lives in the run's output directory.
-const MARKER = 'usb.deauthorized';
+const MARKER = 'usb.unplugged';
+// The name of earlier versions (authorized=0): still looked for among old runs.
+const LEGACY_MARKER = 'usb.deauthorized';
 // Written when a board was re-authorized, read by the round's restore.
 const HEALTH = 'usb.health';
 
@@ -65,37 +73,62 @@ const parseIds = (text) => {
 const isApolloBoard = ({ vendor, product } = {}) =>
   String(vendor || '').trim().toLowerCase() === BOARD.vendor && String(product || '').trim().toLowerCase() === BOARD.product;
 
-// What to run by hand when a board was left deauthorized and nothing else will
-// put it back: every 0483:5740 device on the bus, enabled. Names no directory,
-// because the port number changes.
-const MANUAL_REAUTHORIZE =
-  'for d in /sys/bus/usb/devices/*; do [ "$(cat $d/idVendor 2>/dev/null)" = 0483 ] && [ "$(cat $d/idProduct 2>/dev/null)" = 5740 ] && echo 1 | sudo tee $d/authorized; done';
+// What to run by hand when a board was left unplugged by a run (driver unbound, or
+// from an older version deauthorized) and nothing else will put it back: every
+// 0483:5740 device on the bus enabled, every unbound communications interface bound
+// to cdc_acm. Names no directory, because the port number changes.
+const MANUAL_RESTORE =
+  'for d in /sys/bus/usb/devices/*; do [ "$(cat $d/idVendor 2>/dev/null)" = 0483 ] && [ "$(cat $d/idProduct 2>/dev/null)" = 5740 ] || continue; ' +
+  'echo 1 | sudo tee $d/authorized >/dev/null; ' +
+  'for i in $d:*; do [ "$(cat $i/bInterfaceClass 2>/dev/null)" = 02 ] && [ ! -e $i/driver ] && echo ${i##*/} | sudo tee /sys/bus/usb/drivers/cdc_acm/bind; done; done';
 
-// The write. Disabling (value 0) re-checks, in the shell and at the moment of the
-// write, the vendor/product, that the product reads SLV (not the bootloader, not
-// anything else) and, when given, the serial; any mismatch prints why on stderr and
-// writes nothing. Enabling (value 1) checks nothing: it is never destructive, and a
-// deauthorized device must be re-enabled even if its descriptor can no longer be read.
-const authorizeCommand = (dir, value, { serial = null } = {}) => {
+// The journey never deauthorizes. Enabling a device (value 1) is what puts back a
+// board an OLDER run left at authorized=0; it checks nothing, being never destructive.
+const authorizeCommand = (dir, value) => {
   if (!isDeviceDir(dir)) throw new Error(`refusing to write: ${dir} is not a USB device directory`);
-  if (value !== 0 && value !== 1) throw new Error('authorized is 0 or 1');
-  const d = shq(dir);
-  const check = value === 0
-    ? '[ "$(systemctl show apollo-miner -p ActiveState --value 2>/dev/null)" = active ] || { echo "refused: apollo-miner is not active (an idle board wedges when toggled)" >&2; exit 1; }; ' +
-      'v=$(cat "$d/idVendor" 2>/dev/null); p=$(cat "$d/idProduct" 2>/dev/null); pr=$(cat "$d/product" 2>/dev/null); sn=$(cat "$d/serial" 2>/dev/null); ' +
-      `[ "$v:$p" = ${BOARD.vendor}:${BOARD.product} ] || { echo "refused: $d is $v:$p, not ${BOARD.vendor}:${BOARD.product}" >&2; exit 1; }; ` +
-      `case "$pr" in *SLV*) ;; *) { echo "refused: product reads '$pr', not SLV (mid board-reset?)" >&2; exit 1; };; esac; ` +
-      (serial ? `[ "$sn" = ${shq(serial)} ] || { echo "refused: serial is '$sn', not the chosen board" >&2; exit 1; }; ` : '')
-    : '';
-  return `d=${d}; ${check}echo ${value} | sudo -n tee "$d/authorized" >/dev/null && cat "$d/authorized"`;
+  if (value !== 1) throw new Error('the journey never writes authorized=0 (it wedges the board): only 1 is allowed');
+  return `d=${shq(dir)}; echo 1 | sudo -n tee "$d/authorized" >/dev/null && cat "$d/authorized"`;
+};
+
+// An interface name: <bus>-<port[.port…]>:<config>.<interface>.
+const IFACE_NAME_RE = /^[0-9]+-[0-9.]+:[0-9]+\.[0-9]+$/;
+const isIfaceName = (n) => IFACE_NAME_RE.test(String(n || ''));
+const CDC = '/sys/bus/usb/drivers/cdc_acm';
+
+// Unbind cdc_acm from the board's interface. In the shell and at the moment of the
+// write: apollo-miner active, the parent device 0483:5740, product SLV, the chosen
+// serial, the interface bound to cdc_acm now. A mismatch prints why on stderr and
+// writes nothing. Prints `unbound` on success.
+const unbindCommand = (iface, { serial = null } = {}) => {
+  if (!isIfaceName(iface)) throw new Error(`refusing: "${iface}" is not a USB interface name`);
+  return `i=${shq(iface)}; d=$(dirname "$(readlink -f "/sys/bus/usb/devices/$i")"); ` +
+    '[ "$(systemctl show apollo-miner -p ActiveState --value 2>/dev/null)" = active ] || { echo "refused: apollo-miner is not active (an idle board wedges when toggled)" >&2; exit 1; }; ' +
+    'v=$(cat "$d/idVendor" 2>/dev/null); p=$(cat "$d/idProduct" 2>/dev/null); pr=$(cat "$d/product" 2>/dev/null); sn=$(cat "$d/serial" 2>/dev/null); ' +
+    `[ "$v:$p" = ${BOARD.vendor}:${BOARD.product} ] || { echo "refused: the parent of $i is $v:$p, not ${BOARD.vendor}:${BOARD.product}" >&2; exit 1; }; ` +
+    'case "$pr" in *SLV*) ;; *) { echo "refused: product reads \'$pr\', not SLV (mid board-reset?)" >&2; exit 1; };; esac; ' +
+    (serial ? `[ "$sn" = ${shq(serial)} ] || { echo "refused: serial is '$sn', not the chosen board" >&2; exit 1; }; ` : '') +
+    `[ -e ${CDC}/$i ] || { echo "refused: $i is not bound to cdc_acm" >&2; exit 1; }; ` +
+    `echo "$i" | sudo -n tee ${CDC}/unbind >/dev/null; ` +
+    `[ ! -e ${CDC}/$i ] && echo unbound`;
+};
+
+// Bind it back. Idempotent (already bound: nothing to do) and harmless, so it checks
+// only that the interface exists and that its parent is the board. Prints `bound`.
+const bindCommand = (iface) => {
+  if (!isIfaceName(iface)) throw new Error(`refusing: "${iface}" is not a USB interface name`);
+  return `i=${shq(iface)}; [ -e "/sys/bus/usb/devices/$i" ] || { echo "refused: no such interface $i" >&2; exit 1; }; ` +
+    'd=$(dirname "$(readlink -f "/sys/bus/usb/devices/$i")"); ' +
+    `[ "$(cat "$d/idVendor" 2>/dev/null):$(cat "$d/idProduct" 2>/dev/null)" = ${BOARD.vendor}:${BOARD.product} ] || { echo "refused: the parent of $i is not ${BOARD.vendor}:${BOARD.product}" >&2; exit 1; }; ` +
+    `[ -e ${CDC}/$i ] && { echo bound; exit 0; }; ` +
+    `echo "$i" | sudo -n tee ${CDC}/bind >/dev/null; ` +
+    `for n in 1 2 3 4 5; do [ -e ${CDC}/$i ] && { echo bound; exit 0; }; sleep 1; done; exit 1`;
 };
 
 // A board reset (every miner_stop.sh does `apollo-helper -s <port> -r`) makes it
 // re-enumerate at once as "BCO IAP #<serial>" (bootloader) and ~30 s later as
-// "BCO SLV #<serial>" (the miner firmware). Deauthorizing the port inside the IAP
-// window leaves the kernel with cached SLV descriptors and the board wedged
-// ("Unknown board") until it is physically replugged. So: never write 0 while the
-// product reads IAP, and wait for SLV before any simulated unplug.
+// "BCO SLV #<serial>" (the miner firmware). Cutting the board off inside the IAP
+// window leaves it wedged ("Unknown board") until it is physically replugged. So:
+// never while the product reads IAP, and wait for SLV before any simulated unplug.
 const productState = (product) => {
   const p = String(product || '');
   if (/\bIAP\b/.test(p)) return 'IAP';
@@ -183,52 +216,82 @@ const parseUsbScan = (text) =>
   String(text || '').split('\n').map((l) => l.split('|')).filter((f) => f.length >= 5).map((f) => ({
     dir: f[0].trim(), vendor: f[1].trim().toLowerCase(), product: f[2].trim().toLowerCase(), authorized: f[3].trim(), serial: f[4].trim(),
   }));
+// Unbound interfaces: a communications interface (class 02) of a 0483:5740 device
+// with no driver is a board a killed run left unplugged.
+const IFACE_SCAN_CMD =
+  'for i in /sys/bus/usb/devices/*:*; do [ -e "$i" ] || continue; d=$(dirname "$(readlink -f "$i")"); ' +
+  'echo "$(basename "$i")|$(cat "$d/idVendor" 2>/dev/null)|$(cat "$d/idProduct" 2>/dev/null)|$(cat "$d/serial" 2>/dev/null)|$(cat "$i/bInterfaceClass" 2>/dev/null)|$([ -e "$i/driver" ] && echo 1 || echo 0)"; done; true';
+const parseIfaceScan = (text) =>
+  String(text || '').split('\n').map((l) => l.split('|')).filter((f) => f.length >= 6).map((f) => ({
+    iface: f[0].trim(), vendor: f[1].trim().toLowerCase(), product: f[2].trim().toLowerCase(), serial: f[3].trim(), cls: f[4].trim(), bound: f[5].trim() === '1',
+  }));
+const unboundIn = (ifaces) =>
+  ifaces.filter((x) => isApolloBoard(x) && x.cls === '02' && !x.bound && isIfaceName(x.iface));
 const orphansIn = (devices) =>
   devices.filter((d) => isApolloBoard(d) && d.authorized === '0' && isDeviceDir(d.dir));
 
-// Board(s) found deauthorized: authorize them again (harmless) and say so. `markers`
-// are leftover usb.deauthorized files of earlier runs. Returns notes and errors;
-// an error carries the command to run by hand.
+// Boards found cut off by an earlier run: bound / authorized again (harmless), with a
+// note. `markers` are leftover marker files of earlier runs. Returns notes and
+// errors; an error carries the command to run by hand.
 const rescueOrphans = async ({ ssh, markers = [], fsImpl = fs, waitUntil = null, healthPath = null }) => {
   const notes = [];
   const errors = [];
   for (const file of markers) {
     const m = readMarker(fsImpl, file);
     if (!m) continue;
-    const exists = isDeviceDir(m.dir) && (await ssh(`test -d ${shq(m.dir)} && echo yes || echo no`).catch(() => 'no')).trim() === 'yes';
+    const exists = m.iface
+      ? isIfaceName(m.iface) && (await ssh(`test -e ${shq(`/sys/bus/usb/devices/${m.iface}`)} && echo yes || echo no`).catch(() => 'no')).trim() === 'yes'
+      : isDeviceDir(m.dir) && (await ssh(`test -d ${shq(m.dir)} && echo yes || echo no`).catch(() => 'no')).trim() === 'yes';
     if (!exists) {
       fsImpl.rmSync(file, { force: true });
-      notes.push(`usb: leftover marker ${file} named ${m.dir}, which is gone: dropped`);
+      notes.push(`usb: leftover marker ${file} named ${m.iface || m.dir}, which is gone: dropped`);
       continue;
     }
     const r = await replugFromMarker({ ssh, markerPath: file, healthPath, fsImpl, waitUntil });
     notes.push(...r.notes.map((n) => `${n} (leftover of an earlier run, ${file})`));
     errors.push(...r.errors);
   }
-  for (const d of orphansIn(parseUsbScan(await ssh(USB_SCAN_CMD)))) {
+  const ask = async (cmd) => ssh(cmd).catch(() => '');
+  for (const d of orphansIn(parseUsbScan(await ask(USB_SCAN_CMD)))) {
     try {
       const out = await ssh(authorizeCommand(d.dir, 1));
       if (String(out).trim() !== '1') throw new Error(`authorized reads "${String(out).trim()}"`);
-      notes.push(`usb: board ${d.serial || d.dir} was deauthorized (a killed earlier run): authorized it again`);
+      notes.push(`usb: board ${d.serial || d.dir} was deauthorized (an older run): authorized it again`);
       if (healthPath && d.serial) fsImpl.writeFileSync(healthPath, JSON.stringify({ serial: d.serial, since: Math.floor(Date.now() / 1000) }), { mode: 0o600 });
     } catch (err) {
-      errors.push(`usb: board ${d.serial || d.dir} is deauthorized and could not be re-enabled: ${err.message} — run: ${MANUAL_REAUTHORIZE}`);
+      errors.push(`usb: board ${d.serial || d.dir} is deauthorized and could not be re-enabled: ${err.message} — run: ${MANUAL_RESTORE}`);
+    }
+  }
+  for (const x of unboundIn(parseIfaceScan(await ask(IFACE_SCAN_CMD)))) {
+    try {
+      const out = await ssh(bindCommand(x.iface));
+      if (String(out).trim() !== 'bound') throw new Error(`bind answered "${String(out).trim()}"`);
+      notes.push(`usb: interface ${x.iface} of board ${x.serial || '?'} had no driver (a killed earlier run): bound to cdc_acm`);
+      if (healthPath && x.serial) fsImpl.writeFileSync(healthPath, JSON.stringify({ serial: x.serial, since: Math.floor(Date.now() / 1000) }), { mode: 0o600 });
+    } catch (err) {
+      errors.push(`usb: interface ${x.iface} is unbound and could not be bound: ${err.message} — run: ${MANUAL_RESTORE}`);
     }
   }
   return { notes, errors };
 };
 
-// usb.deauthorized files that earlier runs left in their output directories.
+// Marker files that earlier runs left in their output directories.
 const leftoverMarkers = (out, fsImpl = fs) => {
   const parent = path.dirname(out);
   try {
     return fsImpl.readdirSync(parent)
-      .map((d) => path.join(parent, d, MARKER))
-      .filter((f) => path.resolve(f) !== path.resolve(path.join(out, MARKER)) && fsImpl.existsSync(f));
+      .flatMap((d) => [MARKER, LEGACY_MARKER].map((n) => path.join(parent, d, n)))
+      .filter((f) => path.resolve(path.dirname(f)) !== path.resolve(out) && fsImpl.existsSync(f));
   } catch {
     return [];
   }
 };
+
+// Both kinds of leftover, for a journey that is about to skip.
+const findOrphans = async (ssh) => ({
+  deauthorized: orphansIn(parseUsbScan(await ssh(USB_SCAN_CMD))),
+  unbound: unboundIn(parseIfaceScan(await ssh(IFACE_SCAN_CMD))),
+});
 
 // ------------------------------------------------------------ what runs
 
@@ -267,34 +330,42 @@ const isTransient = (err) =>
 const readMarker = (fsImpl, markerPath) => {
   try {
     const m = JSON.parse(fsImpl.readFileSync(markerPath, 'utf8'));
-    return m && typeof m.dir === 'string' ? m : null;
+    return m && (typeof m.iface === 'string' || typeof m.dir === 'string') ? m : null;
   } catch {
     return null;
   }
 };
 
-// Put back what the marker says was deauthorized. Used by the journey's own
-// `finally` and by the round's restore.
+// Put back what the marker says was cut off: an interface to bind (this version) or a
+// device to authorize (an older run). Used by the journey's own `finally` and by the
+// round's restore.
 const replugFromMarker = async ({ ssh, markerPath, healthPath = null, fsImpl = fs, waitUntil = null, tty = null }) => {
   const m = readMarker(fsImpl, markerPath);
   if (!m) return { restored: false, notes: [], errors: [] };
   const notes = [];
   const errors = [];
-  if (!isDeviceDir(m.dir)) {
-    errors.push(`usb: the marker names ${m.dir}, which is not a USB device directory: not touched`);
+  const target = m.iface || m.dir;
+  if (m.iface ? !isIfaceName(m.iface) : !isDeviceDir(m.dir)) {
+    errors.push(`usb: the marker names ${target}, which is not a USB interface or device: not touched`);
     return { restored: false, notes, errors };
   }
   try {
-    const out = await ssh(authorizeCommand(m.dir, 1));
-    if (String(out).trim() !== '1') throw new Error(`authorized reads "${String(out).trim()}" after the write`);
+    if (m.iface) {
+      const out = await ssh(bindCommand(m.iface), { timeoutMs: 30000 });
+      if (String(out).trim() !== 'bound') throw new Error(`bind answered "${String(out).trim()}"`);
+      notes.push(`usb: ${m.iface} bound to cdc_acm again`);
+    } else {
+      const out = await ssh(authorizeCommand(m.dir, 1));
+      if (String(out).trim() !== '1') throw new Error(`authorized reads "${String(out).trim()}" after the write`);
+      notes.push(`usb: ${m.dir} authorized again`);
+    }
     fsImpl.rmSync(markerPath, { force: true });
-    notes.push(`usb: ${m.dir} authorized again`);
     // The round's restore checks the board really came back (verifyHealth).
     if (healthPath && m.serial) {
       fsImpl.writeFileSync(healthPath, JSON.stringify({ serial: m.serial, since: Math.floor(Date.now() / 1000) }), { mode: 0o600 });
     }
   } catch (err) {
-    errors.push(`usb: could not re-authorize ${m.dir}: ${err.message} — do it by hand: ${MANUAL_REAUTHORIZE}`);
+    errors.push(`usb: could not put ${target} back: ${err.message} — do it by hand: ${MANUAL_RESTORE}`);
     return { restored: false, notes, errors };
   }
   // The port may come back under another name: the board is looked up by serial.
@@ -305,7 +376,7 @@ const replugFromMarker = async ({ ssh, markerPath, healthPath = null, fsImpl = f
         return m.serial ? !!portFor(ports, m.serial) : ports.some((p) => p.tty === (tty || m.tty));
       } catch { return false; }
     }, { timeoutMs: 60000, everyMs: 3000 });
-    if (!back.ok) errors.push(`usb: the board did not come back on the bus within 60 s of the re-authorize`);
+    if (!back.ok) errors.push('usb: the board did not come back on the bus within 60 s of the bind');
   }
   return { restored: true, notes, errors };
 };
@@ -352,44 +423,47 @@ const createUsbRig = ({ ssh, markerPath, healthPath = null, fsImpl = fs, waitUnt
   // Where the board really is, and proof that it is the board. Throws, writes nothing.
   const inspect = async (tty, expectSerial = null) => {
     if (!/^ttyACM\d+$/.test(tty)) throw new Error(`"${tty}" is not a ttyACM port`);
-    const iface = (await ssh(`readlink -f /sys/class/tty/${tty}/device`)).trim();
-    const dir = usbDeviceDirOf(iface);
-    if (!dir) throw new Error(`refusing: /sys/class/tty/${tty}/device resolves to ${iface || '(nothing)'}, which is not a USB interface directory — nothing written`);
+    const ifacePath = (await ssh(`readlink -f /sys/class/tty/${tty}/device`)).trim();
+    const dir = usbDeviceDirOf(ifacePath);
+    const iface = ifacePath.split('/').pop();
+    if (!dir || !isIfaceName(iface)) throw new Error(`refusing: /sys/class/tty/${tty}/device resolves to ${ifacePath || '(nothing)'}, which is not a USB interface directory — nothing written`);
     const ids = parseIds(await ssh(`cat ${shq(`${dir}/idVendor`)} ${shq(`${dir}/idProduct`)}`));
     if (!isApolloBoard(ids)) {
-      throw new Error(`refusing: ${dir} is ${ids.vendor || '?'}:${ids.product || '?'}, not a ${BOARD.vendor}:${BOARD.product} board — nothing written`);
+      throw new Error(`refusing: the parent ${dir} is ${ids.vendor || '?'}:${ids.product || '?'}, not a ${BOARD.vendor}:${BOARD.product} board — nothing written`);
     }
     const product = (await ssh(`cat ${shq(`${dir}/product`)} 2>/dev/null || true`)).trim();
     if (productState(product) !== 'SLV') {
-      throw new Error(`refusing: ${dir} reads "${product || '(nothing)'}", not SLV (bootloader or mid board-reset): deauthorizing now wedges the board — nothing written`);
+      throw new Error(`refusing: ${dir} reads "${product || '(nothing)'}", not SLV (bootloader or mid board-reset): cutting it off now wedges the board — nothing written`);
     }
     const serial = (await ssh(`cat ${shq(`${dir}/serial`)} 2>/dev/null || true`)).trim();
     if (expectSerial && serial.toLowerCase() !== String(expectSerial).toLowerCase()) {
       throw new Error(`refusing: ${dir} has serial "${serial}", not the chosen board ${expectSerial} — nothing written`);
     }
+    const bound = (await ssh(`test -e ${shq(`${CDC}/${iface}`)} && echo yes || echo no`)).trim() === 'yes';
+    if (!bound) throw new Error(`refusing: ${iface} is not bound to cdc_acm — nothing to unbind`);
     return { dir, iface, ids, product, serial };
   };
 
-  // Toggling `authorized` on a board whose miner is stopped (idle after miner_stop's
-  // reset) wedges it until a physical replug; with the miner running the same toggle
-  // recovers. So a deauthorize is refused unless apollo-miner is active.
+  // The unplug: unbind cdc_acm from the board's interface. Refused unless apollo-miner
+  // is active: a board that is idle (miner stopped, after miner_stop's reset) wedges
+  // when toggled, while with the miner running the same toggle recovers.
   const unplug = async (tty, expectSerial = null) => {
     const minerState = (await ssh('systemctl show apollo-miner -p ActiveState --value || true')).trim();
     if (minerState !== 'active') {
       throw new Error(`refusing: apollo-miner is ${minerState || 'unknown'}, not active: an idle board wedges when toggled (use reemit for a stopped miner) — nothing written`);
     }
-    const { dir, serial } = await inspect(tty, expectSerial);
+    const { dir, iface, serial } = await inspect(tty, expectSerial);
     // Before the write: a crash right after it must still leave the way back.
-    fsImpl.writeFileSync(markerPath, JSON.stringify({ dir, tty, serial, at: new Date().toISOString() }), { mode: 0o600 });
+    fsImpl.writeFileSync(markerPath, JSON.stringify({ iface, dir, tty, serial, at: new Date().toISOString() }), { mode: 0o600 });
     let out;
     try {
-      out = await ssh(authorizeCommand(dir, 0, { serial: expectSerial }));
+      out = await ssh(unbindCommand(iface, { serial: expectSerial }), { timeoutMs: 30000 });
     } catch (err) {
       // The shell says why it refused on stderr; ssh puts it in the error.
-      throw new Error(`${(err.stderr || err.message || '').toString().trim().split('\n').pop()} (nothing written, or the write failed: marker kept so the restore re-enables)`);
+      throw new Error(`${(err.stderr || err.message || '').toString().trim().split('\n').pop()} (nothing unbound, or the unbind failed: marker kept so the restore binds it back)`);
     }
-    if (String(out).trim() !== '0') throw new Error(`authorized reads "${String(out).trim()}" after the write`);
-    return dir;
+    if (String(out).trim() !== 'unbound') throw new Error(`the unbind answered "${String(out).trim()}"`);
+    return iface;
   };
 
   // A plug seen by udev without touching the device: the add event of the board's
@@ -489,7 +563,16 @@ module.exports = {
   journalCommand,
   wedgedInJournal,
   verifyHealth,
-  MANUAL_REAUTHORIZE,
+  MANUAL_RESTORE,
+  findOrphans,
+  LEGACY_MARKER,
+  IFACE_NAME_RE,
+  isIfaceName,
+  unbindCommand,
+  bindCommand,
+  IFACE_SCAN_CMD,
+  parseIfaceScan,
+  unboundIn,
   USB_SCAN_CMD,
   USB_UNITS_CMD,
   parseUsbScan,

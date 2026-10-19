@@ -90,11 +90,12 @@ than risk it. `--force-wifi` runs it anyway.
 **`usb-miner` is opt-in** too: it needs a USB hashboard physically attached (Solo Node,
 `profiles/solonode.json`, or an Apollo II with a USB board, `profiles/apollo2.json`).
 `--only usb-miner`, or `--with usb-miner`; add `--with usb-expiry` to also leave the board
-unplugged for the 15-minute expiry (~20 minutes more). It simulates the unplug by writing
-`0`/`1` to the USB *device's* `authorized` attribute over ssh (`sudo -n`), never touching
-the cable; the device directory is checked to be `0483:5740` before any write (a level
-higher is the hub), and the board is re-authorized in a `finally` and again by the round's
-restore. It skips, not fails, when the API has no `Miner.boards` or no USB board is listed.
+unplugged for the 15-minute expiry (~20 minutes more). It simulates the unplug by unbinding the `cdc_acm` driver from the board's USB
+*interface* over ssh (`sudo -n`), never touching the cable and never writing `authorized`
+(which wedged the board); the interface is checked to belong to a `0483:5740` device
+(a level higher is the hub) with the chosen serial and an SLV product, and the miner must
+be running. The board is bound back in a `finally` and again by the round's restore; a
+board a killed run left unbound is bound again at the start of the next round. It skips, not fails, when the API has no `Miner.boards` or no USB board is listed.
 The device must carry `ACCEPTANCE_OK` as for every journey.
 
 Needs the same things as the rest of the suite (`ACCEPTANCE_OK` on the device, the
