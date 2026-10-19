@@ -8,6 +8,7 @@ module.exports = gql`
     solo: SoloStatsOutput
     services: StatusOutput
     settings: SettingsUpdateOutput
+    minerBoards: MinerBoardsOutput
   }
 
   type MinerSubscriptionPayload {

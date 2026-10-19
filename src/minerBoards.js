@@ -184,8 +184,17 @@ function loadLogger() {
     // eslint-disable-next-line global-require
     return require('./logger')('minerBoards');
   } catch (e) {
-    // No central logger on this line: stay quiet rather than use console.*.
-    return { warn() {}, debug() {}, info() {}, error() {} };
+    // No central logger on this line: console.* is what the surrounding code uses.
+    const line = (fn) => (fields, msg) => {
+      const err = fields && fields.err;
+      fn(`[minerBoards] ${msg || ''}${err ? `: ${err.message || err}` : ''}`);
+    };
+    return {
+      warn: line(console.warn),
+      error: line(console.error),
+      info() {},
+      debug() {},
+    };
   }
 }
 

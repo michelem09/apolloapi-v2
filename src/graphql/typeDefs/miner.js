@@ -11,10 +11,41 @@ module.exports = gql`
     restart: EmptyOutput! @auth
     stats: MinerStatsOutput!
     online: MinerOnlineOutput!
+    boards: MinerBoardsOutput!
     resetBlockFoundFlag: EmptyOutput! @auth
   }
 
   type EmptyOutput {
+    error: Error
+  }
+
+  # One hashboard (internal or USB) known to the board registry. The id equals
+  # the uuid of its MinerStats entry, so the two join on it.
+  type MinerBoard {
+    id: String!
+    uuid: String
+    serial: String
+    family: String
+    kind: String!
+    port: String
+    status: String!
+    mining: Boolean!
+    since: String
+    lastSeen: String
+    expiresAt: String
+  }
+
+  type MinerBoardsResult {
+    boards: [MinerBoard!]!
+    hasMiner: Boolean!
+    hasUsbMiners: Boolean!
+    usbCount: Int!
+    usbActiveCount: Int!
+    deviceFamily: String!
+  }
+
+  type MinerBoardsOutput {
+    result: MinerBoardsResult
     error: Error
   }
 
