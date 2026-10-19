@@ -472,6 +472,8 @@ test('the Hashboards badge, not the Pools one; transient errors; journal wording
   const text = 'Miner\nHashboards\nActive 1/2\nrows\nPools\nActive 2/2';
   assert.deepEqual(U.hashboardsBadge(text), { active: 1, total: 2 });
   assert.deepEqual(U.hashboardsBadge('Active 0/1'), { active: 0, total: 1 });
+  // A badge of another card ahead of the Hashboards one must not be taken.
+  assert.deepEqual(U.hashboardsBadge('Pools\nActive 2/2\nHashboards\nActive 1/2'), { active: 1, total: 2 });
   assert.equal(U.hashboardsBadge('nothing'), null);
   assert.ok(U.isTransient(new Error('fetch failed')));
   assert.ok(U.isTransient(Object.assign(new Error('x'), { transport: true })));
@@ -490,4 +492,30 @@ test('--with usb-expiry without usb-miner is an error, and is listed', () => {
   assert.doesNotThrow(() => registry.checkOptions(pick(null, 'usb-miner,usb-expiry'), registry.optionsOf('usb-miner,usb-expiry')));
   assert.doesNotThrow(() => registry.checkOptions(pick('solo'), []));
   assert.ok(registry.OPTION_HELP['usb-expiry']);
+});
+
+test("the round's snapshot enables an orphaned board before photographing, and refuses to start if it cannot", async () => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'usb-snap-'));
+  const order = [];
+  const mk = (failWrite) => ({
+    ssh: async (cmd) => {
+      if (cmd === U.USB_SCAN_CMD) return `${DEVICE}|0483|5740|0|SER1`;
+      if (/sudo -n tee/.test(cmd) && /authorized/.test(cmd)) {
+        order.push('write');
+        if (failWrite) throw new Error('sudo: a password is required');
+        return '1';
+      }
+      if (/^date \+%s/.test(cmd)) return '1000';
+      return '';
+    },
+    gql: async () => ({ Pool: { list: { result: { pools: [] } } }, Settings: { list: { result: { settings: [] } } } }),
+    gqlWrite: async () => ({}),
+    waitUntil: async (p) => ({ ok: await p() }),
+    base: { takeSnapshot: async () => { order.push('photo'); return {}; }, restoreSnapshot: async () => [] },
+  });
+  const deps = buildDeps({ profile: {}, io: mk(false), out, ctxFile: 'x', uiBase: 'x', original: 'pw', wifi: {} });
+  await deps.snapshot();
+  assert.deepEqual(order.slice(0, 2), ['write', 'photo']);
+  const failing = buildDeps({ profile: {}, io: mk(true), out, ctxFile: 'x', uiBase: 'x', original: 'pw', wifi: {} });
+  await assert.rejects(() => failing.snapshot(), /deauthorized and could not be re-enabled.*for d in \/sys\/bus\/usb/s);
 });
