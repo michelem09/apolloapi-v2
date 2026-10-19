@@ -78,21 +78,57 @@ check "a stop killed half-way leaves no marker" 0 "$([ -e "$MINER_STOPPED_MARKER
 stop --if-owed
 check "...so --if-owed does it again" 2 "$(resets)"
 
-# 4c. miner_config rewritten during the 35 s wait is the one the boards start with.
-# The sleep stub rewrites it, standing in for a settings save mid-wait.
-printf '#!/bin/bash\n[ -n "${SLEEP_WRITES:-}" ] && printf -- "-user NEW" > "$APOLLO_MINER_DIR/miner_config"\nexit 0\n' > "$tmp/bin/sleep"
-chmod +x "$tmp/bin/sleep"
-touch "$tmp/usb0"
+# 4c. USB boards are apollo-usb-miner@ instances, enqueued with --no-block (the
+# script is apollo-miner's ExecStart; waiting for After=apollo-miner units hangs).
+# The sleep stub logs its argument so the 35 s wait can be asserted per board.
+printf '#!/bin/bash\necho "sleep $*" >> "$STUB_LOG"\nexit 0\n' > "$tmp/bin/sleep"
+printf '#!/bin/bash\necho "systemctl $*" >> "$STUB_LOG"\n' > "$tmp/bin/systemctl"
+printf '#!/bin/bash\necho "setsid $*" >> "$STUB_LOG"\n' > "$tmp/bin/setsid"
+chmod +x "$tmp/bin/"*
+touch "$tmp/ttyACM0" "$tmp/ttyACM1"
+USBS="$tmp/ttyACM0 $tmp/ttyACM1 $tmp/ttyACM9"; rm -f "$tmp/ttyACM9"
 for board in "Solo Node" "Apollo 3" "FutureBit Apollo II"; do
     printf 'BOARD_NAME="%s"\n' "$board" > "$ARMBIAN_RELEASE_FILE"
-    fresh; printf -- '-user OLD' > "$tmp/miner/miner_config"
-    SLEEP_WRITES=1 APOLLO_USB_PORTS="$tmp/usb0" start
-    check "$board: the USB board starts with the miner_config written during the wait" 1 \
-        "$(grep -c "^screen .*-comport $tmp/usb0 .*-user NEW" "$LOG")"
-    check "$board: ...and not with the stale one" 0 "$(grep -c -- '-user OLD' "$LOG")"
+    fresh; APOLLO_USB_PORTS="$USBS" start
+    check "$board: instance for ttyACM0, --no-block" 1 \
+        "$(grep -c '^systemctl start --no-block apollo-usb-miner@ttyACM0.service$' "$LOG")"
+    check "$board: instance for ttyACM1" 1 "$(grep -c '^systemctl start --no-block apollo-usb-miner@ttyACM1.service$' "$LOG")"
+    check "$board: no instance for a port that is not there" 0 "$(grep -c 'ttyACM9' "$LOG")"
+    check "$board: no USB board in screen" 0 "$(grep -c '^screen .*-comport '"$tmp"'/ttyACM' "$LOG")"
+    check "$board: no systemctl without --no-block" 0 "$(grep '^systemctl' "$LOG" | grep -vc -- '--no-block')"
 done
-check "Apollo II: the internal board gets it too" 1 "$(grep -c '^screen .*-comport /dev/ttyS1 .*-user NEW' "$LOG")"
-: > "$ARMBIAN_RELEASE_FILE"; rm -f "$tmp/miner/miner_config"
+# No USB board: no instance at all.
+printf 'BOARD_NAME="Solo Node"\n' > "$ARMBIAN_RELEASE_FILE"
+fresh; APOLLO_USB_PORTS="$tmp/nothing" start
+check "no board: no systemctl" 0 "$(grep -c '^systemctl' "$LOG")"
+
+# Solo Node: no 35 s wait, a placeholder keeps the unit active, stat files still go.
+printf 'BOARD_NAME="Solo Node"\n' > "$ARMBIAN_RELEASE_FILE"
+touch "$tmp/miner/apollo-miner.1234" "$tmp/miner/apollo-miner-v3.json"
+fresh; start
+check "Solo Node: no sleep 35" 0 "$(grep -c '^sleep 35' "$LOG")"
+check "Solo Node: placeholder started" 1 "$(grep -c '^setsid -f sleep infinity$' "$LOG")"
+check "Solo Node: nothing in screen" 0 "$(grep -c '^screen' "$LOG")"
+check "Solo Node: no gpio" 0 "$(grep -c '^gpio' "$LOG")"
+check "Solo Node: old stat files cleared" 0 "$(ls "$tmp/miner" | grep -c '^apollo-miner[.-]')"
+
+# Apollo II: gpio reset, wait, internal board on ttyS1 with the miner_config read
+# after the wait (the sleep stub rewrites it, standing in for a settings save).
+printf 'BOARD_NAME="FutureBit Apollo II"\n' > "$ARMBIAN_RELEASE_FILE"
+printf '#!/bin/bash\necho "sleep $*" >> "$STUB_LOG"\n[ "$1" = 35 ] && printf -- "-user NEW" > "$APOLLO_MINER_DIR/miner_config"\nexit 0\n' > "$tmp/bin/sleep"
+fresh; printf -- '-user OLD' > "$tmp/miner/miner_config"; start
+check "Apollo II: gpio reset" 1 "$(resets)"
+check "Apollo II: waits 35 s" 1 "$(grep -c '^sleep 35' "$LOG")"
+check "Apollo II: internal board on ttyS1 with the new miner_config" 1 "$(grep -c '^screen .*-comport /dev/ttyS1 .*-user NEW' "$LOG")"
+check "Apollo II: no placeholder" 0 "$(grep -c '^setsid' "$LOG")"
+
+# Apollo 3: internal miner unchanged (miner_config3, no wait, no placeholder).
+printf 'BOARD_NAME="Apollo 3"\n' > "$ARMBIAN_RELEASE_FILE"
+fresh; printf -- '-threads 3' > "$tmp/miner/miner_config3"; start
+check "Apollo 3: internal miner in screen" 1 "$(grep -c '^screen -dmS miner ./futurebit-miner-v3 -threads 3$' "$LOG")"
+check "Apollo 3: no gpio" 0 "$(grep -c '^gpio' "$LOG")"
+check "Apollo 3: no placeholder" 0 "$(grep -c '^setsid' "$LOG")"
+: > "$ARMBIAN_RELEASE_FILE"; rm -f "$tmp/miner/miner_config" "$tmp/miner/miner_config3"
 
 # Past the start script: the real sleep is back (step 6 needs the waiting to be real).
 rm -f "$tmp/bin/sleep"
