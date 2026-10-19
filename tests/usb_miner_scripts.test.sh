@@ -83,6 +83,10 @@ done
 RULE="$DIR/backend/udev/99-apollo-usb-miner.rules"
 check "rule: wants the instance for %k" 1 "$(grep -Fc 'ENV{SYSTEMD_WANTS}+="apollo-usb-miner@%k.service"' "$RULE")"
 check "rule: never RUN+=" 0 "$(grep -v '^#' "$RULE" | grep -c 'RUN')"
+# A negative ATTRS{} match is true at the first parent that differs (the USB hub):
+# every board would skip the rule. Seen on the Solo Node.
+check "rule: no negative ATTRS match" 0 "$(grep -v '^#' "$RULE" | grep -c 'ATTRS{[^}]*}!=')"
+check "rule: vendor/product from usb_id" 2 "$(grep -cE '^ENV\{ID_(VENDOR|MODEL)_ID\}!="(0483|5740)", GOTO=' "$RULE")"
 check "rule: IAP excluded" 1 "$(grep -c '^ATTRS{product}=="BCO IAP\*", GOTO=' "$RULE")"
 # Every GOTO has its LABEL, and every non-comment line is a valid rule shape.
 check "rule: GOTOs resolve" 0 "$(grep -o 'GOTO="[^"]*"' "$RULE" | sort -u | sed 's/GOTO=/LABEL=/' | while read -r l; do grep -Fxq "$l" "$RULE" || echo missing; done | wc -l | tr -d ' ')"
