@@ -185,6 +185,9 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
     let r = await read();
     if (!r.tags.some((t) => /^(USB|Internal)$/.test(t))) {
       const open = j.page.getByRole('button', { name: /Show all data/ });
+      // Right after a miner start the page is still loading its stats: the button
+      // shows up (and enables) a few seconds later.
+      await j.waitUntil(async () => (await open.count()) > 0 && open.first().isEnabled(), { timeoutMs: 30000, everyMs: 1000 });
       if (await open.count()) {
         await open.first().click();
         await j.page.waitForTimeout(800);
