@@ -82,7 +82,10 @@ check "...so --if-owed does it again" 2 "$(resets)"
 # script is apollo-miner's ExecStart; waiting for After=apollo-miner units hangs).
 # The sleep stub logs its argument so the 35 s wait can be asserted per board.
 printf '#!/bin/bash\necho "sleep $*" >> "$STUB_LOG"\nexit 0\n' > "$tmp/bin/sleep"
-printf '#!/bin/bash\necho "systemctl $*" >> "$STUB_LOG"\n' > "$tmp/bin/systemctl"
+# UNIT_MISSING=1: `systemctl cat` fails as for a unit file that was never installed.
+printf '#!/bin/bash\necho "systemctl $*" >> "$STUB_LOG"\n[ "$1" = cat ] && [ -n "${UNIT_MISSING:-}" ] && exit 1\nexit 0\n' > "$tmp/bin/systemctl"
+# PGREP_HIT=1: a miner already runs on some port.
+printf '#!/bin/bash\necho "pgrep $*" >> "$STUB_LOG"\n[ -n "${PGREP_HIT:-}" ]\n' > "$tmp/bin/pgrep"
 printf '#!/bin/bash\necho "setsid $*" >> "$STUB_LOG"\n' > "$tmp/bin/setsid"
 chmod +x "$tmp/bin/"*
 touch "$tmp/ttyACM0" "$tmp/ttyACM1"
@@ -95,12 +98,32 @@ for board in "Solo Node" "Apollo 3" "FutureBit Apollo II"; do
     check "$board: instance for ttyACM1" 1 "$(grep -c '^systemctl start --no-block apollo-usb-miner@ttyACM1.service$' "$LOG")"
     check "$board: no instance for a port that is not there" 0 "$(grep -c 'ttyACM9' "$LOG")"
     check "$board: no USB board in screen" 0 "$(grep -c '^screen .*-comport '"$tmp"'/ttyACM' "$LOG")"
-    check "$board: no systemctl without --no-block" 0 "$(grep '^systemctl' "$LOG" | grep -vc -- '--no-block')"
+    check "$board: no systemctl start without --no-block" 0 "$(grep '^systemctl start' "$LOG" | grep -vc -- '--no-block')"
 done
+# Unit file not installed (git deploy): the old way, in screen, same binary choice
+# (the apollo-helper stub answers Apollo-2), and nothing is enqueued.
+for board in "Solo Node" "Apollo 3"; do
+    printf 'BOARD_NAME="%s"\n' "$board" > "$ARMBIAN_RELEASE_FILE"
+    printf -- '-user USB' > "$tmp/miner/miner_config"
+    fresh; UNIT_MISSING=1 APOLLO_USB_PORTS="$USBS" start
+    check "$board, no unit: no instance enqueued" 0 "$(grep -c '^systemctl start' "$LOG")"
+    check "$board, no unit: ttyACM0 in screen with miner_config" 1 \
+        "$(grep -Fc "screen -dmS miner ./futurebit-miner-v2 -comport $tmp/ttyACM0 -ao_mode 1 -user USB" "$LOG")"
+    check "$board, no unit: ttyACM1 in screen" 1 "$(grep -Fc "screen -dmS miner ./futurebit-miner-v2 -comport $tmp/ttyACM1 " "$LOG")"
+    check "$board, no unit: no screen for the port that is not there" 0 "$(grep '^screen' "$LOG" | grep -c ttyACM9)"
+    # A port whose miner already runs is skipped, not started twice.
+    fresh; UNIT_MISSING=1 PGREP_HIT=1 APOLLO_USB_PORTS="$USBS" start
+    check "$board, no unit, miner already there: no screen on a USB port" 0 "$(grep -c '^screen .*-comport '"$tmp"'/ttyACM' "$LOG")"
+    check "$board, no unit, miner already there: no probe of the port" 0 "$(grep -c '^apollo-helper -s '"$tmp"'/ttyACM' "$LOG")"
+done
+rm -f "$tmp/miner/miner_config"
+# With the unit installed the fallback never runs.
+fresh; APOLLO_USB_PORTS="$USBS" start
+check "unit installed: no screen on a USB port" 0 "$(grep -c '^screen .*-comport '"$tmp"'/ttyACM' "$LOG")"
 # No USB board: no instance at all.
 printf 'BOARD_NAME="Solo Node"\n' > "$ARMBIAN_RELEASE_FILE"
 fresh; APOLLO_USB_PORTS="$tmp/nothing" start
-check "no board: no systemctl" 0 "$(grep -c '^systemctl' "$LOG")"
+check "no board: no systemctl start" 0 "$(grep -c '^systemctl start' "$LOG")"
 
 # Solo Node: no 35 s wait, a placeholder keeps the unit active, stat files still go.
 printf 'BOARD_NAME="Solo Node"\n' > "$ARMBIAN_RELEASE_FILE"
@@ -131,7 +154,7 @@ check "Apollo 3: no placeholder" 0 "$(grep -c '^setsid' "$LOG")"
 : > "$ARMBIAN_RELEASE_FILE"; rm -f "$tmp/miner/miner_config" "$tmp/miner/miner_config3"
 
 # Past the start script: the real sleep is back (step 6 needs the waiting to be real).
-rm -f "$tmp/bin/sleep"
+rm -f "$tmp/bin/sleep" "$tmp/bin/pgrep"
 
 # 5. An explicit stop is never skipped by a stale marker (ExecStop always shuts down).
 touch "$MINER_STOPPED_MARKER"; : > "$LOG"

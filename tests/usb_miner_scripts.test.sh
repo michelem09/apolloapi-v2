@@ -26,8 +26,21 @@ printf '#!/bin/bash\necho "screen $*" >> "$STUB_LOG"\n' > "$tmp/bin/screen"
 # The sleep stub logs its argument; SLEEP_REMOVES deletes the port, SLEEP_WRITES
 # rewrites miner_config, standing in for an unplug / a settings save during the settle.
 printf '#!/bin/bash\necho "sleep $*" >> "$STUB_LOG"\n[ -n "${SLEEP_REMOVES:-}" ] && rm -f "$SLEEP_REMOVES"\n[ -n "${SLEEP_WRITES:-}" ] && printf -- "-user NEW" > "$APOLLO_MINER_DIR/miner_config"\nexit 0\n' > "$tmp/bin/sleep"
-# BOARD names what apollo-helper -s prints.
-printf '#!/bin/bash\necho "apollo-helper $*" >> "$STUB_LOG"\ncase "$1" in -s) echo "${BOARD:-}";; esac\n' > "$tmp/miner/apollo-helper"
+# BOARD names what apollo-helper -s prints; BOARD_SEQ is a file of answers, one per
+# probe, consumed first (a board that answers empty while it comes up).
+cat > "$tmp/miner/apollo-helper" <<'EOS'
+#!/bin/bash
+echo "apollo-helper $*" >> "$STUB_LOG"
+if [ "$1" = -s ]; then
+    if [ -n "${BOARD_SEQ:-}" ] && [ -s "$BOARD_SEQ" ]; then
+        head -1 "$BOARD_SEQ"; tail -n +2 "$BOARD_SEQ" > "$BOARD_SEQ.t"; mv "$BOARD_SEQ.t" "$BOARD_SEQ"
+    else
+        echo "${BOARD:-}"
+    fi
+fi
+EOS
+# PGREP_HIT=1: a miner already runs on the port.
+printf '#!/bin/bash\necho "pgrep $*" >> "$STUB_LOG"\n[ -n "${PGREP_HIT:-}" ]\n' > "$tmp/bin/pgrep"
 chmod +x "$tmp/bin/"* "$tmp/miner/apollo-helper"
 cp "$SCRIPTS/usb_miner_run.sh" "$tmp/miner/"
 
@@ -53,6 +66,27 @@ check "unknown board: exit 64" 64 "$rc"
 check "unknown board: no screen" 0 "$(grep -c '^screen' "$LOG")"
 rc=$(BOARD="" run)
 check "empty probe: exit 64" 64 "$rc"
+
+# 3b. A transient empty answer is retried (3 probes, 3 s apart) before the final 64.
+rc=$(BOARD="" run)
+check "empty probe: 3 probes" 3 "$(grep -c '^apollo-helper -s' "$LOG")"
+check "empty probe: waits 3 s between probes" 3 "$(grep -c '^sleep 3$' "$LOG")"
+printf '\n\nApollo-BTC\n' > "$tmp/seq"
+rc=$(BOARD_SEQ="$tmp/seq" run)
+check "late answer: exit 0" 0 "$rc"
+check "late answer: started after 3 probes" 1 "$(grep -Fc "screen -D -m -S miner ./futurebit-miner -comport $PORT" "$LOG")"
+printf '\nApollo-2\n' > "$tmp/seq"
+rc=$(BOARD_SEQ="$tmp/seq" run)
+check "answer on the 2nd probe picks the right binary" 1 "$(grep -Fc "screen -D -m -S miner ./futurebit-miner-v2 -comport $PORT" "$LOG")"
+check "...and stops probing" 2 "$(grep -c '^apollo-helper -s' "$LOG")"
+
+# 3c. A miner already on the port (rollback: an old miner_start.sh started it in
+# screen): exit 0 without probing or starting; the pattern names this port.
+rc=$(PGREP_HIT=1 BOARD="Apollo-BTC" run)
+check "already running: exit 0" 0 "$rc"
+check "already running: no screen" 0 "$(grep -c '^screen' "$LOG")"
+check "already running: no probe" 0 "$(grep -c '^apollo-helper' "$LOG")"
+check "already running: pgrep matches -comport of this port" 1 "$(grep -Fc -- "-comport ${PORT}( |\$)" "$LOG")"
 
 # 4. Binary per board type; the session is named miner, in the foreground.
 for pair in "Apollo-BTC:./futurebit-miner" "RD6:./futurebit-miner" "Apollo-2:./futurebit-miner-v2"; do

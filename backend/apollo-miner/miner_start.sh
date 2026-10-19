@@ -26,20 +26,54 @@ load_settings()
     [[ -r miner_config ]] && settings=$(<miner_config)
 }
 
-# USB boards are no longer started here: each one is an apollo-usb-miner@<port>
-# instance (hotplug starts the same instances from udev). --no-block is mandatory:
-# this script is apollo-miner's ExecStart and the instances are After=apollo-miner,
-# so waiting for them would deadlock. Starting an instance that already runs is a
-# no-op.
+# A miner already drives this port (see usb_miner_run.sh, which yields the same way).
+usb_port_running()
+{
+    pgrep -f "futurebit-miner(-v2)? .*-comport ${1}( |\$)" >/dev/null 2>&1
+}
+
+# The pre-template way, for a git deploy that did not install the unit file
+# (apollo-usb-miner@.service is copied by the installer, not by git pull): without
+# it every systemctl start below fails and the USB boards silently stay off.
+start_usb_board_in_screen()
+{
+    local port="$1"
+    if usb_port_running "$port"; then
+        echo "a miner already runs on $port"
+        return
+    fi
+    local boardType
+    boardType=$(./apollo-helper -s "$port")
+    load_settings
+    if [[ "$boardType" == *"Apollo-BTC"* || "$boardType" == *"RD6"* ]]; then
+        screen -dmS miner ./futurebit-miner -comport "$port" -ao_mode 1 $settings
+    elif [[ "$boardType" == *"Apollo-2"* ]]; then
+        screen -dmS miner ./futurebit-miner-v2 -comport "$port" -ao_mode 1 $settings
+    else
+        echo "unknown USB board on $port"
+    fi
+}
+
+# USB boards are apollo-usb-miner@<port> instances (hotplug starts the same
+# instances from udev). --no-block is mandatory: this script is apollo-miner's
+# ExecStart and the instances are After=apollo-miner, so waiting for them would
+# deadlock. Starting an instance that already runs is a no-op.
 start_external_hashboards()
 {
     # Glob overridable so the test can fake a plugged-in USB board.
     local ports=(${APOLLO_USB_PORTS:-/dev/ttyACM*})
     local port
+    local have_unit=1
+    systemctl cat apollo-usb-miner@.service >/dev/null 2>&1 || have_unit=0
     for port in "${ports[@]}"; do
         [[ -e "$port" ]] || continue
-        systemctl start --no-block "apollo-usb-miner@${port##*/}.service" ||
-            echo "could not enqueue apollo-usb-miner@${port##*/}"
+        if [[ "$have_unit" == 1 ]]; then
+            systemctl start --no-block "apollo-usb-miner@${port##*/}.service" ||
+                echo "could not enqueue apollo-usb-miner@${port##*/}"
+        else
+            echo "apollo-usb-miner@.service is not installed: starting ${port} in screen"
+            start_usb_board_in_screen "$port"
+        fi
     done
 }
 
