@@ -45,9 +45,9 @@ class MinerService {
         await this._setDevStatus('online');
         console.log('Dev miner started - status updated to online');
       } else {
-        // --no-block: miner_start.sh sleeps ~35s waiting for USB boards to
-        // enumerate, and a forking unit blocks systemctl for that whole time.
-        // The board reset and that wait still run in full on the device; we just
+        // --no-block: on an Apollo II miner_start.sh resets the internal board and
+        // sleeps ~35s before starting it, and a forking unit blocks systemctl for
+        // that whole time. The reset and that wait still run in full; we just
         // don't hold the API call open for them. The service monitor reports the
         // miner coming online.
         await transition.run(
