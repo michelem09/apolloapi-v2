@@ -422,7 +422,15 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
     // Mining is judged by the API; when it does not come, the journal says why
     // (apollo-helper "Unknown board", instance exit 64) and goes in the message.
     const mustMine = async (epoch, timeoutMs, what) => {
+      const t0 = Date.now();
       const r = await waitBoard((b) => !!b && b.status === 'active' && b.mining, { timeoutMs, everyMs: 3000 });
+      if (r.ok) {
+        // `mining` can still be true from the stat file the stop left behind (fresh
+        // for 15 s), while the new instance sits in its settle: wait for the process.
+        const expected = await activeUsbCount();
+        const left = Math.max(timeoutMs - (Date.now() - t0), 15 * MS);
+        await j.waitUntil(async () => !U.instanceMismatch({ ...(await running()), expected }), { timeoutMs: left, everyMs: 3000 });
+      }
       if (!r.ok) {
         throw new Error(`${what}: not mining after ${timeoutMs / MS} s (API: ${describe(r.last)}; ${unit()} ${await unitActive()}); journal: ${await journalSince(epoch)}`);
       }
