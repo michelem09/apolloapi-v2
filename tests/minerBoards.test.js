@@ -77,6 +77,26 @@ describe('deriveBoards classification', () => {
   });
 });
 
+describe('deriveBoards serial that differs from the stat uuid', () => {
+  test('the stat file joins the port by comport; no phantom board, not disconnected', () => {
+    const res = run({
+      statEntries: [usbEntry({ file: 'apollo-miner-v2.ABCDEF', uuid: 'ABCDEF' })],
+      ports: [port({ serial: 'SERIAL-XYZ' })],
+    });
+    expect(res.boards).toEqual([
+      expect.objectContaining({ id: 'ABCDEF', kind: 'usb', status: 'active', mining: true, port: '/dev/ttyACM0' }),
+    ]);
+  });
+
+  test('a stat file on another port is not stolen', () => {
+    const res = run({
+      statEntries: [usbEntry({ file: 'apollo-miner-v2.ABCDEF', uuid: 'ABCDEF', comport: '/dev/ttyACM1' })],
+      ports: [port({ serial: 'SERIAL-XYZ' })],
+    });
+    expect(res.boards.map((b) => b.id).sort()).toEqual(['ABCDEF', 'SERIAL-XYZ']);
+  });
+});
+
 describe('deriveBoards lifecycle', () => {
   const present = () => run({ statEntries: [usbEntry()], ports: [port()] });
 
@@ -215,6 +235,8 @@ describe('MinerBoards.refresh', () => {
     fs.mkdirSync(path.join(usbdev, 'if0'), { recursive: true });
     fs.writeFileSync(path.join(usbdev, 'serial'), `${SERIAL}\n`);
     fs.writeFileSync(path.join(usbdev, 'product'), 'BCO SLV #1\n');
+    fs.writeFileSync(path.join(usbdev, 'idVendor'), '0483\n');
+    fs.writeFileSync(path.join(usbdev, 'idProduct'), '5740\n');
     fs.mkdirSync(path.join(dir, 'sys', 'ttyACM0'));
     fs.symlinkSync(path.join(usbdev, 'if0'), path.join(dir, 'sys', 'ttyACM0', 'device'));
     fs.writeFileSync(path.join(dir, 'dev', 'ttyACM0'), '');
@@ -234,6 +256,35 @@ describe('MinerBoards.refresh', () => {
     expect(reg.snapshot()).toMatchObject({ hasMiner: true, deviceFamily: 'solo-node', usbCount: 1 });
     expect(await reg.refresh({ now: now + 1000 })).toBe(false);
     expect(await reg.refresh({ now: now + 2000 })).toBe(false);
+  });
+
+  test('a ttyACM with another vendor/product id (Zigbee stick, Arduino) is not a miner', async () => {
+    const now = Date.now();
+    plug();
+    writeStat(now);
+    const other = path.join(dir, 'sys', 'otherdev');
+    fs.mkdirSync(path.join(other, 'if0'), { recursive: true });
+    fs.writeFileSync(path.join(other, 'serial'), 'ZB-1\n');
+    fs.writeFileSync(path.join(other, 'idVendor'), '10c4\n');
+    fs.writeFileSync(path.join(other, 'idProduct'), 'ea60\n');
+    fs.mkdirSync(path.join(dir, 'sys', 'ttyACM1'));
+    fs.symlinkSync(path.join(other, 'if0'), path.join(dir, 'sys', 'ttyACM1', 'device'));
+    fs.writeFileSync(path.join(dir, 'dev', 'ttyACM1'), '');
+    await reg.refresh({ now });
+    expect(reg.snapshot().boards.map((b) => b.id)).toEqual([SERIAL]);
+    expect(reg.snapshot().usbCount).toBe(1);
+  });
+
+  test('only a non-miner ACM on the Solo Node: no board, no miner', async () => {
+    const other = path.join(dir, 'sys', 'otherdev');
+    fs.mkdirSync(path.join(other, 'if0'), { recursive: true });
+    fs.writeFileSync(path.join(other, 'idVendor'), '10c4\n');
+    fs.writeFileSync(path.join(other, 'idProduct'), 'ea60\n');
+    fs.mkdirSync(path.join(dir, 'sys', 'ttyACM0'));
+    fs.symlinkSync(path.join(other, 'if0'), path.join(dir, 'sys', 'ttyACM0', 'device'));
+    fs.writeFileSync(path.join(dir, 'dev', 'ttyACM0'), '');
+    await reg.refresh();
+    expect(reg.snapshot()).toMatchObject({ boards: [], usbCount: 0, hasMiner: false });
   });
 
   test('mining flip, unplug and expiry each report a change, then settle', async () => {
