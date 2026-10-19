@@ -34,6 +34,8 @@ WorkingDirectory=/opt/apolloapi/backend/apollo-miner
 # so screen is the main process and a miner that exits ends the unit.
 ExecStart=/opt/apolloapi/backend/apollo-miner/usb_miner_run.sh /dev/%I
 Restart=always
+# screen exits 1 when systemd stops it with SIGTERM: a Stop is not a failure.
+SuccessExitStatus=1
 RestartSec=10s
 # 64: not a known board (an Apollo II still in its bootloader, a stranger on the
 # same VID:PID). Retrying would loop; the next add event starts a fresh attempt.
