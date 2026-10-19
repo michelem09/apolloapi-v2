@@ -4,6 +4,7 @@ const { spawn } = require('child_process');
 const probes = require('./probes');
 const { takeStateSnapshot, restoreState, capture, describeDrift } = require('./state');
 const { ensureMinerOff, ensurePassword, JOURNAL } = require('./finalize');
+const usb = require('./usb');
 
 const LOGIN = `query($input: AuthLoginInput!) {
   Auth { login(input: $input) { result { accessToken } error { message } } }
@@ -59,7 +60,15 @@ const buildDeps = ({ profile, io, out, ctxFile, uiBase, original, wifi, spawnImp
       return { ...rec, ok: code === 0 && !!rec.ok && !rec.skipped, skipped: code === 0 ? rec.skipped : null, journeyExit: code };
     },
 
-    restore: (snap) => restoreState({ profile, ssh, gql, gqlWrite, snap, base, waitUntil, wifi }),
+    // A USB board a journey deauthorized comes back FIRST: everything after it
+    // (the API's view of the miner, the final check) assumes it is plugged in.
+    // Runs after a failed journey too, and is a no-op when no marker was left.
+    restore: async (snap) => {
+      const back = await usb.replugFromMarker({ ssh, markerPath: usb.markerFile(out), waitUntil })
+        .catch((err) => ({ notes: [], errors: [`usb: ${err.message}`] }));
+      const rest = await restoreState({ profile, ssh, gql, gqlWrite, snap, base, waitUntil, wifi });
+      return { notes: [...back.notes, ...rest.notes], errors: [...back.errors, ...rest.errors] };
+    },
 
     password: () =>
       ensurePassword({

@@ -1,0 +1,6 @@
+{
+  "host": "192.168.86.96",
+  "user": "futurebit",
+  "apiPort": 5000,
+  "uiPort": 3000
+}

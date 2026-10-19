@@ -34,10 +34,11 @@ const stamp = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
 const main = async () => {
   const all = registry.list();
   if (flag('list')) {
-    all.forEach((j) => console.log(`${j.id}${registry.OPT_IN.has(j.name) ? '  (opt-in: --only wifi or --with wifi)' : ''}`));
+    all.forEach((j) => console.log(`${j.id}${registry.OPT_IN.has(j.name) ? `  (opt-in: --only ${j.name} or --with ${j.name})` : ''}`));
     return 0;
   }
   const journeys = registry.select(all, arg('only'), arg('with'));
+  const options = registry.optionsOf(arg('with'));
   const started = Date.now();
   const out = path.resolve(arg('out', path.join(__dirname, 'journeys', 'out', stamp())));
   fs.mkdirSync(out, { recursive: true });
@@ -76,7 +77,7 @@ const main = async () => {
       const r = await gql(probe, '', `query($input: AuthLoginInput!){ Auth { login(input:$input) { result { accessToken } } } }`, { input: { password } }).catch(() => null);
       token = r?.Auth?.login?.result?.accessToken || '';
     }
-    const ctx = { local: true, profile: probe, token, out, deviceKind: 'apollo-legacy', journeys: defaults('local', {}) };
+    const ctx = { local: true, profile: probe, token, out, deviceKind: 'apollo-legacy', journeys: defaults('local', {}), options };
     const ctxFile = path.join(out, 'context.json');
     fs.writeFileSync(ctxFile, JSON.stringify(ctx));
     deps = localDeps({ ctxFile, uiBase, out, state });
@@ -132,6 +133,7 @@ const main = async () => {
       out,
       deviceKind: device.kind,
       forceWifi: flag('force-wifi'),
+      options,
       journeys: defaults(hostname, profile.journeys),
     };
     const ctxFile = path.join(out, 'context.json');

@@ -4,10 +4,11 @@ const assert = require('node:assert/strict');
 const registry = require('../journeys/registry');
 const report = require('../journeys/report');
 
-test('the journeys are the twelve, in order', () => {
+test('the journeys are the thirteen, in order', () => {
   assert.deepEqual(registry.list().map((j) => j.name), [
     'solo', 'pooled', 'padded', 'node-software', 'tor', 'wifi', 'units-timezone', 'password',
     'stop-during-start', 'early-click', 'edit-during-refetch', 'save-stopped-miner',
+    'usb-miner',
   ]);
 });
 

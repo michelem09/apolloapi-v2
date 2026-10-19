@@ -19,7 +19,14 @@ const list = () =>
 // ARP behaviour, arp_ignore=0) that can cut the ethernet address too, for minutes,
 // and everything after it fails for that reason. It runs when asked for by name
 // (`--only wifi`) or with `--with wifi`.
-const OPT_IN = new Set(['wifi']);
+// usb-miner needs a USB hashboard physically attached and unplugs it (in software)
+// for several minutes.
+const OPT_IN = new Set(['wifi', 'usb-miner']);
+
+// Switches that ride on `--with` but are not journeys: `--with usb-expiry` makes
+// the usb-miner journey also wait out the 15-minute expiry.
+const OPTIONS = new Set(['usb-expiry']);
+const optionsOf = (extra) => names(extra).filter((w) => OPTIONS.has(w));
 
 // Accepts ids ("04-node-software"), short names ("node-software") or a prefix of
 // either ("node"), and refuses a name that matches nothing: a typo that selects
@@ -38,9 +45,9 @@ const select = (all, only, extra = null) => {
   if (only) names(only).forEach((w) => add(match(all, w)));
   else {
     add(all.filter((j) => !OPT_IN.has(j.name)));
-    names(extra).forEach((w) => add(match(all, w)));
+    names(extra).filter((w) => !OPTIONS.has(w)).forEach((w) => add(match(all, w)));
   }
   return all.filter((j) => picked.includes(j));
 };
 
-module.exports = { list, select, OPT_IN };
+module.exports = { list, select, OPT_IN, OPTIONS, optionsOf };

@@ -74,7 +74,7 @@ more. Run from the Mac; the LAN is not reachable from the cloud.
 
 One command is the whole round. `--only` takes short names (`solo`, `pooled`,
 `padded`, `node-software`, `tor`, `wifi`, `units-timezone`, `password`,
-`stop-during-start`, `early-click`, `edit-during-refetch`, `save-stopped-miner`), in file
+`stop-during-start`, `early-click`, `edit-during-refetch`, `save-stopped-miner`, `usb-miner`), in file
 order whatever the order typed; a name that matches nothing is an error. `--bail`
 stops at the first failure. Each journey is one spec in `journeys/specs/`.
 
@@ -86,6 +86,16 @@ and everything after it then fails for that reason. When it does run, it first
 reads the device's addresses and sysctls; on the same subnet without
 `arp_ignore>=1` and `arp_announce=2` it ends *inconclusive* with that reason rather
 than risk it. `--force-wifi` runs it anyway.
+
+**`usb-miner` is opt-in** too: it needs a USB hashboard physically attached (Solo Node,
+`profiles/solonode.json`, or an Apollo II with a USB board, `profiles/apollo2.json`).
+`--only usb-miner`, or `--with usb-miner`; add `--with usb-expiry` to also leave the board
+unplugged for the 15-minute expiry (~20 minutes more). It simulates the unplug by writing
+`0`/`1` to the USB *device's* `authorized` attribute over ssh (`sudo -n`), never touching
+the cable; the device directory is checked to be `0483:5740` before any write (a level
+higher is the hub), and the board is re-authorized in a `finally` and again by the round's
+restore. It skips, not fails, when the API has no `Miner.boards` or no USB board is listed.
+The device must carry `ACCEPTANCE_OK` as for every journey.
 
 Needs the same things as the rest of the suite (`ACCEPTANCE_OK` on the device, the
 device password in the keychain, `yarn --cwd acceptance install`, chromium), plus
