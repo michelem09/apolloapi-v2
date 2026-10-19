@@ -34,7 +34,7 @@ const U = require('../usb');
 // 2 unplug -> disconnected within ~15 s, toast, warning indicator, "Active 0/n",
 // Start/Restart disabled on a Solo Node, the unit gone, the internal board
 // untouched; 3 replug -> mining again, one process, one instance; 4 Stop from the UI,
-// unplug+replug while stopped: it does NOT start, Start from the UI: it mines;
+// a udev add re-emitted while stopped: it does NOT start, Start from the UI: it mines;
 // 5 (--with usb-expiry) 15 minutes unplugged: the board disappears and a Solo Node
 // UI goes back to solo-only without a reload.
 
@@ -376,14 +376,14 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
     // The stop reset the board: IAP now, SLV in ~30 s. Deauthorizing inside that
     // window leaves it wedged until it is physically replugged.
     await j.verify('the board finished the reset the stop caused (SLV, stable, ~35 s after the stop)', () => settled(stopAt, 35 * MS));
-    await j.step('unplug and replug while stopped', async () => {
-      await rig.unplug(tty, serial);
-      const gone = await j.waitUntil(async () => !(await boardOnBus()), { timeoutMs: 15 * MS, everyMs: 1000 });
-      j.must(gone.ok, `/dev/${tty} is still there after authorized=0`);
-      const back = await rig.replug();
-      j.must(back.errors.length === 0 && back.restored, back.errors.join('; ') || 'nothing was recorded as deauthorized');
+    // NOT a deauthorize: toggling `authorized` on an idle board (miner stopped, after
+    // miner_stop's reset) wedges it until a physical replug, a simulation artifact.
+    // The plug is simulated for udev only: the tty's add event is emitted again.
+    await j.step('a plug event while stopped (udev add re-emitted for the board)', async () => {
+      await refreshTty();
+      await rig.reemit(tty, serial);
     });
-    await j.verify('the board is back but does NOT start (Requisite): 45 s with no instance and no process', async () => {
+    await j.verify('the plug event does NOT start the board (Requisite): 45 s with no instance and no process', async () => {
       const t0 = Date.now();
       let reads = 0;
       while (Date.now() - t0 < 45 * MS) {
@@ -392,8 +392,8 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
         // Any USB instance or process, on any port name: none may exist.
         const x = await running();
         const at2 = Math.round((Date.now() - t0) / MS);
-        j.must(x.units.length === 0, `${x.units.join(', ')} became active ${at2} s after the replug`);
-        j.must(x.procs.length === 0, `${x.procs.length} futurebit-miner process(es) on a USB port ${at2} s after the replug`);
+        j.must(x.units.length === 0, `${x.units.join(', ')} became active ${at2} s after the plug event`);
+        j.must(x.procs.length === 0, `${x.procs.length} futurebit-miner process(es) on a USB port ${at2} s after the plug event`);
         await new Promise((r) => setTimeout(r, 3000));
       }
       return `${reads} reads, never active`;

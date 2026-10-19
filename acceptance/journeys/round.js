@@ -15,7 +15,7 @@ const safely = async (fn, label) => {
 };
 
 const runRound = async ({ journeys, deps, bail = false, log = () => {} }) => {
-  const report = { journeys: [], restore: null, password: null, miner: null, final: null, drift: [], errors: [] };
+  const report = { journeys: [], restoreErrorsAfterFailure: [], restore: null, password: null, miner: null, final: null, drift: [], errors: [] };
 
   // If this fails nothing has been touched yet, so it is allowed to throw.
   const snap = await deps.snapshot();
@@ -34,7 +34,12 @@ const runRound = async ({ journeys, deps, bail = false, log = () => {} }) => {
       if (!entry.ok && !entry.skipped) {
         const back = await safely(() => deps.restore(snap), 'restore after failure');
         entry.restoredAfterFailure = back;
-        if (back.errors?.length) report.errors.push(...back.errors);
+        if (back.errors?.length) {
+          report.errors.push(...back.errors);
+          // Not lost when the final restore (a later, clean one) says nothing: a person
+          // still has to act on these (a board that needs a physical replug).
+          report.restoreErrorsAfterFailure.push(...back.errors);
+        }
         if (bail) break;
       }
     }

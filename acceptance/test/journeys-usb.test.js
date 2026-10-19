@@ -43,7 +43,7 @@ test('only 0483:5740 is a board; the hub is not', () => {
 
 test('the write command checks the ids itself when disabling, and only takes a device dir', () => {
   const off = U.authorizeCommand(DEVICE, 0);
-  assert.match(off, /idVendor.*0483:5740.*\*SLV\*\) ;;.*not SLV.*echo 0 \| sudo -n tee/);
+  assert.match(off, /apollo-miner -p ActiveState.*= active \].*not active.*idVendor.*0483:5740.*\*SLV\*\) ;;.*not SLV.*echo 0 \| sudo -n tee/);
   assert.doesNotMatch(off, /sn\b.*=.*\$sn.*chosen/);
   const withSerial = U.authorizeCommand(DEVICE, 0, { serial: '3100' });
   assert.match(withSerial, /\[ "\$sn" = '3100' \]/);
@@ -61,12 +61,14 @@ test('the write command checks the ids itself when disabling, and only takes a d
 });
 
 // A fake device: answers the three kinds of command the rig issues.
-const device = ({ iface = IFACE, ids = '0483\n5740', product = 'BCO SLV #310059000850393855313720', failWrite = false } = {}) => {
+const device = ({ iface = IFACE, ids = '0483\n5740', product = 'BCO SLV #310059000850393855313720', failWrite = false, minerState = 'active' } = {}) => {
   const log = [];
   const ssh = async (cmd) => {
     log.push(cmd);
     if (/^readlink -f/.test(cmd)) return iface;
     if (/^for t in/.test(cmd)) return `ttyACM0|${iface}|310059000850393855313720|${product}`;
+    if (/^systemctl show apollo-miner/.test(cmd)) return minerState;
+    if (/udevadm trigger/.test(cmd)) return '';
     if (/\/product' 2>/.test(cmd)) return product;
     if (/\/serial' 2>/.test(cmd)) return '310059000850393855313720';
     if (/^cat /.test(cmd)) return ids;
@@ -394,6 +396,7 @@ test('unplug refuses a board that is not SLV, or not the chosen serial, and says
 test("the shell's own refusal reaches the report", async () => {
   const markerPath = tmpMarker();
   const ssh = async (cmd) => {
+    if (/^systemctl show apollo-miner/.test(cmd)) return 'active';
     if (/^readlink/.test(cmd)) return IFACE;
     if (/\/product' 2>/.test(cmd)) return 'BCO SLV #1';
     if (/^cat /.test(cmd)) return /serial/.test(cmd) ? '1' : '0483\n5740';
@@ -518,4 +521,53 @@ test("the round's snapshot enables an orphaned board before photographing, and r
   assert.deepEqual(order.slice(0, 2), ['write', 'photo']);
   const failing = buildDeps({ profile: {}, io: mk(true), out, ctxFile: 'x', uiBase: 'x', original: 'pw', wifi: {} });
   await assert.rejects(() => failing.snapshot(), /deauthorized and could not be re-enabled.*for d in \/sys\/bus\/usb/s);
+});
+
+test('no deauthorize while apollo-miner is not active (an idle board wedges), in JS and in the shell', async () => {
+  for (const state of ['inactive', 'activating', 'failed', '']) {
+    const d = device({ minerState: state });
+    const markerPath = tmpMarker();
+    await assert.rejects(() => U.createUsbRig({ ssh: d.ssh, markerPath }).unplug('ttyACM0', '310059000850393855313720'), /apollo-miner is .*not active/, state);
+    assert.equal(d.wrote().length, 0, state);
+    assert.ok(!fs.existsSync(markerPath), state);
+  }
+  assert.match(U.authorizeCommand(DEVICE, 0), /systemctl show apollo-miner -p ActiveState --value.*= active/);
+  // Enabling is never refused for it: it is how a stuck board comes back.
+  assert.doesNotMatch(U.authorizeCommand(DEVICE, 1), /apollo-miner/);
+});
+
+test('reemit: a udev add for the board tty, after checking the tty is the board; never writes authorized', async () => {
+  const d = device({ minerState: 'inactive' });
+  const rig = U.createUsbRig({ ssh: d.ssh, markerPath: tmpMarker() });
+  assert.equal(await rig.reemit('ttyACM0', '310059000850393855313720'), 'ttyACM0');
+  const trig = d.log.filter((c) => /udevadm trigger/.test(c));
+  assert.equal(trig.length, 1);
+  assert.match(trig[0], /^sudo -n udevadm trigger --action=add --settle \/sys\/class\/tty\/ttyACM0$/);
+  assert.equal(d.wrote().length, 0);
+  // another tty / another board / bad names: no event
+  for (const [tty, serial, re] of [['ttyACM1', '310059000850393855313720', /is not the board/], ['ttyACM0', '999', /is not the board/], ['ttyACM0; reboot', 'x', /not a ttyACM/], ['ttyACM0', '', /needs the board serial/]]) {
+    const e = device();
+    await assert.rejects(() => U.createUsbRig({ ssh: e.ssh, markerPath: tmpMarker() }).reemit(tty, serial), re);
+    assert.equal(e.log.filter((c) => /udevadm trigger/.test(c)).length, 0);
+  }
+});
+
+test('a failure-time restore error stays in LEFT TO DO BY HAND even if the final restore is clean', async () => {
+  const report = require('../journeys/report');
+  const deps = {
+    snapshot: async () => ({}),
+    runJourney: async (j) => ({ id: j.id, name: j.name, ok: false, durationMs: 1, error: 'boom' }),
+    restore: (() => { let n = 0; return async () => (n++ === 0 ? { errors: ['usb: PHYSICAL REPLUG NEEDED — board 1'] } : { errors: [] }); })(),
+    password: async () => ({ errors: [], loginOk: true }),
+    minerOff: async () => ({ errors: [], off: true, scriptRan: true }),
+    finalCheck: async () => ({ errors: [], drift: [] }),
+  };
+  const r = await runRound({ journeys: [{ id: '13-usb-miner', name: 'usb-miner' }], deps });
+  assert.ok(r.errors.some((e) => /PHYSICAL REPLUG/.test(e)));
+  const todo = report.leftToDo(r, { host: 'h' });
+  assert.ok(todo.some((t) => /PHYSICAL REPLUG NEEDED/.test(t)), JSON.stringify(todo));
+  assert.match(report.toMarkdown(r, { host: 'h' }), /LEFT TO DO BY HAND: .*PHYSICAL REPLUG NEEDED/);
+  // and a clean round still says nothing
+  const clean = await runRound({ journeys: [], deps: { ...deps, restore: async () => ({ errors: [] }) } });
+  assert.deepEqual(report.leftToDo(clean, { host: 'h' }), []);
 });

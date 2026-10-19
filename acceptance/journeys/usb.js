@@ -81,7 +81,8 @@ const authorizeCommand = (dir, value, { serial = null } = {}) => {
   if (value !== 0 && value !== 1) throw new Error('authorized is 0 or 1');
   const d = shq(dir);
   const check = value === 0
-    ? 'v=$(cat "$d/idVendor" 2>/dev/null); p=$(cat "$d/idProduct" 2>/dev/null); pr=$(cat "$d/product" 2>/dev/null); sn=$(cat "$d/serial" 2>/dev/null); ' +
+    ? '[ "$(systemctl show apollo-miner -p ActiveState --value 2>/dev/null)" = active ] || { echo "refused: apollo-miner is not active (an idle board wedges when toggled)" >&2; exit 1; }; ' +
+      'v=$(cat "$d/idVendor" 2>/dev/null); p=$(cat "$d/idProduct" 2>/dev/null); pr=$(cat "$d/product" 2>/dev/null); sn=$(cat "$d/serial" 2>/dev/null); ' +
       `[ "$v:$p" = ${BOARD.vendor}:${BOARD.product} ] || { echo "refused: $d is $v:$p, not ${BOARD.vendor}:${BOARD.product}" >&2; exit 1; }; ` +
       `case "$pr" in *SLV*) ;; *) { echo "refused: product reads '$pr', not SLV (mid board-reset?)" >&2; exit 1; };; esac; ` +
       (serial ? `[ "$sn" = ${shq(serial)} ] || { echo "refused: serial is '$sn', not the chosen board" >&2; exit 1; }; ` : '')
@@ -369,7 +370,14 @@ const createUsbRig = ({ ssh, markerPath, healthPath = null, fsImpl = fs, waitUnt
     return { dir, iface, ids, product, serial };
   };
 
+  // Toggling `authorized` on a board whose miner is stopped (idle after miner_stop's
+  // reset) wedges it until a physical replug; with the miner running the same toggle
+  // recovers. So a deauthorize is refused unless apollo-miner is active.
   const unplug = async (tty, expectSerial = null) => {
+    const minerState = (await ssh('systemctl show apollo-miner -p ActiveState --value || true')).trim();
+    if (minerState !== 'active') {
+      throw new Error(`refusing: apollo-miner is ${minerState || 'unknown'}, not active: an idle board wedges when toggled (use reemit for a stopped miner) — nothing written`);
+    }
     const { dir, serial } = await inspect(tty, expectSerial);
     // Before the write: a crash right after it must still leave the way back.
     fsImpl.writeFileSync(markerPath, JSON.stringify({ dir, tty, serial, at: new Date().toISOString() }), { mode: 0o600 });
@@ -384,9 +392,21 @@ const createUsbRig = ({ ssh, markerPath, healthPath = null, fsImpl = fs, waitUnt
     return dir;
   };
 
+  // A plug seen by udev without touching the device: the add event of the board's
+  // tty is emitted again. The tty must belong to the board (by serial).
+  const reemit = async (tty, expectSerial) => {
+    if (!/^ttyACM\d+$/.test(tty)) throw new Error(`"${tty}" is not a ttyACM port`);
+    if (!expectSerial) throw new Error('reemit needs the board serial');
+    const port = portFor(parsePortList(await ssh(PORT_LIST_CMD)), expectSerial);
+    if (!port || port.tty !== tty) {
+      throw new Error(`refusing: /dev/${tty} is not the board ${expectSerial} (sysfs says ${port ? port.tty : 'not on the bus'}) — no event emitted`);
+    }
+    await ssh(`sudo -n udevadm trigger --action=add --settle /sys/class/tty/${tty}`, { timeoutMs: 60000 });
+    return port.tty;
+  };
   const replug = () => replugFromMarker({ ssh, markerPath, healthPath, fsImpl, waitUntil });
   const isUnplugged = () => readMarker(fsImpl, markerPath) !== null;
-  return { inspect, unplug, replug, isUnplugged };
+  return { inspect, unplug, reemit, replug, isUnplugged };
 };
 
 // ------------------------------------------------------------ API, device

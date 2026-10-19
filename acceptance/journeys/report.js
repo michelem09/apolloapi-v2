@@ -53,7 +53,7 @@ const leftToDo = (report, meta = {}) => {
     todo.push('the original password is NOT confirmed: check the dashboard login and `ssh` with it; if wrong, set it again (Settings → System, or the API with a minted token)');
   }
   if ((report.drift || []).length) todo.push(`undo the drift: ${report.drift.join('; ')}`);
-  const restoreErrors = report.restore?.errors || [];
+  const restoreErrors = [...(report.restore?.errors || []), ...(report.restoreErrorsAfterFailure || [])];
   if (report.restore?.threw || restoreErrors.length) todo.push(`the restore did not finish cleanly: ${[...restoreErrors].join('; ') || 'it threw'}`);
   if (report.final?.threw) todo.push('the final check did not run: verify the device by hand');
   return todo;
