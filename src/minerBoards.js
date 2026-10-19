@@ -25,6 +25,10 @@ const MINING_MS = 15 * 1000; // same "fresh stat file" threshold as services/min
 
 const iso = (ms) => (ms === null || ms === undefined ? null : new Date(ms).toISOString());
 
+// USB ids of the hashboards, as in backend/udev/99-apollo-usb-miner.rules.
+const MINER_VID = '0483';
+const MINER_PID = '5740';
+
 const STAT_RE = /^apollo-miner(?:-v(\d+))?\.(.+)$/;
 
 // Filename -> { version, id }, or null when it is not a stat file.
@@ -87,8 +91,11 @@ function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory
 
   for (const p of livePorts) {
     let c = p.serial ? cands.get(p.serial) : null;
-    if (!c && !p.serial) {
-      // Serial unreadable: fall back to the port the stat file names.
+    if (!c) {
+      // No stat file under this serial: either the serial is unreadable, or it
+      // differs from the uuid the miner wrote (verified equal only on Apollo BTC).
+      // Join on the port the stat file names, so the mining board is not marked
+      // disconnected next to a phantom one. The stat uuid stays the board id.
       c = [...cands.values()].find(
         (x) => !x.port && x.entry && path.basename(x.entry.comport || '') === p.name
       );
@@ -297,7 +304,8 @@ class MinerBoards {
       }
       return names.map((name) => ({ name, serial: null, product: null }));
     }
-    return names.map((name) => {
+    const ports = [];
+    for (const name of names) {
       // `device` is a symlink to the USB interface; serial/product sit on its
       // parent. Resolve first: a lexical `device/..` would land on the tty dir.
       let base = null;
@@ -306,12 +314,18 @@ class MinerBoards {
       } catch (e) {
         // No device link: serial and product stay unknown.
       }
-      return {
+      // Same filter as the udev rule: a Zigbee/Z-Wave stick, an Arduino or a
+      // printer is a ttyACM too, and is not a miner.
+      const vid = base && readTxt(path.join(base, 'idVendor'));
+      const pid = base && readTxt(path.join(base, 'idProduct'));
+      if (vid !== MINER_VID || pid !== MINER_PID) continue;
+      ports.push({
         name,
-        serial: base && readTxt(path.join(base, 'serial')),
-        product: base && readTxt(path.join(base, 'product')),
-      };
-    });
+        serial: readTxt(path.join(base, 'serial')),
+        product: readTxt(path.join(base, 'product')),
+      });
+    }
+    return ports;
   }
 
   /**
