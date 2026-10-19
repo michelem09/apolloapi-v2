@@ -5,6 +5,7 @@ const _ = require('lodash');
 const moment = require('moment');
 const { GraphQLError } = require('graphql');
 const transition = require('./transition');
+const { getMinerBoards } = require('../minerBoards');
 
 // Import the dev miner service for development mode
 const devMinerService =
@@ -131,6 +132,13 @@ class MinerService {
       .where({ service_name: 'miner' })
       .update({ status, last_checked: Date.now() });
     this._notifyServicesStatus();
+  }
+
+  // Boards known to the registry, read fresh (a cheap sysfs/stat scan).
+  async getBoards() {
+    const registry = getMinerBoards();
+    await registry.refresh();
+    return registry.snapshot();
   }
 
   // Get miner statistics
@@ -473,6 +481,21 @@ class MinerService {
       }
     }
 
+    // A stat file outlives its board: on II/III miner_start.sh clears the
+    // enumerated ones only at start, so the file of a USB board gone for good
+    // would sit in the totals forever. The registry forgets a board after its
+    // expiry; whatever it no longer lists is dropped here. Only once the
+    // registry is running — before that its snapshot is empty, not authoritative.
+    const registry = getMinerBoards();
+    if (registry.started) {
+      try {
+        registry.refreshSync(); // a board that just appeared must not be dropped
+      } catch (e) {
+        console.error(`Board registry refresh failed: ${e.message}`);
+      }
+      const known = new Set(registry.snapshot().boards.map((b) => b.id));
+      return stats.filter((s) => known.has(s.uuid));
+    }
     return stats;
   }
 

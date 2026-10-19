@@ -6,6 +6,7 @@ const path = require('path');
 const net = require('net');
 const pubsub = require('../graphql/pubsub');
 const TOPICS = require('../graphql/topics');
+const { getMinerBoards } = require('../minerBoards');
 
 const execAsync = promisify(exec);
 
@@ -264,6 +265,23 @@ class ServiceMonitor {
         }
       }
 
+      // A Solo Node has no internal miner: miner_start.sh keeps apollo-miner
+      // `active` on a placeholder while no USB board is plugged in. The
+      // application check says offline there, and without this the pair would
+      // read as "starting" (pending) for good. Read from the registry, refreshed
+      // here so the answer is not older than this tick.
+      let soloNodeNoBoards = false;
+      if (serviceName === 'apollo-miner') {
+        try {
+          const registry = getMinerBoards();
+          await registry.refresh();
+          const snap = registry.snapshot();
+          soloNodeNoBoards = snap.deviceFamily === 'solo-node' && snap.usbActiveCount === 0;
+        } catch (error) {
+          console.log(`Board registry unavailable for ${serviceName}: ${error.message}`);
+        }
+      }
+
       // Standard systemctl check for local services
       let status;
       try {
@@ -464,6 +482,15 @@ class ServiceMonitor {
       // If within grace period, keep as pending regardless of other checks
       if (isWithinGracePeriod) {
         finalStatus = 'pending';
+      }
+      // Solo Node, no active USB board, unit up on the placeholder: there is
+      // nothing to start or wait for, so offline. A fresh stat file (app check
+      // online) still wins: that is a real miner, whatever the registry saw.
+      // This also answers a Start pressed with no board: the unit is `active`,
+      // the request counts as arrived, and the UI settles on offline instead
+      // of spinning. Auto-restart only fires on systemd `failed`, untouched.
+      else if (soloNodeNoBoards && status === 'active' && applicationOnline !== 'online') {
+        finalStatus = 'offline';
       }
       // Special handling for services with application check (miner, node)
       else if (applicationOnline) {

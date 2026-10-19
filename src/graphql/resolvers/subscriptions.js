@@ -27,5 +27,9 @@ module.exports = {
       subscribe: () => pubsub.asyncIterator([TOPICS.SETTINGS]),
       resolve: (payload) => payload.settings,
     },
+    minerBoards: {
+      subscribe: () => pubsub.asyncIterator([TOPICS.MINER_BOARDS]),
+      resolve: (payload) => payload.minerBoards,
+    },
   },
 };

@@ -3,6 +3,7 @@ const _ = require('lodash');
 const services = require('../services');
 const pubsub = require('../graphql/pubsub');
 const TOPICS = require('../graphql/topics');
+const { getMinerBoards } = require('../minerBoards');
 
 /**
  * Parse hashrate string (e.g., "810M", "3.2T", "1.5G") to GH/s
@@ -119,8 +120,19 @@ async function fetchStatistics() {
     const { stats } = await services.miner.getStats();
     if (!stats || stats.length === 0) return;
 
+    // Disconnected boards are out of totals and time series: their stat file is
+    // stale, and counting it would keep hashrate the device no longer has.
+    const disconnected = new Set(
+      getMinerBoards()
+        .snapshot()
+        .boards.filter((b) => b.status === 'disconnected')
+        .map((b) => b.id)
+    );
+    const liveStats = stats.filter((s) => !disconnected.has(s.uuid));
+    if (liveStats.length === 0) return;
+
     // Process data for each board
-    const boards = stats.map((board) => {
+    const boards = liveStats.map((board) => {
       const {
         master: {
           boardsI: voltage,
@@ -399,6 +411,14 @@ function withTimeout(promise, ms, label) {
  * Runs every 5 seconds — replaces the client-side 5 s poll.
  */
 async function pushMinerStats() {
+  // `mining` on a board only changes when someone reads the stat file's mtime,
+  // so this cycle is the reader. It publishes (via the registry listener) only
+  // when the snapshot actually changed.
+  try {
+    await getMinerBoards().refresh();
+  } catch (e) {
+    console.error('[PubSub] MINER_BOARDS refresh error:', e.message);
+  }
   try {
     const [statsResult, onlineResult] = await Promise.all([
       withTimeout(services.miner.getStats(),    8000, 'miner.getStats'),
@@ -420,6 +440,44 @@ async function pushMinerStats() {
       },
     });
   }
+}
+
+/**
+ * Publish the board registry snapshot. Used for the initial fill on WS connect
+ * and by the registry listener on every change.
+ */
+function publishMinerBoards(snapshot) {
+  pubsub.publish(TOPICS.MINER_BOARDS, {
+    minerBoards: { result: snapshot, error: null },
+  });
+  if (process.env.NODE_ENV === 'development') console.log('[PubSub] MINER_BOARDS published');
+}
+
+async function pushMinerBoards() {
+  try {
+    publishMinerBoards(getMinerBoards().snapshot());
+  } catch (e) {
+    console.error('[PubSub] MINER_BOARDS error:', e.message);
+    pubsub.publish(TOPICS.MINER_BOARDS, {
+      minerBoards: { result: null, error: { message: e.message } },
+    });
+  }
+}
+
+let stopBoardsListener = null;
+// On change, not on cadence: the registry's own watcher/expiry timer and the
+// refresh() in pushMinerStats are the triggers.
+function startMinerBoards() {
+  if (stopBoardsListener) return;
+  const registry = getMinerBoards();
+  stopBoardsListener = registry.onChange(publishMinerBoards);
+  registry.start();
+}
+
+function stopMinerBoards() {
+  if (stopBoardsListener) stopBoardsListener();
+  stopBoardsListener = null;
+  getMinerBoards().stop();
 }
 
 /**
@@ -497,6 +555,9 @@ async function startAllSchedulers() {
     // Initialize DB rows for service status
     await initServiceStatusRows();
 
+    // The board registry first: the monitor and the stats read its snapshot.
+    startMinerBoards();
+
     // Start service monitor - this is the single source of truth for status updates
     await startServiceMonitor();
 
@@ -530,7 +591,8 @@ async function startAllSchedulers() {
     pushMcuStats().catch(() => {});
     pushNodeStats().catch(() => {});
     pushSoloStats().catch(() => {});
-    pushServicesStatus().catch(() => {});;
+    pushServicesStatus().catch(() => {});
+    pushMinerBoards().catch(() => {});
   } catch (error) {
     console.error('Failed to initialize schedulers:', error);
   }
@@ -548,7 +610,11 @@ module.exports = {
   // Called by action resolvers (start/stop/restart) to immediately push the updated
   // service status to all connected subscribers instead of waiting for the periodic timer.
   pushServicesStatus,
+  pushMinerBoards,
+  startMinerBoards,
+  stopMinerBoards,
   pushAllStats: () => Promise.allSettled([
+    pushMinerBoards(),
     pushMinerStats(),
     pushMcuStats(),
     pushNodeStats(),

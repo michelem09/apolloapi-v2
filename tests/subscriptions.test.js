@@ -34,6 +34,7 @@ describe('Subscription resolvers', () => {
     { name: 'solo',     topic: 'SOLO',     payloadKey: 'solo'     },
     { name: 'services', topic: 'SERVICES', payloadKey: 'services' },
     { name: 'settings', topic: 'SETTINGS', payloadKey: 'settings' },
+    { name: 'minerBoards', topic: 'MINER_BOARDS', payloadKey: 'minerBoards' },
   ];
 
   describe('subscribe() calls asyncIterator with the correct TOPIC', () => {
@@ -70,11 +71,11 @@ describe('Subscription resolvers', () => {
   });
 
   describe('Subscription object structure', () => {
-    it('exports exactly the 6 expected subscription fields', () => {
+    it('exports exactly the 7 expected subscription fields', () => {
       const keys = Object.keys(resolvers.Subscription);
-      expect(keys).toHaveLength(6);
+      expect(keys).toHaveLength(7);
       expect(keys).toEqual(
-        expect.arrayContaining(['miner', 'node', 'mcu', 'solo', 'services', 'settings'])
+        expect.arrayContaining(['miner', 'node', 'mcu', 'solo', 'services', 'settings', 'minerBoards'])
       );
     });
 
