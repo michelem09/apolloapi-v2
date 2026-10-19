@@ -43,7 +43,7 @@ test('only 0483:5740 is a board; the hub is not', () => {
 
 test('the write command checks the ids itself when disabling, and only takes a device dir', () => {
   const off = U.authorizeCommand(DEVICE, 0);
-  assert.match(off, /idVendor.*= 0483.*idProduct.*= 5740.*&& echo 0 \| sudo -n tee/);
+  assert.match(off, /idVendor.*= 0483.*idProduct.*= 5740.*\*IAP\*\) false.*&& echo 0 \| sudo -n tee/);
   const on = U.authorizeCommand(DEVICE, 1);
   assert.match(on, /echo 1 \| sudo -n tee/);
   assert.doesNotMatch(on, /idVendor/);
@@ -54,11 +54,14 @@ test('the write command checks the ids itself when disabling, and only takes a d
 });
 
 // A fake device: answers the three kinds of command the rig issues.
-const device = ({ iface = IFACE, ids = '0483\n5740', failWrite = false } = {}) => {
+const device = ({ iface = IFACE, ids = '0483\n5740', product = 'BCO SLV #310059000850393855313720', failWrite = false } = {}) => {
   const log = [];
   const ssh = async (cmd) => {
     log.push(cmd);
     if (/^readlink -f/.test(cmd)) return iface;
+    if (/^for t in/.test(cmd)) return `ttyACM0|${iface}|310059000850393855313720|${product}`;
+    if (/\/product' 2>/.test(cmd)) return product;
+    if (/\/serial' 2>/.test(cmd)) return '310059000850393855313720';
     if (/^cat /.test(cmd)) return ids;
     if (/sudo -n tee/.test(cmd)) {
       if (failWrite) throw new Error('sudo: a password is required');
@@ -87,6 +90,7 @@ test('a path that is not the board writes nothing and leaves no marker (hub, wro
     ['a readlink that already lands on the hub', device({ iface: HUB }), 'ttyACM0'],
     ['a readlink that lands on the root hub', device({ iface: '/sys/devices/x/xhci/usb3' }), 'ttyACM0'],
     ['an interface whose device is the hub (1a40)', device({ ids: '1a40\n0101' }), 'ttyACM0'],
+    ['a board mid-reset, product reads IAP', device({ product: 'BCO IAP #310059000850393855313720' }), 'ttyACM0'],
     ['a port that is not ttyACM', device(), 'ttyS1'],
     ['a port with shell in it', device(), 'ttyACM0; reboot'],
   ]) {
@@ -212,4 +216,117 @@ test('usb-miner is opt-in, and usb-expiry is a switch on --with, not a journey',
   assert.deepEqual(registry.optionsOf('usb-miner,usb-expiry'), ['usb-expiry']);
   assert.deepEqual(registry.optionsOf(null), []);
   assert.throws(() => registry.select(all, null, 'usb-expiri'), /no journey named "usb-expiri"/);
+});
+
+test('the marker carries the serial, and a re-authorize asks for a health check', async () => {
+  const d = device();
+  const markerPath = tmpMarker();
+  const healthPath = path.join(path.dirname(markerPath), 'usb.health');
+  const rig = U.createUsbRig({ ssh: d.ssh, markerPath, healthPath });
+  await rig.unplug('ttyACM0');
+  assert.equal(U.readMarker(fs, markerPath).serial, '310059000850393855313720');
+  await rig.replug();
+  assert.equal(JSON.parse(fs.readFileSync(healthPath, 'utf8')).serial, '310059000850393855313720');
+});
+
+test('product states and the port list: the board is found by serial, whatever the tty name', () => {
+  assert.equal(U.productState('BCO IAP #3100'), 'IAP');
+  assert.equal(U.productState('BCO SLV #3100'), 'SLV');
+  assert.equal(U.productState(''), 'unknown');
+  const text = [
+    `ttyACM1|${IFACE}|310059000850393855313720|BCO SLV #310059000850393855313720`,
+    '|garbage',
+    'ttyACM2|/sys/devices/x/usb3/3-1/3-1.2/3-1.2:1.0|ZIGBEE1|ConBee II',
+  ].join('\n');
+  const ports = U.parsePortList(text);
+  assert.equal(ports.length, 2);
+  assert.equal(U.portFor(ports, '310059000850393855313720').tty, 'ttyACM1');
+  assert.equal(U.portFor(ports, '310059000850393855313720').dir, DEVICE);
+  assert.equal(U.portFor(ports, '310059000850393855313720').state, 'SLV');
+  assert.equal(U.portFor(ports, 'nope'), null);
+  assert.equal(U.portFor(ports, ''), null);
+});
+
+// A scripted board and a fake clock: each poll advances 1 s.
+const clock = () => { let t = 0; return { now: () => t, sleep: async (ms) => { t += ms; } }; };
+const scripted = (c, at) => async () => {
+  const [, v] = [...at].reverse().find(([from]) => c.now() >= from) || [0, null];
+  return v;
+};
+const slv = (tty = 'ttyACM1') => ({ tty, product: 'BCO SLV #1', state: 'SLV' });
+const iap = { tty: 'ttyACM1', product: 'BCO IAP #1', state: 'IAP' };
+
+test('waitSlvStable waits out IAP, then 5 s of stable SLV', async () => {
+  const c = clock();
+  const read = scripted(c, [[0, iap], [30000, slv()]]);
+  const r = await U.waitSlvStable({ read, ...c, since: 0, minMs: 35000 });
+  assert.ok(r.ok);
+  assert.ok(r.sawReset);
+  assert.ok(c.now() >= 35000, `returned at ${c.now()}`);
+});
+
+test('waitSlvStable: never early while IAP, and a changing port restarts the stable timer', async () => {
+  const c = clock();
+  const r = await U.waitSlvStable({ read: scripted(c, [[0, iap]]), ...c, timeoutMs: 20000 });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /IAP/);
+  const c2 = clock();
+  const hop = async () => slv(c2.now() < 3000 ? 'ttyACM0' : 'ttyACM1');
+  const r2 = await U.waitSlvStable({ read: hop, ...c2, minMs: 0 });
+  assert.ok(r2.ok);
+  assert.ok(c2.now() >= 3000 + 5000, `stable counted across a port change: ${c2.now()}`);
+  assert.equal(r2.tty, 'ttyACM1');
+});
+
+test('waitSlvStable: a board that was always SLV still needs minMs since the stop', async () => {
+  const c = clock();
+  const r = await U.waitSlvStable({ read: async () => slv(), ...c, since: 0, minMs: 35000 });
+  assert.ok(r.ok);
+  assert.ok(!r.sawReset);
+  assert.ok(c.now() >= 35000);
+  const c2 = clock();
+  const gone = await U.waitSlvStable({ read: async () => null, ...c2, timeoutMs: 10000 });
+  assert.equal(gone.ok, false);
+  assert.match(gone.reason, /not on the bus/);
+});
+
+test('the journal excerpt keeps the cause lines', () => {
+  const text = [
+    '2026-10-19T18:35:20 h apollo-helper[1]: noise',
+    '2026-10-19T18:35:21 h usb_miner_run.sh[2]: Unknown board',
+    '2026-10-19T18:35:22 h systemd[1]: apollo-usb-miner@ttyACM1.service: Main process exited, code=exited, status=64/n/a',
+  ].join('\n');
+  const lines = U.pickJournal(text);
+  assert.equal(lines.length, 2);
+  assert.ok(U.wedgedInJournal(text));
+  assert.ok(!U.wedgedInJournal('all fine'));
+  assert.match(U.journalCommand(1760000000), /--since @1760000000/);
+});
+
+test('verifyHealth reports a physical replug when the board does not come back or answers Unknown board', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usb-h-'));
+  const healthPath = path.join(dir, 'usb.health');
+  const req = () => fs.writeFileSync(healthPath, JSON.stringify({ serial: '1', since: 100 }));
+  const mk = ({ ports, journal = '', unit = 'failed', miner = 'active' }) => async (cmd) => {
+    if (/^for t in/.test(cmd)) return ports;
+    if (/apollo-miner -p ActiveState/.test(cmd)) return miner;
+    if (/apollo-usb-miner@/.test(cmd) && /ActiveState/.test(cmd)) return unit;
+    if (/^journalctl/.test(cmd)) return journal;
+    return '';
+  };
+  assert.deepEqual(await U.verifyHealth({ ssh: mk({ ports: '' }), healthPath, ...clock() }), { checked: false, errors: [] });
+  req();
+  let r = await U.verifyHealth({ ssh: mk({ ports: '' }), healthPath, ...clock(), timeoutMs: 8000 });
+  assert.match(r.errors[0], /PHYSICAL REPLUG NEEDED/);
+  assert.ok(!fs.existsSync(healthPath));
+  req();
+  const ports = `ttyACM1|${IFACE}|1|BCO SLV #1`;
+  r = await U.verifyHealth({ ssh: mk({ ports, journal: 'usb_miner_run.sh: Unknown board' }), healthPath, ...clock() });
+  assert.match(r.errors[0], /Unknown board/);
+  req();
+  r = await U.verifyHealth({ ssh: mk({ ports, unit: 'active', journal: 'usb_miner_run.sh: Unknown board' }), healthPath, ...clock() });
+  assert.deepEqual(r.errors, []);
+  req();
+  r = await U.verifyHealth({ ssh: mk({ ports, miner: 'inactive', unit: 'inactive' }), healthPath, ...clock() });
+  assert.deepEqual(r.errors, []);
 });

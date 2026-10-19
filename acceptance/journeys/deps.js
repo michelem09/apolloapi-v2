@@ -64,10 +64,12 @@ const buildDeps = ({ profile, io, out, ctxFile, uiBase, original, wifi, spawnImp
     // (the API's view of the miner, the final check) assumes it is plugged in.
     // Runs after a failed journey too, and is a no-op when no marker was left.
     restore: async (snap) => {
-      const back = await usb.replugFromMarker({ ssh, markerPath: usb.markerFile(out), waitUntil })
+      const back = await usb.replugFromMarker({ ssh, markerPath: usb.markerFile(out), healthPath: usb.healthFile(out), waitUntil })
         .catch((err) => ({ notes: [], errors: [`usb: ${err.message}`] }));
+      const health = await usb.verifyHealth({ ssh, healthPath: usb.healthFile(out) })
+        .catch((err) => ({ errors: [`usb: health check failed: ${err.message}`] }));
       const rest = await restoreState({ profile, ssh, gql, gqlWrite, snap, base, waitUntil, wifi });
-      return { notes: [...back.notes, ...rest.notes], errors: [...back.errors, ...rest.errors] };
+      return { notes: [...back.notes, ...rest.notes], errors: [...back.errors, ...health.errors, ...rest.errors] };
     },
 
     password: () =>
