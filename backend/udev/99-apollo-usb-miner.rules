@@ -1,0 +1,28 @@
+# Apollo USB hashboards (Apollo BTC / RD6 / Apollo-2 USB): hotplug start.
+#
+# The rule never starts the miner itself. systemd-udevd runs with IPAddressDeny=any
+# and RestrictAddressFamilies, so anything started from RUN+= inherits a sandbox
+# the miner cannot live in. It only tags the node and asks systemd to pull in
+# the per-port instance; the instance is bound to the device unit
+# (dev-ttyACMx.device), so it goes away with the port.
+#
+# Board strings seen on an Apollo BTC (the serial is the stat-file uuid):
+#   miner firmware  product "BCO SLV #<serial>"   ID_MODEL=BCO_SLV_#<serial>
+#   bootloader      product "BCO IAP #<serial>"   (~29 s after power-up, then it
+#                   re-enumerates as SLV on the same port)
+# SLV is deliberately not required: other boards share 0483:5740 with unknown
+# strings. Only the bootloader is excluded, with a negative match.
+
+ACTION!="add", GOTO="apollo_usb_miner_end"
+SUBSYSTEM!="tty", GOTO="apollo_usb_miner_end"
+KERNEL!="ttyACM[0-9]*", GOTO="apollo_usb_miner_end"
+ATTRS{idVendor}!="0483", GOTO="apollo_usb_miner_end"
+ATTRS{idProduct}!="5740", GOTO="apollo_usb_miner_end"
+
+# Bootloader phase: the SLV add that follows starts the miner.
+ATTRS{product}=="BCO IAP*", GOTO="apollo_usb_miner_end"
+ENV{ID_MODEL}=="BCO_IAP_*", GOTO="apollo_usb_miner_end"
+
+TAG+="systemd", ENV{SYSTEMD_WANTS}+="apollo-usb-miner@%k.service"
+
+LABEL="apollo_usb_miner_end"
