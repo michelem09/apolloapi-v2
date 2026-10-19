@@ -22,39 +22,21 @@ remove_env_var() {
     sed -i "/^${key}=/d" "$ENV_FILE"
 }
 
+# USB miner presence is live from the API (hotplug), and the device type is
+# derived from the chassis: drop the values older builds left behind. The stale
+# DEVICE_TYPE is what pinned the Solo Node UI mode.
+remove_env_var "NEXT_PUBLIC_USB_MINERS"
+remove_env_var "NEXT_PUBLIC_DEVICE_TYPE"
+
 case "${BOARD_NAME:-}" in
     "Apollo 3")
         set_env_var "NEXT_PUBLIC_CHASSIS" "apollo-iii"
-        remove_env_var "NEXT_PUBLIC_USB_MINERS"
         echo "Detected Apollo III chassis"
         ;;
     "Solo Node")
         set_env_var "NEXT_PUBLIC_CHASSIS" "solo-node"
 
-        USB_MINER_FOUND=0
-        USB_PORTS=(/dev/ttyACM*)
-        if [[ ! -e ${USB_PORTS[0]} ]]; then
-            USB_PORTS=()
-        fi
-
-        for port in "${USB_PORTS[@]}"; do
-            echo "Checking $port"
-            boardType=$(/opt/apolloapi/backend/apollo-miner/apollo-helper -s "$port" 2>/dev/null)
-            if [[ "$boardType" == *"Apollo-BTC"* ||
-                  "$boardType" == *"RD6"* ||
-                  "$boardType" == *"Apollo-2"* ]]; then
-                USB_MINER_FOUND=1
-                break
-            fi
-        done
-
-        if [[ "$USB_MINER_FOUND" -eq 1 ]]; then
-            set_env_var "NEXT_PUBLIC_USB_MINERS" "true"
-            echo "Detected Solo Node chassis with USB miner"
-        else
-            remove_env_var "NEXT_PUBLIC_USB_MINERS"
-            echo "Detected Solo Node chassis without USB miner"
-        fi
+        echo "Detected Solo Node chassis"
         ;;
     *)
         echo "Unsupported BOARD_NAME: ${BOARD_NAME:-unset}" >&2
