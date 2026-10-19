@@ -43,7 +43,14 @@ test('only 0483:5740 is a board; the hub is not', () => {
 
 test('the write command checks the ids itself when disabling, and only takes a device dir', () => {
   const off = U.authorizeCommand(DEVICE, 0);
-  assert.match(off, /idVendor.*= 0483.*idProduct.*= 5740.*\*IAP\*\) false.*&& echo 0 \| sudo -n tee/);
+  assert.match(off, /idVendor.*0483:5740.*\*SLV\*\) ;;.*not SLV.*echo 0 \| sudo -n tee/);
+  assert.doesNotMatch(off, /sn\b.*=.*\$sn.*chosen/);
+  const withSerial = U.authorizeCommand(DEVICE, 0, { serial: '3100' });
+  assert.match(withSerial, /\[ "\$sn" = '3100' \]/);
+  // Syntax of what is sent to the device's shell, refusal messages included.
+  for (const cmd of [off, withSerial, U.authorizeCommand(DEVICE, 1)]) {
+    require('child_process').execFileSync('sh', ['-n', '-c', cmd]);
+  }
   const on = U.authorizeCommand(DEVICE, 1);
   assert.match(on, /echo 1 \| sudo -n tee/);
   assert.doesNotMatch(on, /idVendor/);
@@ -140,7 +147,7 @@ test('a re-authorize that fails keeps the marker and says how to do it by hand',
   const d = device({ failWrite: true });
   const back = await U.replugFromMarker({ ssh: d.ssh, markerPath });
   assert.equal(back.restored, false);
-  assert.match(back.errors[0], /by hand: echo 1 \| sudo tee .*authorized/);
+  assert.match(back.errors[0], /by hand: for d in \/sys\/bus\/usb\/devices/);
   assert.ok(fs.existsSync(markerPath));
 });
 
@@ -303,30 +310,184 @@ test('the journal excerpt keeps the cause lines', () => {
   assert.match(U.journalCommand(1760000000), /--since @1760000000/);
 });
 
-test('verifyHealth reports a physical replug when the board does not come back or answers Unknown board', async () => {
+test('verifyHealth: waits out the instance settle, then spots "unknown USB board" / status=64', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usb-h-'));
   const healthPath = path.join(dir, 'usb.health');
   const req = () => fs.writeFileSync(healthPath, JSON.stringify({ serial: '1', since: 100 }));
-  const mk = ({ ports, journal = '', unit = 'failed', miner = 'active' }) => async (cmd) => {
-    if (/^for t in/.test(cmd)) return ports;
+  const ports = `ttyACM1|${IFACE}|1|BCO SLV #1`;
+  const PS_OK = '  7 futurebit-miner ./futurebit-miner -comport /dev/ttyACM1 -ao_mode 1';
+  // `script(c)` decides what the device says as the fake clock advances.
+  const mk = (c, { ports: p = ports, journalAfterMs = 0, journal = '', ps = () => '', miner = 'active', unit = 'active' }) => async (cmd) => {
+    if (/^for t in/.test(cmd)) return p;
     if (/apollo-miner -p ActiveState/.test(cmd)) return miner;
     if (/apollo-usb-miner@/.test(cmd) && /ActiveState/.test(cmd)) return unit;
-    if (/^journalctl/.test(cmd)) return journal;
+    if (/^ps -eo/.test(cmd)) return ps(c.now());
+    if (/^journalctl/.test(cmd)) return c.now() >= journalAfterMs ? journal : '';
     return '';
   };
-  assert.deepEqual(await U.verifyHealth({ ssh: mk({ ports: '' }), healthPath, ...clock() }), { checked: false, errors: [] });
+  assert.deepEqual(await U.verifyHealth({ ssh: async () => '', healthPath, ...clock() }), { checked: false, errors: [] });
+
+  // never on the bus
   req();
-  let r = await U.verifyHealth({ ssh: mk({ ports: '' }), healthPath, ...clock(), timeoutMs: 8000 });
+  let c = clock();
+  let r = await U.verifyHealth({ ssh: mk(c, { ports: '' }), healthPath, ...c, timeoutMs: 8000 });
   assert.match(r.errors[0], /PHYSICAL REPLUG NEEDED/);
   assert.ok(!fs.existsSync(healthPath));
+
+  // SLV, the instance is 'active' (Type=simple, still in its 8 s settle): the old
+  // check saw "active" and stopped. Now it waits, and the script's line arrives late.
   req();
-  const ports = `ttyACM1|${IFACE}|1|BCO SLV #1`;
-  r = await U.verifyHealth({ ssh: mk({ ports, journal: 'usb_miner_run.sh: Unknown board' }), healthPath, ...clock() });
-  assert.match(r.errors[0], /Unknown board/);
+  c = clock();
+  r = await U.verifyHealth({
+    ssh: mk(c, { journalAfterMs: 14000, journal: 'usb_miner_run.sh[9]: unknown USB board on /dev/ttyACM1', unit: 'active' }),
+    healthPath, ...c,
+  });
+  assert.match(r.errors[0], /PHYSICAL REPLUG NEEDED/);
+  assert.match(r.errors[0], /unknown USB board/);
+  assert.ok(c.now() >= 14000, 'it must have waited for the settle, not judged at the first SLV');
+
+  // exit 64 alone is enough
   req();
-  r = await U.verifyHealth({ ssh: mk({ ports, unit: 'active', journal: 'usb_miner_run.sh: Unknown board' }), healthPath, ...clock() });
+  c = clock();
+  r = await U.verifyHealth({ ssh: mk(c, { journal: 'apollo-usb-miner@ttyACM1.service: Main process exited, code=exited, status=64/n/a' }), healthPath, ...c });
+  assert.match(r.errors[0], /PHYSICAL REPLUG NEEDED/);
+
+  // a miner is running on the board: healthy
+  req();
+  c = clock();
+  r = await U.verifyHealth({ ssh: mk(c, { ps: (t) => (t >= 12000 ? PS_OK : '') }), healthPath, ...c });
   assert.deepEqual(r.errors, []);
+  assert.ok(r.judged);
+
+  // apollo-miner stopped: nothing starts on purpose, nothing is judged
   req();
-  r = await U.verifyHealth({ ssh: mk({ ports, miner: 'inactive', unit: 'inactive' }), healthPath, ...clock() });
+  c = clock();
+  r = await U.verifyHealth({ ssh: mk(c, { miner: 'inactive', unit: 'inactive', journal: 'unknown USB board' }), healthPath, ...c });
   assert.deepEqual(r.errors, []);
+  assert.equal(r.judged, false);
+
+  // active, no miner, no sign of why, for the whole window: reported (not as a replug)
+  req();
+  c = clock();
+  r = await U.verifyHealth({ ssh: mk(c, {}), healthPath, ...c, probeMs: 9000 });
+  assert.match(r.errors[0], /no miner runs on it/);
+  assert.doesNotMatch(r.errors[0], /PHYSICAL/);
+});
+
+test('unplug refuses a board that is not SLV, or not the chosen serial, and says why', async () => {
+  for (const [name, d, serial, re] of [
+    ['unknown product', device({ product: '' }), undefined, /not SLV/],
+    ['another board', device(), '999', /not the chosen board/],
+  ]) {
+    const markerPath = tmpMarker();
+    await assert.rejects(() => U.createUsbRig({ ssh: d.ssh, markerPath }).unplug('ttyACM0', serial), re, name);
+    assert.equal(d.wrote().length, 0, name);
+    assert.ok(!fs.existsSync(markerPath), name);
+  }
+  // The same serial in other case is the board.
+  const d = device();
+  await U.createUsbRig({ ssh: d.ssh, markerPath: tmpMarker() }).unplug('ttyACM0', '310059000850393855313720');
+  assert.equal(d.wrote().length, 1);
+  assert.match(d.wrote()[0], /\[ "\$sn" = '310059000850393855313720' \]/);
+});
+
+test("the shell's own refusal reaches the report", async () => {
+  const markerPath = tmpMarker();
+  const ssh = async (cmd) => {
+    if (/^readlink/.test(cmd)) return IFACE;
+    if (/\/product' 2>/.test(cmd)) return 'BCO SLV #1';
+    if (/^cat /.test(cmd)) return /serial/.test(cmd) ? '1' : '0483\n5740';
+    throw Object.assign(new Error('Command failed: ssh'), { stderr: "refused: product reads 'BCO IAP #1', not SLV (mid board-reset?)" });
+  };
+  await assert.rejects(() => U.createUsbRig({ ssh, markerPath }).unplug('ttyACM0'), /refused: product reads 'BCO IAP #1'/);
+  // The marker stays: the write may have happened before the failure was reported.
+  assert.ok(fs.existsSync(markerPath));
+});
+
+test('orphans: a board found authorized=0 is enabled again; leftover markers are honoured; failure names the command', async () => {
+  const scan = [
+    `${DEVICE}|0483|5740|0|SER1`,
+    `${HUB}|1a40|0101|0|`,           // the hub, also 0: never touched
+    '/sys/devices/x/usb3/3-2|8087|0a2b|0|',
+    '/sys/devices/x/usb3/3-3|0483|5740|1|SER2', // authorized: fine
+  ].join('\n');
+  const parsed = U.parseUsbScan(scan);
+  assert.deepEqual(U.orphansIn(parsed).map((o) => o.serial), ['SER1']);
+
+  const log = [];
+  const ssh = async (cmd) => {
+    log.push(cmd);
+    if (cmd === U.USB_SCAN_CMD) return scan;
+    if (/^for t in/.test(cmd)) return `ttyACM0|${IFACE}|SER1|BCO SLV #SER1`;
+    if (/^test -d/.test(cmd)) return /GONE/.test(cmd) ? 'no' : 'yes';
+    if (/sudo -n tee/.test(cmd)) return '1';
+    return '';
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usb-orph-'));
+  const healthPath = path.join(dir, 'usb.health');
+  const stale = path.join(dir, 'old-run');
+  fs.mkdirSync(stale);
+  const staleMarker = path.join(stale, U.MARKER);
+  fs.writeFileSync(staleMarker, JSON.stringify({ dir: '/sys/devices/GONE/usb3/3-9', serial: 'S9' }));
+  const live = path.join(dir, 'old-run2');
+  fs.mkdirSync(live);
+  fs.writeFileSync(path.join(live, U.MARKER), JSON.stringify({ dir: DEVICE, serial: 'SER1' }));
+  const mine = path.join(dir, 'this-run');
+  fs.mkdirSync(mine);
+  const markers = U.leftoverMarkers(mine);
+  assert.equal(markers.length, 2);
+  assert.ok(!markers.some((m) => m.startsWith(mine)));
+
+  const r = await U.rescueOrphans({ ssh, markers, healthPath, waitUntil: async (p) => ({ ok: await p() }) });
+  assert.deepEqual(r.errors, []);
+  assert.ok(r.notes.some((n) => /GONE.*gone: dropped/.test(n)));
+  assert.ok(!fs.existsSync(staleMarker));
+  const writes = log.filter((c) => /sudo -n tee/.test(c));
+  assert.ok(writes.every((c) => !new RegExp(HUB.replace(/[/.]/g, '\\$&') + "'").test(c)), 'the hub was written to');
+  assert.ok(writes.length >= 1);
+  assert.ok(fs.existsSync(healthPath), 'a health check was requested');
+
+  const bad = await U.rescueOrphans({
+    ssh: async (cmd) => { if (cmd === U.USB_SCAN_CMD) return scan; throw new Error('sudo: a password is required'); },
+  });
+  assert.match(bad.errors[0], /run: for d in \/sys\/bus\/usb\/devices/);
+});
+
+test('instance counts: a stray unit or process on the old port name is a mismatch', () => {
+  const unit = (t) => `apollo-usb-miner@${t}.service loaded active running Apollo USB miner`;
+  const names = U.activeUnitNames(`${unit('ttyACM1')}\n  ${unit('ttyACM0')}\nunrelated.service loaded active`);
+  assert.deepEqual(names, ['apollo-usb-miner@ttyACM1.service', 'apollo-usb-miner@ttyACM0.service']);
+  const proc = (t) => ({ pid: 1, comport: `/dev/${t}` });
+  assert.equal(U.instanceMismatch({ units: ['apollo-usb-miner@ttyACM1.service'], procs: [proc('ttyACM1')], expected: 1 }), null);
+  assert.equal(U.instanceMismatch({ units: [], procs: [], expected: 0 }), null);
+  // moved from ttyACM0 to ttyACM1, old process still there
+  assert.match(U.instanceMismatch({ units: ['apollo-usb-miner@ttyACM1.service'], procs: [proc('ttyACM1'), proc('ttyACM0')], expected: 1 }), /2 process/);
+  // right counts, wrong ports
+  assert.match(U.instanceMismatch({ units: ['apollo-usb-miner@ttyACM1.service'], procs: [proc('ttyACM0')], expected: 1 }), /expected 1/);
+  // an unplugged board with a leftover unit
+  assert.match(U.instanceMismatch({ units: ['apollo-usb-miner@ttyACM0.service'], procs: [], expected: 0 }), /expected 0/);
+});
+
+test('the Hashboards badge, not the Pools one; transient errors; journal wording', () => {
+  const text = 'Miner\nHashboards\nActive 1/2\nrows\nPools\nActive 2/2';
+  assert.deepEqual(U.hashboardsBadge(text), { active: 1, total: 2 });
+  assert.deepEqual(U.hashboardsBadge('Active 0/1'), { active: 0, total: 1 });
+  assert.equal(U.hashboardsBadge('nothing'), null);
+  assert.ok(U.isTransient(new Error('fetch failed')));
+  assert.ok(U.isTransient(Object.assign(new Error('x'), { transport: true })));
+  assert.ok(!U.isTransient(new Error('GraphQL: nope')));
+  assert.ok(U.wedgedInJournal('usb_miner_run.sh[3]: unknown USB board on /dev/ttyACM1'));
+  assert.ok(U.wedgedInJournal('code=exited, status=64/n/a'));
+  assert.equal(U.pickJournal('unknown USB board on /dev/ttyACM1\nnoise').length, 1);
+});
+
+test('--with usb-expiry without usb-miner is an error, and is listed', () => {
+  const all = registry.list();
+  const pick = (only, extra) => registry.select(all, only, extra);
+  assert.throws(() => registry.checkOptions(pick('solo'), ['usb-expiry']), /only applies to the usb-miner journey/);
+  assert.throws(() => registry.checkOptions(pick(null, 'usb-expiry'), registry.optionsOf('usb-expiry')), /usb-miner/);
+  assert.doesNotThrow(() => registry.checkOptions(pick('usb-miner'), ['usb-expiry']));
+  assert.doesNotThrow(() => registry.checkOptions(pick(null, 'usb-miner,usb-expiry'), registry.optionsOf('usb-miner,usb-expiry')));
+  assert.doesNotThrow(() => registry.checkOptions(pick('solo'), []));
+  assert.ok(registry.OPTION_HELP['usb-expiry']);
 });

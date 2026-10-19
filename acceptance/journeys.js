@@ -35,10 +35,12 @@ const main = async () => {
   const all = registry.list();
   if (flag('list')) {
     all.forEach((j) => console.log(`${j.id}${registry.OPT_IN.has(j.name) ? `  (opt-in: --only ${j.name} or --with ${j.name})` : ''}`));
+    for (const [name, help] of Object.entries(registry.OPTION_HELP)) console.log(`option: --with ${name}  (${help})`);
     return 0;
   }
   const journeys = registry.select(all, arg('only'), arg('with'));
   const options = registry.optionsOf(arg('with'));
+  registry.checkOptions(journeys, options);
   const started = Date.now();
   const out = path.resolve(arg('out', path.join(__dirname, 'journeys', 'out', stamp())));
   fs.mkdirSync(out, { recursive: true });

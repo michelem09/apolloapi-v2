@@ -52,7 +52,12 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
   // The default 25 minutes are for steps 1-4; the expiry wait is 15 more.
   test.setTimeout(longStep ? 55 * 60 * MS : 25 * 60 * MS);
 
+  // A Solo Node has no internal board; an Apollo II has one that must keep mining
+  // while the USB one comes and goes. An Apollo III with a USB board is not covered
+  // here yet (its internal board has no comport and no stat-file join).
+  if (j.kind === 'apollo-iii') j.skip('an Apollo III with a USB board is not supported by this journey yet');
   const solo = j.kind === 'solo-node';
+  const expectInternal = j.kind === 'apollo-legacy';
   const rig = U.createUsbRig({
     ssh: j.ssh,
     markerPath: U.markerFile(j.ctx.out),
@@ -77,6 +82,10 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
   const listed = U.usbBoards(first.boards);
   const chosen = listed.find((b) => b.status === 'active');
   if (!chosen) {
+    // A board a killed run left deauthorized is not "no USB miner attached": say so.
+    const orphans = U.orphansIn(U.parseUsbScan(await j.ssh(U.USB_SCAN_CMD)));
+    j.must(orphans.length === 0,
+      `a 0483:5740 board is deauthorized (authorized=0), probably left by a killed run: ${orphans.map((o) => o.serial || o.dir).join(', ')} — run: ${U.MANUAL_REAUTHORIZE}`);
     j.skip(`no USB miner attached (USB boards listed: ${listed.length ? listed.map((b) => `${b.id} ${b.status}`).join(', ') : 'none'})`);
   }
   const boardId = chosen.id;
@@ -85,7 +94,6 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
   const serial = chosen.serial || chosen.id;
   let tty = U.ttyOf(chosen.port);
   j.must(!!tty, `the active USB board ${boardId} has no ttyACM port (${chosen.port})`);
-  const hadInternal = first.boards.some((b) => b.kind === 'internal');
 
   // ---- what the device says
   const unit = () => `apollo-usb-miner@${tty}`;
@@ -96,12 +104,19 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
     return p;
   };
   const unitActive = async () => { await refreshTty(); return j.probes.unitState(j.ssh, unit()); };
-  const instances = async () => {
-    await refreshTty();
-    return (await j.ssh(`systemctl list-units --plain --no-legend --state=active 'apollo-usb-miner@*' | awk '{print $1}' || true`))
-      .split('\n').filter((l) => l === `${unit()}.service`).length;
-  };
   const procs = async () => U.parseMinerProcs(await j.ssh('ps -eo pid=,comm=,args='));
+  // Every active USB instance and every miner process on a ttyACM port, against what
+  // the API says: a leftover on the OLD port name after ttyACM0 -> ttyACM1 shows here.
+  const running = async () => ({
+    units: U.activeUnitNames(await j.ssh(U.USB_UNITS_CMD)),
+    procs: (await procs()).filter((p) => /ttyACM\d+$/.test(p.comport || '')),
+  });
+  const activeUsbCount = async () => U.usbBoards((await readBoards()).boards).filter((b) => b.status === 'active').length;
+  const expectRunning = async (expected, what) => {
+    const bad = U.instanceMismatch({ ...(await running()), expected });
+    j.must(!bad, `${what}: ${bad}`);
+    return `${expected} instance(s) and process(es), no strays`;
+  };
   const usbProcs = async () => { await refreshTty(); return U.procsOn(await procs(), tty); };
   const minerUnit = () => j.probes.unitState(j.ssh, 'apollo-miner');
   const boardOnBus = async () => !!(await readPort());
@@ -113,7 +128,8 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
   const waitBoard = async (pred, { timeoutMs, everyMs = 2000 }) => {
     let last = null;
     const r = await j.waitUntil(async () => {
-      last = await board();
+      // One dropped connection is not "not yet".
+      try { last = await board(); } catch (err) { if (U.isTransient(err)) return false; throw err; }
       adopt(last);
       return pred(last);
     }, { timeoutMs, everyMs });
@@ -170,7 +186,7 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
         await j.page.waitForTimeout(400);
       }
     }
-    return { ...r, badges: U.activeBadges(r.text) };
+    return { ...r, badges: U.activeBadges(r.text), hashboards: U.hashboardsBadge(r.text) };
   };
   const waitUi = async (name, probe, timeoutMs, everyMs = 1000) => {
     let last;
@@ -205,15 +221,19 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
       const r = await waitBoard((b) => !!b && b.status === 'active' && b.mining, { timeoutMs: 240 * MS, everyMs: 4000 });
       j.must(r.ok, `precondition not met: after Miner.start the USB board is ${describe(r.last)} (not a build failure)`);
     });
-    await j.verify('the board is mining on the device: one instance, one process', async () => {
-      j.must((await unitActive()) === 'active', `${unit()} is ${await unitActive()}`);
-      j.must((await instances()) === 1, `${await instances()} instances of ${unit()}`);
-      const p = await usbProcs();
-      j.must(p.length === 1, `${p.length} futurebit-miner processes on /dev/${tty}`);
-      return `${unit()} active, pid ${p[0].pid}`;
+    await j.verify('the board is mining on the device: one instance, one process, no strays', async () => {
+      return expectRunning(await activeUsbCount(), 'at the start');
     });
-    if (hadInternal) {
-      await j.verify('the internal board is mining', async () => {
+    if (expectInternal) {
+      await j.verify('the API lists the internal board, mining (an Apollo II must have one)', async () => {
+        // Its stat file appears ~35 s after a start: wait, then fail, never skip.
+        const r = await j.waitUntil(async () => {
+          try {
+            const b = (await readBoards()).boards.find((x) => x.kind === 'internal');
+            return !!b && b.status === 'active' && b.mining;
+          } catch (err) { if (U.isTransient(err)) return false; throw err; }
+        }, { timeoutMs: 150 * MS, everyMs: 4000 });
+        j.must(r.ok, 'an Apollo II must list an active, mining internal board and the API does not');
         internalBefore = await internalSnapshot();
         j.must(internalBefore.pids.length >= 1, 'the API lists an internal board but no futurebit-miner runs on it');
         return `pids ${internalBefore.pids.join(',')}`;
@@ -247,7 +267,10 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
       const ui = await boardsUi();
       await j.shot('miner-page');
       j.must(ui.tags.includes('USB'), `no USB tag (tags: ${ui.tags.join(' | ')})`);
-      if (hadInternal) j.must(ui.tags.includes('Internal'), `no Internal tag (tags: ${ui.tags.join(' | ')})`);
+      // Plugged in: the Hashboards card reads Active n/n, n >= 1.
+      j.must(ui.hashboards && ui.hashboards.active === ui.hashboards.total && ui.hashboards.total >= 1,
+        `the Hashboards badge reads ${JSON.stringify(ui.hashboards)}, expected Active n/n with the board plugged in`);
+      if (expectInternal) j.must(ui.tags.includes('Internal'), `no Internal tag (tags: ${ui.tags.join(' | ')})`);
       j.must(!ui.tags.includes('Disconnected'), 'a Disconnected tag with the board plugged in');
     });
 
@@ -258,7 +281,7 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
     await j.step('unplug: authorized=0 on the USB device', async () => {
       since = j.toastCount();
       at = Date.now();
-      const dir = await rig.unplug(tty);
+      const dir = await rig.unplug(tty, serial);
       j.note('deauthorized', dir);
     });
     await j.verify('the kernel dropped the port, the device is deauthorized', async () => {
@@ -285,7 +308,8 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
       const ui = await boardsUi();
       j.must(ui.tags.includes('Disconnected'), `no Disconnected tag (tags: ${ui.tags.join(' | ')})`);
       // Disconnected boards stay in the denominator: Active 0/1 (Solo Node), 1/2 (Apollo II).
-      j.must(ui.badges.some((b) => b.active < b.total), `no "Active a/t" badge with a < t (found ${JSON.stringify(ui.badges)})`);
+      j.must(ui.hashboards && ui.hashboards.active < ui.hashboards.total,
+        `the Hashboards badge reads ${JSON.stringify(ui.hashboards)}, expected a < t (all badges: ${JSON.stringify(ui.badges)})`);
       return st;
     });
     if (solo) {
@@ -299,14 +323,11 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
         await j.shot('start-disabled');
       });
     }
-    await j.verify('device: instance gone, apollo-miner still active, no miner on that port', async () => {
-      j.must((await unitActive()) !== 'active', `${unit()} is still active`);
+    await j.verify('device: instance gone, apollo-miner still active, no miner on any USB port', async () => {
       j.must((await minerUnit()) === 'active', `apollo-miner is ${await minerUnit()}`);
-      const p = await usbProcs();
-      j.must(p.length === 0, `${p.length} futurebit-miner process(es) still on /dev/${tty}`);
-      return `${unit()} ${await unitActive()}, apollo-miner active`;
+      return expectRunning(await activeUsbCount(), 'after the unplug');
     });
-    if (hadInternal) {
+    if (expectInternal) {
       await j.verify('the internal board kept mining, process and unit untouched', assertInternalUntouched);
     }
 
@@ -321,12 +342,9 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
       j.must(r.ok, `60 s after the replug the API says ${describe(r.last)}`);
       return `${describe(r.last)} after ${Math.round(r.waitedMs / MS)} s`;
     });
-    await j.verify('the device: one instance, one process on that port', async () => {
+    await j.verify('the device: one instance, one process, none left on the old port name', async () => {
       j.must((await unitActive()) === 'active', `${unit()} is ${await unitActive()}`);
-      j.must((await instances()) === 1, `${await instances()} instances of ${unit()}`);
-      const p = await usbProcs();
-      j.must(p.length === 1, `${p.length} futurebit-miner processes on /dev/${tty}`);
-      return `pid ${p[0].pid}`;
+      return expectRunning(await activeUsbCount(), 'after the replug');
     });
     await j.step('UI: the indicator is back to normal, no Disconnected tag', async () => {
       await waitUi('the indicator back to normal', async () => {
@@ -336,8 +354,9 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
       const ui = await boardsUi();
       await j.shot('replugged');
       j.must(!ui.tags.includes('Disconnected'), 'the Disconnected tag is still there');
+      j.must(ui.tags.includes('USB'), `no USB tag after the replug (tags: ${ui.tags.join(' | ')})`);
     });
-    if (hadInternal) {
+    if (expectInternal) {
       await j.verify('the internal board is still untouched after the replug', assertInternalUntouched);
     }
 
@@ -348,9 +367,9 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
       await btn('Stop').click();
     });
     await j.verify('the instance and the miner stop', async () => {
-      const r = await j.waitUntil(async () => (await unitActive()) !== 'active' && (await usbProcs()).length === 0,
+      const r = await j.waitUntil(async () => { const x = await running(); return x.units.length === 0 && x.procs.length === 0; },
         { timeoutMs: 60 * MS, everyMs: 2000 });
-      j.must(r.ok, `after Stop: ${unit()} is ${await unitActive()}, ${(await usbProcs()).length} process(es)`);
+      j.must(r.ok, `after Stop: ${JSON.stringify((await running()).units)} still active, ${(await running()).procs.length} process(es)`);
       const m = await j.waitUntil(async () => ['inactive', 'failed'].includes(await minerUnit()), { timeoutMs: 120 * MS, everyMs: 3000 });
       j.must(m.ok, `apollo-miner is ${await minerUnit()} after Stop`);
     });
@@ -358,7 +377,7 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
     // window leaves it wedged until it is physically replugged.
     await j.verify('the board finished the reset the stop caused (SLV, stable, ~35 s after the stop)', () => settled(stopAt, 35 * MS));
     await j.step('unplug and replug while stopped', async () => {
-      await rig.unplug(tty);
+      await rig.unplug(tty, serial);
       const gone = await j.waitUntil(async () => !(await boardOnBus()), { timeoutMs: 15 * MS, everyMs: 1000 });
       j.must(gone.ok, `/dev/${tty} is still there after authorized=0`);
       const back = await rig.replug();
@@ -370,10 +389,11 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
       while (Date.now() - t0 < 45 * MS) {
         reads += 1;
         // `failed` is fine (a Requisite refusal can leave it so): active/activating is not.
-        const s = await unitActive();
-        j.must(s !== 'active' && s !== 'activating', `${unit()} became ${s} ${Math.round((Date.now() - t0) / MS)} s after the replug`);
-        const n = (await usbProcs()).length;
-        j.must(n === 0, `${n} futurebit-miner process(es) on /dev/${tty} ${Math.round((Date.now() - t0) / MS)} s after the replug`);
+        // Any USB instance or process, on any port name: none may exist.
+        const x = await running();
+        const at2 = Math.round((Date.now() - t0) / MS);
+        j.must(x.units.length === 0, `${x.units.join(', ')} became active ${at2} s after the replug`);
+        j.must(x.procs.length === 0, `${x.procs.length} futurebit-miner process(es) on a USB port ${at2} s after the replug`);
         await new Promise((r) => setTimeout(r, 3000));
       }
       return `${reads} reads, never active`;
@@ -400,10 +420,7 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
         throw new Error(`${what}: not mining after ${timeoutMs / MS} s (API: ${describe(r.last)}; ${unit()} ${await unitActive()}); journal: ${await journalSince(epoch)}`);
       }
       j.must((await unitActive()) === 'active', `${unit()} is ${await unitActive()}`);
-      j.must((await instances()) === 1, `${await instances()} instances of ${unit()}`);
-      const p = await usbProcs();
-      j.must(p.length === 1, `${p.length} futurebit-miner processes on /dev/${tty}`);
-      return `mining after ${Math.round(r.waitedMs / MS)} s, pid ${p[0].pid}`;
+      return `mining after ${Math.round(r.waitedMs / MS)} s; ${await expectRunning(await activeUsbCount(), what)}`;
     };
     await j.verify('the board mines again: one instance, one process', () =>
       mustMine(startedAt, solo ? 60 * MS : 150 * MS, 'after Start'));
@@ -411,13 +428,24 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
     // ---- 4b: Stop, then Start at once. The stop resets the board (IAP for ~30 s);
     // with apollo-miner active again, udev starts the instance on the SLV add.
     let quickEpoch = 0;
+    let stopClickedAt = 0;
     await j.step('Stop, then Start within a few seconds (the board is still in its bootloader)', async () => {
+      stopClickedAt = Date.now();
       await btn('Stop').click();
       const start = btn('Start');
-      await start.waitFor({ state: 'visible', timeout: 15 * MS });
-      await j.waitUntil(async () => start.isEnabled(), { timeoutMs: 15 * MS, everyMs: 500 });
+      // A UI that is slow to flip is not a board that fails: say which it was.
+      const shown = await start.waitFor({ state: 'visible', timeout: 15 * MS }).then(() => true).catch(() => false);
+      j.must(shown, "the UI's Start button did not appear within 15 s of Stop (UI / service-monitor timing, not the board)");
+      const enabled = await j.waitUntil(async () => start.isEnabled(), { timeoutMs: 15 * MS, everyMs: 500 });
+      // The board's state at the moment of the click: sysfs product and the API.
+      const port = await readPort().catch(() => null);
+      const b = await board().catch(() => null);
+      const info = `sysfs ${port ? port.product || port.state : 'not on the bus'}, API ${describe(b)}`;
+      j.note('quickStartAt', info);
+      j.finding(`Start pressed ${Math.round((Date.now() - stopClickedAt) / MS)} s after Stop, board: ${info}`);
+      j.must(enabled.ok, `the UI's Start button stayed disabled for 15 s after Stop (UI timing, not the board; ${info})`);
       quickEpoch = Math.floor(Date.now() / MS) - 20;
-      await start.click();
+      await start.click({ timeout: 5000 });
     });
     await j.verify('it still ends up mining within 90 s (a failure here is a product defect)', () =>
       mustMine(quickEpoch, 90 * MS, 'Stop then quick Start'));
@@ -433,8 +461,9 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
         await j.shot('overview-with-miner');
         if (solo) j.must(overviewHadMiner, 'the overview of a Solo Node with a miner shows no miner cards: the "gone" check below would prove nothing');
       });
+      await j.verify('the board is in its miner firmware (SLV) and stable', () => settled(Date.now(), 0));
       await j.step('unplug and leave it unplugged until it expires', async () => {
-        await rig.unplug(tty);
+        await rig.unplug(tty, serial);
       });
       await j.verify('the board is listed disconnected, then removed after ~15 minutes', async () => {
         const gone = await j.waitUntil(async () => (await board()) === null, { timeoutMs: 17 * 60 * MS, everyMs: 15 * MS });
@@ -458,7 +487,7 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
       await j.verify('the board comes back and mines (the miner was running)', async () => {
         const r = await waitBoard((b) => !!b && b.status === 'active' && b.mining, { timeoutMs: 120 * MS, everyMs: 3000 });
         j.must(r.ok, `the API says ${describe(r.last)}`);
-        j.must((await instances()) === 1 && (await usbProcs()).length === 1, 'not exactly one instance and one process');
+        return expectRunning(await activeUsbCount(), 'after the expiry replug');
       });
       await j.step('UI: the Miner item and the indicator are back, still without a reload', async () => {
         await waitUi('the indicator', async () => (await indicator().count()) > 0, 45 * MS);

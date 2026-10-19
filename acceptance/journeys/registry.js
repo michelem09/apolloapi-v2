@@ -26,6 +26,13 @@ const OPT_IN = new Set(['wifi', 'usb-miner']);
 // Switches that ride on `--with` but are not journeys: `--with usb-expiry` makes
 // the usb-miner journey also wait out the 15-minute expiry.
 const OPTIONS = new Set(['usb-expiry']);
+const OPTION_HELP = { 'usb-expiry': 'with usb-miner: also leave the board unplugged for the 15-minute expiry (~20 min more)' };
+// An option for a journey that is not in the run is a mistake, not a no-op.
+const checkOptions = (journeys, options) => {
+  if (options.includes('usb-expiry') && !journeys.some((j) => j.name === 'usb-miner')) {
+    throw new Error('--with usb-expiry only applies to the usb-miner journey: add --only usb-miner (or --with usb-miner)');
+  }
+};
 const optionsOf = (extra) => names(extra).filter((w) => OPTIONS.has(w));
 
 // Accepts ids ("04-node-software"), short names ("node-software") or a prefix of
@@ -50,4 +57,4 @@ const select = (all, only, extra = null) => {
   return all.filter((j) => picked.includes(j));
 };
 
-module.exports = { list, select, OPT_IN, OPTIONS, optionsOf };
+module.exports = { list, select, OPT_IN, OPTIONS, OPTION_HELP, optionsOf, checkOptions };

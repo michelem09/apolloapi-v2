@@ -65,18 +65,26 @@ const parseIds = (text) => {
 const isApolloBoard = ({ vendor, product } = {}) =>
   String(vendor || '').trim().toLowerCase() === BOARD.vendor && String(product || '').trim().toLowerCase() === BOARD.product;
 
-// The write. Disabling (value 0) re-checks vendor and product in the shell, at the
-// moment of the write, and does nothing otherwise. Enabling (value 1) does not: it
-// is never destructive, and a deauthorized device must be re-enabled even if its
-// descriptor can no longer be read.
-const authorizeCommand = (dir, value) => {
+// What to run by hand when a board was left deauthorized and nothing else will
+// put it back: every 0483:5740 device on the bus, enabled. Names no directory,
+// because the port number changes.
+const MANUAL_REAUTHORIZE =
+  'for d in /sys/bus/usb/devices/*; do [ "$(cat $d/idVendor 2>/dev/null)" = 0483 ] && [ "$(cat $d/idProduct 2>/dev/null)" = 5740 ] && echo 1 | sudo tee $d/authorized; done';
+
+// The write. Disabling (value 0) re-checks, in the shell and at the moment of the
+// write, the vendor/product, that the product reads SLV (not the bootloader, not
+// anything else) and, when given, the serial; any mismatch prints why on stderr and
+// writes nothing. Enabling (value 1) checks nothing: it is never destructive, and a
+// deauthorized device must be re-enabled even if its descriptor can no longer be read.
+const authorizeCommand = (dir, value, { serial = null } = {}) => {
   if (!isDeviceDir(dir)) throw new Error(`refusing to write: ${dir} is not a USB device directory`);
   if (value !== 0 && value !== 1) throw new Error('authorized is 0 or 1');
   const d = shq(dir);
   const check = value === 0
-    ? `[ "$(cat "$d/idVendor")" = ${BOARD.vendor} ] && [ "$(cat "$d/idProduct")" = ${BOARD.product} ] && ` +
-      // Never while the board is in its bootloader window (see productState).
-      `case "$(cat "$d/product" 2>/dev/null)" in *IAP*) false;; *) true;; esac && `
+    ? 'v=$(cat "$d/idVendor" 2>/dev/null); p=$(cat "$d/idProduct" 2>/dev/null); pr=$(cat "$d/product" 2>/dev/null); sn=$(cat "$d/serial" 2>/dev/null); ' +
+      `[ "$v:$p" = ${BOARD.vendor}:${BOARD.product} ] || { echo "refused: $d is $v:$p, not ${BOARD.vendor}:${BOARD.product}" >&2; exit 1; }; ` +
+      `case "$pr" in *SLV*) ;; *) { echo "refused: product reads '$pr', not SLV (mid board-reset?)" >&2; exit 1; };; esac; ` +
+      (serial ? `[ "$sn" = ${shq(serial)} ] || { echo "refused: serial is '$sn', not the chosen board" >&2; exit 1; }; ` : '')
     : '';
   return `d=${d}; ${check}echo ${value} | sudo -n tee "$d/authorized" >/dev/null && cat "$d/authorized"`;
 };
@@ -154,11 +162,104 @@ const waitSlvStable = async ({
 // The journal lines that explain a board that does not mine.
 const pickJournal = (text, max = 12) =>
   String(text || '').split('\n').map((l) => l.trim())
-    .filter((l) => /Unknown board|status=64|code=exited|Failed|Requisite|dependency|Started|Stopp(ed|ing)/i.test(l))
+    .filter((l) => /unknown\s+(USB\s+)?board|status=64|code=exited|Failed|Requisite|dependency|Started|Stopp(ed|ing)/i.test(l))
     .slice(-max);
 const journalCommand = (epoch) =>
   `journalctl -u 'apollo-usb-miner@*' -u apollo-miner --since @${Number(epoch)} -o short-iso --no-pager 2>/dev/null || true`;
-const wedgedInJournal = (text) => /Unknown board/.test(String(text || ''));
+// usb_miner_run.sh logs "unknown USB board on <port>" and exits 64 (apollo-helper's own
+// output goes to a variable, so the journal never has "Unknown board").
+const wedgedInJournal = (text) => /status=64|unknown\s+USB\s+board|Unknown board/i.test(String(text || ''));
+
+// ------------------------------------------------------------------ orphans
+
+// A killed run (SIGKILL, a second Ctrl-C, the Mac asleep) leaves a board with
+// authorized=0 and nothing that remembers it: the next run would "skip: no USB
+// miner attached". Every USB device on the bus, with its authorized flag.
+const USB_SCAN_CMD =
+  'for d in /sys/bus/usb/devices/*; do [ -f "$d/idVendor" ] || continue; ' +
+  'echo "$(readlink -f "$d")|$(cat "$d/idVendor" 2>/dev/null)|$(cat "$d/idProduct" 2>/dev/null)|$(cat "$d/authorized" 2>/dev/null)|$(cat "$d/serial" 2>/dev/null)"; done; true';
+const parseUsbScan = (text) =>
+  String(text || '').split('\n').map((l) => l.split('|')).filter((f) => f.length >= 5).map((f) => ({
+    dir: f[0].trim(), vendor: f[1].trim().toLowerCase(), product: f[2].trim().toLowerCase(), authorized: f[3].trim(), serial: f[4].trim(),
+  }));
+const orphansIn = (devices) =>
+  devices.filter((d) => isApolloBoard(d) && d.authorized === '0' && isDeviceDir(d.dir));
+
+// Board(s) found deauthorized: authorize them again (harmless) and say so. `markers`
+// are leftover usb.deauthorized files of earlier runs. Returns notes and errors;
+// an error carries the command to run by hand.
+const rescueOrphans = async ({ ssh, markers = [], fsImpl = fs, waitUntil = null, healthPath = null }) => {
+  const notes = [];
+  const errors = [];
+  for (const file of markers) {
+    const m = readMarker(fsImpl, file);
+    if (!m) continue;
+    const exists = isDeviceDir(m.dir) && (await ssh(`test -d ${shq(m.dir)} && echo yes || echo no`).catch(() => 'no')).trim() === 'yes';
+    if (!exists) {
+      fsImpl.rmSync(file, { force: true });
+      notes.push(`usb: leftover marker ${file} named ${m.dir}, which is gone: dropped`);
+      continue;
+    }
+    const r = await replugFromMarker({ ssh, markerPath: file, healthPath, fsImpl, waitUntil });
+    notes.push(...r.notes.map((n) => `${n} (leftover of an earlier run, ${file})`));
+    errors.push(...r.errors);
+  }
+  for (const d of orphansIn(parseUsbScan(await ssh(USB_SCAN_CMD)))) {
+    try {
+      const out = await ssh(authorizeCommand(d.dir, 1));
+      if (String(out).trim() !== '1') throw new Error(`authorized reads "${String(out).trim()}"`);
+      notes.push(`usb: board ${d.serial || d.dir} was deauthorized (a killed earlier run): authorized it again`);
+      if (healthPath && d.serial) fsImpl.writeFileSync(healthPath, JSON.stringify({ serial: d.serial, since: Math.floor(Date.now() / 1000) }), { mode: 0o600 });
+    } catch (err) {
+      errors.push(`usb: board ${d.serial || d.dir} is deauthorized and could not be re-enabled: ${err.message} — run: ${MANUAL_REAUTHORIZE}`);
+    }
+  }
+  return { notes, errors };
+};
+
+// usb.deauthorized files that earlier runs left in their output directories.
+const leftoverMarkers = (out, fsImpl = fs) => {
+  const parent = path.dirname(out);
+  try {
+    return fsImpl.readdirSync(parent)
+      .map((d) => path.join(parent, d, MARKER))
+      .filter((f) => path.resolve(f) !== path.resolve(path.join(out, MARKER)) && fsImpl.existsSync(f));
+  } catch {
+    return [];
+  }
+};
+
+// ------------------------------------------------------------ what runs
+
+// The instances and miner processes that run on USB ports right now, against the
+// number the API says are active USB boards. A leftover instance or process on the
+// OLD port name after a re-enumeration (ttyACM0 -> ttyACM1) is the real risk, and a
+// count filtered on one unit name cannot see it. Returns null when it adds up.
+const instanceMismatch = ({ units, procs, expected }) => {
+  const unitPorts = units.map((u) => /^apollo-usb-miner@(ttyACM\d+)\.service$/.exec(u)?.[1]).filter(Boolean).sort();
+  const procPorts = procs.map((p) => /(ttyACM\d+)$/.exec(p.comport || '')?.[1]).filter(Boolean).sort();
+  const same = JSON.stringify(unitPorts) === JSON.stringify(procPorts);
+  if (unitPorts.length === expected && procPorts.length === expected && same) return null;
+  return `expected ${expected} USB miner instance(s) and process(es), found ${unitPorts.length} unit(s) [${unitPorts.join(', ') || '-'}] and ${procPorts.length} process(es) [${procPorts.join(', ') || '-'}]`;
+};
+const activeUnitNames = (text) => String(text || '').split('\n').map((l) => l.trim().split(/\s+/)[0]).filter((n) => /^apollo-usb-miner@/.test(n));
+const USB_UNITS_CMD = "systemctl list-units --plain --no-legend --state=active,activating,reloading 'apollo-usb-miner@*' || true";
+
+// ------------------------------------------------------------------- misc
+
+// The "Active a/t" badge of the Hashboards card: on an Apollo II the Pools card
+// has one too. The first badge after the word "Hashboards" (the first badge at all
+// when the word is absent).
+const hashboardsBadge = (text) => {
+  const t = String(text || '');
+  const at = t.indexOf('Hashboards');
+  const found = activeBadges(at >= 0 ? t.slice(at) : t);
+  return found[0] || null;
+};
+
+// A probe that polls must not read one dropped connection as "not yet".
+const isTransient = (err) =>
+  !!err && (err.transport === true || /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|socket hang up|UND_ERR/i.test(`${err.message} ${err.cause?.message || ''}`));
 
 // ------------------------------------------------------------------ rig
 
@@ -192,7 +293,7 @@ const replugFromMarker = async ({ ssh, markerPath, healthPath = null, fsImpl = f
       fsImpl.writeFileSync(healthPath, JSON.stringify({ serial: m.serial, since: Math.floor(Date.now() / 1000) }), { mode: 0o600 });
     }
   } catch (err) {
-    errors.push(`usb: could not re-authorize ${m.dir}: ${err.message} — do it by hand: echo 1 | sudo tee ${m.dir}/authorized`);
+    errors.push(`usb: could not re-authorize ${m.dir}: ${err.message} — do it by hand: ${MANUAL_REAUTHORIZE}`);
     return { restored: false, notes, errors };
   }
   // The port may come back under another name: the board is looked up by serial.
@@ -208,10 +309,13 @@ const replugFromMarker = async ({ ssh, markerPath, healthPath = null, fsImpl = f
   return { restored: true, notes, errors };
 };
 
-// After a re-authorize: is the board really back? SLV and stable within 90 s, and
-// no "Unknown board" in the journal with the instance not running. A wedged board
-// only a physical replug brings back; this says so instead of failing silently.
-const verifyHealth = async ({ ssh, healthPath, fsImpl = fs, now, sleep, timeoutMs = 90000 }) => {
+// After a re-authorize: is the board really back? SLV and stable within 90 s; then,
+// when apollo-miner is active, the instance must leave usb_miner_run.sh's settle and
+// probe (~8 s + up to 3 probes) and either run a miner on the board or fail:
+// "unknown USB board" / status=64 in the journal means the board answers nothing
+// and only a physical replug brings it back. With apollo-miner stopped nothing
+// starts on purpose, and nothing is judged.
+const verifyHealth = async ({ ssh, healthPath, fsImpl = fs, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), timeoutMs = 90000, probeMs = 45000 }) => {
   let req;
   try { req = JSON.parse(fsImpl.readFileSync(healthPath, 'utf8')); } catch { return { checked: false, errors: [] }; }
   fsImpl.rmSync(healthPath, { force: true });
@@ -222,18 +326,30 @@ const verifyHealth = async ({ ssh, healthPath, fsImpl = fs, now, sleep, timeoutM
     errors.push(`usb: PHYSICAL REPLUG NEEDED — board ${req.serial} did not come back after the re-authorize: ${r.reason}`);
     return { checked: true, errors };
   }
-  const minerActive = (await ssh('systemctl show apollo-miner -p ActiveState --value || true')).trim() === 'active';
-  const unit = (await ssh(`systemctl show 'apollo-usb-miner@${r.tty}' -p ActiveState --value || true`)).trim();
-  const journal = await ssh(journalCommand(req.since));
-  if (minerActive && unit !== 'active' && wedgedInJournal(journal)) {
-    errors.push(`usb: PHYSICAL REPLUG NEEDED — board ${req.serial} is back as SLV on ${r.tty} but the miner answers "Unknown board" and the instance is ${unit}`);
+  const minerActive = async () => (await ssh('systemctl show apollo-miner -p ActiveState --value || true')).trim() === 'active';
+  if (!(await minerActive())) return { checked: true, errors, tty: r.tty, judged: false };
+  const t0 = now();
+  for (;;) {
+    const port = (await read()) || { tty: r.tty };
+    const running = procsOn(parseMinerProcs(await ssh('ps -eo pid=,comm=,args=')), port.tty).length > 0;
+    if (running) return { checked: true, errors, tty: port.tty, judged: true };
+    const journal = await ssh(journalCommand(req.since));
+    if (wedgedInJournal(journal)) {
+      const unit = (await ssh(`systemctl show 'apollo-usb-miner@${port.tty}' -p ActiveState --value || true`)).trim();
+      errors.push(`usb: PHYSICAL REPLUG NEEDED — board ${req.serial} is back as SLV on ${port.tty} but the miner does not recognise it (instance ${unit}): ${pickJournal(journal, 3).join(' | ')}`);
+      return { checked: true, errors, tty: port.tty, judged: true };
+    }
+    if (now() - t0 >= probeMs) {
+      errors.push(`usb: board ${req.serial} is back as SLV on ${port.tty} and apollo-miner is active, but no miner runs on it ${Math.round(probeMs / 1000)} s later (journal: ${pickJournal(journal, 3).join(' | ') || 'nothing relevant'})`);
+      return { checked: true, errors, tty: port.tty, judged: true };
+    }
+    await sleep(3000);
   }
-  return { checked: true, errors, tty: r.tty };
 };
 
 const createUsbRig = ({ ssh, markerPath, healthPath = null, fsImpl = fs, waitUntil = null }) => {
   // Where the board really is, and proof that it is the board. Throws, writes nothing.
-  const inspect = async (tty) => {
+  const inspect = async (tty, expectSerial = null) => {
     if (!/^ttyACM\d+$/.test(tty)) throw new Error(`"${tty}" is not a ttyACM port`);
     const iface = (await ssh(`readlink -f /sys/class/tty/${tty}/device`)).trim();
     const dir = usbDeviceDirOf(iface);
@@ -243,18 +359,27 @@ const createUsbRig = ({ ssh, markerPath, healthPath = null, fsImpl = fs, waitUnt
       throw new Error(`refusing: ${dir} is ${ids.vendor || '?'}:${ids.product || '?'}, not a ${BOARD.vendor}:${BOARD.product} board — nothing written`);
     }
     const product = (await ssh(`cat ${shq(`${dir}/product`)} 2>/dev/null || true`)).trim();
-    if (productState(product) === 'IAP') {
-      throw new Error(`refusing: ${dir} reads "${product}" (bootloader, mid board-reset): deauthorizing now wedges the board — nothing written`);
+    if (productState(product) !== 'SLV') {
+      throw new Error(`refusing: ${dir} reads "${product || '(nothing)'}", not SLV (bootloader or mid board-reset): deauthorizing now wedges the board — nothing written`);
     }
     const serial = (await ssh(`cat ${shq(`${dir}/serial`)} 2>/dev/null || true`)).trim();
+    if (expectSerial && serial.toLowerCase() !== String(expectSerial).toLowerCase()) {
+      throw new Error(`refusing: ${dir} has serial "${serial}", not the chosen board ${expectSerial} — nothing written`);
+    }
     return { dir, iface, ids, product, serial };
   };
 
-  const unplug = async (tty) => {
-    const { dir, serial } = await inspect(tty);
+  const unplug = async (tty, expectSerial = null) => {
+    const { dir, serial } = await inspect(tty, expectSerial);
     // Before the write: a crash right after it must still leave the way back.
     fsImpl.writeFileSync(markerPath, JSON.stringify({ dir, tty, serial, at: new Date().toISOString() }), { mode: 0o600 });
-    const out = await ssh(authorizeCommand(dir, 0));
+    let out;
+    try {
+      out = await ssh(authorizeCommand(dir, 0, { serial: expectSerial }));
+    } catch (err) {
+      // The shell says why it refused on stderr; ssh puts it in the error.
+      throw new Error(`${(err.stderr || err.message || '').toString().trim().split('\n').pop()} (nothing written, or the write failed: marker kept so the restore re-enables)`);
+    }
     if (String(out).trim() !== '0') throw new Error(`authorized reads "${String(out).trim()}" after the write`);
     return dir;
   };
@@ -344,4 +469,15 @@ module.exports = {
   journalCommand,
   wedgedInJournal,
   verifyHealth,
+  MANUAL_REAUTHORIZE,
+  USB_SCAN_CMD,
+  USB_UNITS_CMD,
+  parseUsbScan,
+  orphansIn,
+  rescueOrphans,
+  leftoverMarkers,
+  instanceMismatch,
+  activeUnitNames,
+  hashboardsBadge,
+  isTransient,
 };

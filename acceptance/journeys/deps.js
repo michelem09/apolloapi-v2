@@ -30,6 +30,13 @@ const buildDeps = ({ profile, io, out, ctxFile, uiBase, original, wifi, spawnImp
       // The journal is read from here on: a stop that skipped its script
       // anywhere in the round is found at the end, whichever journey caused it.
       state.roundSince = Number(await ssh('date +%s'));
+      // A board a killed earlier run left deauthorized comes back before anything is
+      // photographed (and before a journey could skip as "no USB miner attached").
+      const orphans = await usb.rescueOrphans({
+        ssh, markers: usb.leftoverMarkers(out), waitUntil, healthPath: usb.healthFile(out),
+      });
+      if (orphans.errors.length) throw new Error(orphans.errors.join('; '));
+      state.usbNotes = orphans.notes;
       return takeStateSnapshot({ profile, ssh, gql, base });
     },
 
@@ -69,7 +76,9 @@ const buildDeps = ({ profile, io, out, ctxFile, uiBase, original, wifi, spawnImp
       const health = await usb.verifyHealth({ ssh, healthPath: usb.healthFile(out) })
         .catch((err) => ({ errors: [`usb: health check failed: ${err.message}`] }));
       const rest = await restoreState({ profile, ssh, gql, gqlWrite, snap, base, waitUntil, wifi });
-      return { notes: [...back.notes, ...rest.notes], errors: [...back.errors, ...health.errors, ...rest.errors] };
+      const early = state.usbNotes || [];
+      state.usbNotes = [];
+      return { notes: [...early, ...back.notes, ...rest.notes], errors: [...back.errors, ...health.errors, ...rest.errors] };
     },
 
     password: () =>
