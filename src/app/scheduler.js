@@ -5,6 +5,7 @@ const pubsub = require('../graphql/pubsub');
 const TOPICS = require('../graphql/topics');
 const log = require('../logger')('scheduler');
 const { getMinerBoards } = require('../minerBoards');
+const { getDeviceFamily } = require('../deviceFamily');
 
 /**
  * Parse hashrate string (e.g., "810M", "3.2T", "1.5G") to GH/s
@@ -543,7 +544,18 @@ async function pushSoloStats() {
  * and board temperature all move on that scale, and anything faster would fight
  * the guard rails rather than help.
  */
+let soloNodeAutomationSkipLogged = false;
 async function evaluateAutomation() {
+  // Automation is hidden on a Solo Node (nothing to schedule: the miners are USB
+  // boards, not the device's own), so the engine does not act there either. The
+  // stored config and rules are left as they are; only the tick is skipped.
+  if (getDeviceFamily() === 'solo-node') {
+    if (!soloNodeAutomationSkipLogged) {
+      soloNodeAutomationSkipLogged = true;
+      log.debug('automation tick skipped: Solo Node');
+    }
+    return;
+  }
   try {
     const result = await withTimeout(services.automation.evaluate(), 20000, 'automation.evaluate');
 

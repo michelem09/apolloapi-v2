@@ -33,6 +33,8 @@ jest.mock('../src/services', () => ({
   serviceMonitor: null,
 }));
 
+jest.mock('../src/deviceFamily', () => ({ getDeviceFamily: jest.fn(() => 'unknown') }));
+
 jest.setTimeout(15000);
 
 describe('scheduler push functions', () => {
@@ -364,6 +366,26 @@ describe('scheduler push functions', () => {
   // ------------------------------------------------------------------ //
 
   describe('evaluateAutomation', () => {
+    it('does nothing on a Solo Node: no tick, no publish', async () => {
+      require('../src/deviceFamily').getDeviceFamily.mockReturnValue('solo-node');
+      services.automation.evaluate.mockResolvedValue({ applied: true });
+
+      await scheduler.evaluateAutomation();
+      await scheduler.evaluateAutomation();
+
+      expect(services.automation.evaluate).not.toHaveBeenCalled();
+      expect(publishSpy.mock.calls.find(([t]) => t === TOPICS.AUTOMATION)).toBeUndefined();
+    });
+
+    it('still ticks on an Apollo III (the guard is the Solo Node only)', async () => {
+      require('../src/deviceFamily').getDeviceFamily.mockReturnValue('apollo-iii');
+      services.automation.evaluate.mockResolvedValue({ applied: false, decision: null });
+
+      await scheduler.evaluateAutomation();
+
+      expect(services.automation.evaluate).toHaveBeenCalledTimes(1);
+    });
+
     it('publishes the tick result and does not push status when nothing was applied', async () => {
       services.automation.evaluate.mockResolvedValue({ applied: false, decision: null });
 

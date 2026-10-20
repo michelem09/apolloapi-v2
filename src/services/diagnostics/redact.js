@@ -90,6 +90,12 @@ const INLINE_SECRET =
 const ARG_SECRET =
   /(?<![\w.-])((?:wifi-sec|802-11-wireless-security)\.(?:psk|wep-key\d)|password|passphrase|psk|secret|token)\s+(?!=)(\S+)/gi;
 
+// The miner CLI's pool password (`-pswd <value>`, `-pswd2` for the backup pool), as it
+// sits in miner_config and in the process list. ARG_SECRET cannot see it: its
+// lookbehind refuses a word preceded by `-`, and `pswd` is not in its list. The
+// pool USER (`-user`) is a worker name and stays, so support can tell workers apart.
+const MINER_PSWD = /(^|\s)(-pswd2?)(\s+|=)(\S+)/gi;
+
 // A sudo journal line for nmcli: the whole argv is dropped. Field-level matching
 // cannot cover it — a passphrase may hold spaces (sudo does not quote), and the
 // SSID and profile name (`ssid X`, `con-name X`) are identifying too.
@@ -115,6 +121,7 @@ function scrubText(text) {
       .replace(SUDO_NMCLI, (_m, head) => `${head} ${CENSOR}`)
       .replace(INLINE_SECRET, (_m, key) => `${key}=${CENSOR}`)
       .replace(ARG_SECRET, (_m, key) => `${key} ${CENSOR}`)
+      .replace(MINER_PSWD, (_m, lead, flag, sep) => `${lead}${flag}${sep}${CENSOR}`)
       .replace(NMCLI_SSID, (_m, verb) => `${verb} ${CENSOR}`)
       .replace(INLINE_SSID, (_m, key) => `${key}=${CENSOR}`)
       .replace(URL_USERINFO, (_m, scheme) => `${scheme}${CENSOR}:${CENSOR}@`)

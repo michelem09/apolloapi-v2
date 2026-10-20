@@ -89,6 +89,19 @@ describe('diagnostics redaction — secrets in free text', () => {
     });
   });
 
+  it('redacts the miner CLI pool password but keeps the worker name', () => {
+    const cmd = '-host 127.0.0.1 -port 3333 -user bc1qexampleworker.rig1 -pswd hunter2pool -host2 pool.example -user2 w2 -pswd2 backupSecret -powermode eco';
+    const out = scrubText(cmd);
+    expect(out).not.toContain('hunter2pool');
+    expect(out).not.toContain('backupSecret');
+    expect(out).toContain('-pswd [redacted]');
+    expect(out).toContain('-pswd2 [redacted]');
+    expect(out).toContain('-user2 w2');
+    expect(out).toContain('-powermode eco');
+    // multi-line config form, flag at line start
+    expect(scrubText('-user a\n-pswd x1y2z3\n-port 3333')).not.toContain('x1y2z3');
+  });
+
   it('does not let `psk` inside `wpa-psk` hide the real key', () => {
     const out = scrubText('wifi-sec.key-mgmt wpa-psk wifi-sec.psk Sup3rSecretPSK');
     expect(out).not.toContain('Sup3rSecretPSK');
