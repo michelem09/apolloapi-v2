@@ -23,7 +23,8 @@ jest.mock('../src/logger', () => {
 
 const logger = require('../src/logger');
 const { getDeviceFamily, parseBoardName, familyOf, resetDeviceFamilyCache } = require('../src/deviceFamily');
-const { hasUsbMiners, resetUsbMinersCache, GRACE_MS } = require('../src/usbMiners');
+const { hasUsbMiners, resetUsbMinersCache } = require('../src/usbMiners');
+const { EXPIRY_MS } = require('../src/minerBoards');
 const { MINER_MODES, availableMinerModes } = require('../src/constants/minerModes');
 const signals = require('../src/services/signals');
 const { decide } = require('../src/services/automation/engine');
@@ -545,13 +546,17 @@ describe('USB miner detection (Solo Node)', () => {
     expect(hasUsbMiners()).toBe(true);
   });
 
-  it('debounces a re-enumeration blink shorter than the grace window, but not a real unplug', () => {
+  // The board registry answers (a lost board stays "attached" for EXPIRY_MS, so a
+  // blink or a replug never flips the modes), replacing the old 60 s sighting grace.
+  it('a re-enumeration blink keeps the answer, a real unplug ends it once the board has expired', () => {
     fs.writeFileSync(path.join(dev, 'ttyACM0'), '');
     const t0 = 1_000_000;
     expect(hasUsbMiners(process.env, t0)).toBe(true);
     fs.rmSync(path.join(dev, 'ttyACM0'));
-    expect(hasUsbMiners(process.env, t0 + GRACE_MS - 1)).toBe(true); // blink: still present
-    expect(hasUsbMiners(process.env, t0 + GRACE_MS + 1)).toBe(false); // gone for good
+    // The absence is counted from the first reading that misses the board.
+    expect(hasUsbMiners(process.env, t0 + 1000)).toBe(true); // blink: still present
+    expect(hasUsbMiners(process.env, t0 + 1000 + EXPIRY_MS - 1)).toBe(true);
+    expect(hasUsbMiners(process.env, t0 + 1000 + EXPIRY_MS + 1)).toBe(false); // gone for good
   });
 
   it('an unreadable dev dir counts as absent', () => {

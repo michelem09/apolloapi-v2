@@ -221,6 +221,19 @@ jobs:
           install -m 755 "$m/bin/aarch64/apollo-helper"   "$m/apollo-helper"
           install -m 755 "$STAGE/backend/ckpool/bin/aarch64/ckpool" "$STAGE/backend/ckpool/ckpool"
 
+          # USB miner hotplug. These are tracked files that the backend/ copy above
+          # carries along; they are checked here because nothing else would notice
+          # one going missing: apollo-usb-miner@.service runs usb_miner_run.sh
+          # directly (so it needs its execute bit), and the updater refuses an
+          # artifact without all three.
+          for f in backend/apollo-miner/usb_miner_run.sh \
+                   backend/systemd/apollo-usb-miner@.service \
+                   backend/udev/99-apollo-usb-miner.rules; do
+            [ -f "$STAGE/$f" ] || { echo "::error::the staged tree has no $f"; exit 1; }
+          done
+          [ -x "$STAGE/backend/apollo-miner/usb_miner_run.sh" ] \
+            || { echo "::error::usb_miner_run.sh is not executable in the staged tree"; exit 1; }
+
           # These arrive with steps 4 and 5; included automatically once they exist.
           [ -f bin/apollo-update ] && install -Dm755 bin/apollo-update "$STAGE/bin/apollo-update" || true
           [ -f bootstrap.sh ]      && install -Dm755 bootstrap.sh      "$STAGE/bootstrap.sh"      || true

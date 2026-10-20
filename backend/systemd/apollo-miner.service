@@ -13,7 +13,8 @@ EnvironmentFile=-/opt/apolloapi/.env
 ExecStart=/opt/apolloapi/backend/apollo-miner/miner_start.sh
 WorkingDirectory=/opt/apolloapi/backend/apollo-miner
 #Stop:
-# miner_start.sh keeps the unit "activating" for ~35s, and a stop in that window
+# On an Apollo II miner_start.sh keeps the unit "activating" for ~35s (internal
+# board reset and wait; Solo Node and Apollo 3 do not wait), and a stop in that window
 # (or after a crash) never runs ExecStop: systemd goes straight to killing the
 # cgroup. ExecStopPost always runs, so it owes the same shutdown; --if-owed makes
 # it a no-op when ExecStop already did it.

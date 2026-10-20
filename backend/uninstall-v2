@@ -48,9 +48,14 @@ rm -f /etc/systemd/system/apollo-ui-v2.service
 rm -f /etc/systemd/system/apollo-miner.service
 rm -f /etc/systemd/system/node.service
 rm -f /etc/systemd/system/ckpool.service
+rm -f /etc/systemd/system/apollo-usb-miner@.service
 
-# Reload systemd daemon
+# Remove the USB miner hotplug rule
+rm -f /etc/udev/rules.d/99-apollo-usb-miner.rules
+
+# Reload systemd daemon and udev rules
 systemctl daemon-reload
+udevadm control --reload-rules
 
 echo -e "${GREEN} ---> Systemd services stopped, disabled and removed${NC}"
 

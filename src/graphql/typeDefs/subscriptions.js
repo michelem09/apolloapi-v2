@@ -9,6 +9,7 @@ module.exports = gql`
     services: StatusOutput
     settings: SettingsUpdateOutput
     automation: AutomationStateOutput
+    minerBoards: MinerBoardsOutput
   }
 
   type MinerSubscriptionPayload {

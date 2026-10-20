@@ -37,6 +37,7 @@ HEALTH_TIMEOUT="${APOLLO_HEALTH_TIMEOUT:-90}"
 # Overridable so the unit backup/restore path can be exercised against a sandbox
 # instead of only asserted on as text. Same reasoning as APOLLO_ROOT_DIR.
 SYSTEMD_DIR="${APOLLO_SYSTEMD_DIR:-/etc/systemd/system}"
+UDEV_RULES_DIR="${APOLLO_UDEV_RULES_DIR:-/etc/udev/rules.d}"
 RC_LOCAL="${APOLLO_RC_LOCAL:-/etc/rc.local}"
 # A hard runtime dependency, checked rather than assumed: this is sourced before
 # the ERR trap is armed, so a missing file aborted the script with no record, no
@@ -508,6 +509,13 @@ ROOT_FILES='knexfile.js package.json version.json'
 # cannot drift apart and leave a unit un-revertable.
 UNITS='apollo-bootstrap apollo-api apollo-ui-v2 apollo-miner node ckpool rc-local swap'
 
+# USB miner hotplug: a template unit (one instance per port, never enabled — udev
+# and miner_start.sh start the instances) and the udev rule that asks for them.
+# Not in UNITS: that list is enabled at boot, and enabling a template is an error.
+# Named once for the same reason as UNITS: backup, install and rollback must agree.
+USB_UNIT='apollo-usb-miner@.service'
+USB_RULE='99-apollo-usb-miner.rules'
+
 # backend/ is replaced wholesale, bitcoind included. It used to be the single
 # carried-across exception — excluded from the artifact to keep it small, and
 # moved aside and back around the swap. That machinery is gone: the release now
@@ -660,6 +668,8 @@ backup_units() {
     [ -f "$SYSTEMD_DIR/$unit.service" ] \
       && cp -p "$SYSTEMD_DIR/$unit.service" "$UNIT_BACKUP/$unit.service"
   done
+  [ -f "$SYSTEMD_DIR/$USB_UNIT" ] && cp -p "$SYSTEMD_DIR/$USB_UNIT" "$UNIT_BACKUP/$USB_UNIT"
+  [ -f "$UDEV_RULES_DIR/$USB_RULE" ] && cp -p "$UDEV_RULES_DIR/$USB_RULE" "$UNIT_BACKUP/$USB_RULE"
   [ -f "$RC_LOCAL" ] && cp -p "$RC_LOCAL" "$UNIT_BACKUP/rc.local"
   UNITS_SAVED=1
   return 0
@@ -685,8 +695,43 @@ restore_units() {
   if [ -f "$UNIT_BACKUP/rc.local" ]; then
     install -m 755 "$UNIT_BACKUP/rc.local" "$RC_LOCAL" || rc=1
   fi
+  # The USB hotplug pair goes back as it was, or goes away if the release
+  # introduced it: the restored backend/ has no usb_miner_run.sh to run, and a rule
+  # left behind would keep asking systemd for instances whose ExecStart is gone.
+  # The instances themselves stop with apollo-miner (PartOf=), which the rollback
+  # has already stopped.
+  if [ -f "$UNIT_BACKUP/$USB_UNIT" ]; then
+    install -m 644 "$UNIT_BACKUP/$USB_UNIT" "$SYSTEMD_DIR/$USB_UNIT" || rc=1
+  else
+    rm -f "$SYSTEMD_DIR/$USB_UNIT" || rc=1
+  fi
+  if [ -f "$UNIT_BACKUP/$USB_RULE" ]; then
+    install -m 644 "$UNIT_BACKUP/$USB_RULE" "$UDEV_RULES_DIR/$USB_RULE" || rc=1
+  else
+    rm -f "$UDEV_RULES_DIR/$USB_RULE" || rc=1
+  fi
   systemctl daemon-reload || true
+  reload_udev_rules
   return "$rc"
+}
+
+# Replays the udev add event for already-attached USB hashboards (0483:5740), so
+# the instances start without a replug or a reboot. Targeted, never the whole tty
+# subsystem: other serial devices (a Zigbee stick on the Solo Node) have no business
+# being re-announced. Best effort, like the reload.
+trigger_usb_miners() {
+  have udevadm || return 0
+  udevadm trigger --action=add --subsystem-match=tty \
+    --property-match=ID_VENDOR_ID=0483 --property-match=ID_MODEL_ID=5740 \
+    >/dev/null 2>&1 || err "Could not re-announce the attached USB miners"
+}
+
+# New or removed rules are not seen by udevd until told. Best effort: a sandbox
+# (tests) or a minimal image has no udevadm, and a missed reload only delays the
+# hotplug start until the next boot, it never fails an update.
+reload_udev_rules() {
+  have udevadm || return 0
+  udevadm control --reload-rules >/dev/null 2>&1 || true
 }
 
 # Nothing pruned these, so every update left a full copy of the tree it replaced
@@ -1064,6 +1109,12 @@ for unit in $UNITS; do
   [ -e "$STAGING/backend/systemd/$unit.service" ] \
     || die "Artifact is missing the $unit unit — refusing to install"
 done
+# And for the USB hotplug pair, which a release that dropped it would leave
+# un-installed while the new miner_start.sh enqueues instances of a unit that is
+# not there.
+for f in "backend/systemd/$USB_UNIT" "backend/udev/$USB_RULE" backend/apollo-miner/usb_miner_run.sh; do
+  [ -e "$STAGING/$f" ] || die "Artifact is missing $f — refusing to install"
+done
 # The updater's own runtime dependencies, which the `backend/` existence test
 # above cannot see. version.sh is sourced before the ERR trap is armed, so a
 # release that lost it installs cleanly, passes the health check, and then kills
@@ -1168,7 +1219,11 @@ for unit in $UNITS; do
     && install -m 644 "$APOLLO_DIR/backend/systemd/$unit.service" "$SYSTEMD_DIR/$unit.service"
 done
 [ -f "$APOLLO_DIR/backend/rc.local" ] && install -m 755 "$APOLLO_DIR/backend/rc.local" "$RC_LOCAL"
+install -m 644 "$APOLLO_DIR/backend/systemd/$USB_UNIT" "$SYSTEMD_DIR/$USB_UNIT"
+mkdir -p "$UDEV_RULES_DIR"
+install -m 644 "$APOLLO_DIR/backend/udev/$USB_RULE" "$UDEV_RULES_DIR/$USB_RULE"
 systemctl daemon-reload
+reload_udev_rules
 # Every installed unit, and failures are reported. The old updater enabled seven
 # unconditionally; this had dropped swap.service — silently removing swap at the
 # next boot on a 4 GB board — and swallowed every error with `|| true`, so an
@@ -1246,6 +1301,11 @@ if wanted miner; then
 else
   err "Leaving apollo-miner.service stopped: it was turned off before the update"
 fi
+# Boards plugged in before the rule existed were never offered to it. Replay the
+# add event for them, so their instances start without a replug or a reboot (a
+# second start of a running instance is a no-op; with the miner left stopped
+# Requisite= refuses the instance, which is what a stopped miner should get).
+trigger_usb_miners
 health_ok || die "Health check failed after installing $VERSION"
 
 COMPLETED=1

@@ -312,6 +312,9 @@ cp $APOLLO_DIR/backend/systemd/ckpool.service /etc/systemd/system/
 
 # Copy the apollo-miner.service file to /etc/systemd/system
 cp $APOLLO_DIR/backend/systemd/apollo-miner.service /etc/systemd/system/
+# USB miner hotplug: template unit (never enabled, udev starts it) + its rule
+cp $APOLLO_DIR/backend/systemd/apollo-usb-miner@.service /etc/systemd/system/
+cp $APOLLO_DIR/backend/udev/99-apollo-usb-miner.rules /etc/udev/rules.d/
 
 #SWAP
 cp $APOLLO_DIR/backend/systemd/swap.service /etc/systemd/system/
@@ -340,6 +343,7 @@ systemctl restart systemd-journald
 
 # Reload systemd daemon to recognize the new service
 systemctl daemon-reload
+udevadm control --reload-rules
 
 echo -e "${GREEN} ---> Reloaded systemd daemon${NC}"
 

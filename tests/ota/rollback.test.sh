@@ -31,7 +31,7 @@ export RESULTS
 # Hand-written assertions. The shared version-ordering fixture adds one per case
 # on top, counted below so a growing table does not need this number edited —
 # while a scenario that dies before asserting still fails the suite.
-HAND_WRITTEN_ASSERTIONS=95
+HAND_WRITTEN_ASSERTIONS=102
 VERSION_FIXTURE="$REPO/apolloui-v2/src/lib/version-order.fixture.txt"
 if [ ! -f "$VERSION_FIXTURE" ]; then
   printf '\033[0;31mmissing %s\033[0m — the UI submodule is not checked out\n' "$VERSION_FIXTURE"
@@ -289,6 +289,53 @@ EOF
   if [ -f "$SYSTEMD_DIR/apollo-bootstrap.service" ]; then
     bad "a unit added by the release is removed" "it is still installed"
   else ok "a unit added by the release is removed"; fi
+)
+
+# --- the USB hotplug unit and rule are backed up and rolled back with the rest -
+# The real backup_units / restore_units run against a sandbox (the /etc paths are
+# overridable). A release that introduced the pair has nothing to restore, so the
+# rollback must REMOVE it; one that already had it gets its old copy back. Left
+# behind, the rule keeps asking systemd for instances of a restored tree that has
+# no usb_miner_run.sh.
+(
+  make_device
+  SYSTEMD_DIR="$ROOT/etc/systemd/system"; UDEV_RULES_DIR="$ROOT/etc/udev/rules.d"
+  RC_LOCAL="$ROOT/etc/rc.local"
+  mkdir -p "$SYSTEMD_DIR" "$UDEV_RULES_DIR"
+  cat > "$STUBS/udevadm" <<'EOS'
+#!/bin/bash
+echo "udevadm $*" >> "$SYSTEMCTL_LOG"
+EOS
+  chmod +x "$STUBS/udevadm"
+
+  # The device already has the pair (an earlier release installed it).
+  echo 'OLD-USB-UNIT' > "$SYSTEMD_DIR/$USB_UNIT"
+  echo 'OLD-USB-RULE' > "$UDEV_RULES_DIR/$USB_RULE"
+  backup_units
+  check "the backup holds the USB template unit" "$(cat "$UNIT_BACKUP/$USB_UNIT" 2>/dev/null)" "OLD-USB-UNIT"
+  check "the backup holds the udev rule" "$(cat "$UNIT_BACKUP/$USB_RULE" 2>/dev/null)" "OLD-USB-RULE"
+  echo 'NEW-USB-UNIT' > "$SYSTEMD_DIR/$USB_UNIT"
+  echo 'NEW-USB-RULE' > "$UDEV_RULES_DIR/$USB_RULE"
+  restore_units >/dev/null 2>&1
+  check "the USB template unit is reverted" "$(cat "$SYSTEMD_DIR/$USB_UNIT")" "OLD-USB-UNIT"
+  check "the udev rule is reverted" "$(cat "$UDEV_RULES_DIR/$USB_RULE")" "OLD-USB-RULE"
+  if grep -q 'udevadm control --reload-rules' "$SYSTEMCTL_LOG"; then ok "udev rules reloaded after the revert"
+  else bad "udev rules reloaded after the revert" "no reload recorded"; fi
+  rm -rf "$ROOT"
+)
+(
+  make_device
+  SYSTEMD_DIR="$ROOT/etc/systemd/system"; UDEV_RULES_DIR="$ROOT/etc/udev/rules.d"
+  RC_LOCAL="$ROOT/etc/rc.local"
+  mkdir -p "$SYSTEMD_DIR" "$UDEV_RULES_DIR"
+  # The device predates the feature: nothing to back up, the release adds the pair.
+  backup_units
+  echo 'NEW-USB-UNIT' > "$SYSTEMD_DIR/$USB_UNIT"
+  echo 'NEW-USB-RULE' > "$UDEV_RULES_DIR/$USB_RULE"
+  restore_units >/dev/null 2>&1
+  check "a USB unit the release added is removed" "$([ -e "$SYSTEMD_DIR/$USB_UNIT" ] && echo present || echo gone)" "gone"
+  check "a udev rule the release added is removed" "$([ -e "$UDEV_RULES_DIR/$USB_RULE" ] && echo present || echo gone)" "gone"
+  rm -rf "$ROOT"
 )
 
 # --- a rollback after a PARTIAL backup must not destroy the live copies -------

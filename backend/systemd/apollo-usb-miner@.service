@@ -1,0 +1,48 @@
+[Unit]
+Description=Apollo USB miner on /dev/%I
+# One instance per USB hashboard port, started by udev (99-apollo-usb-miner.rules)
+# and by miner_start.sh for boards already plugged in when apollo-miner starts.
+# apollo-miner itself must never be restarted for a plug: on Apollo II that
+# resets the internal board through gpio.
+
+# The instance lives and dies with its port.
+BindsTo=dev-%i.device
+After=dev-%i.device apollo-miner.service
+
+# A miner the user stopped stays stopped: a plug does not start it, because
+# Requisite= makes the start fail instead of pulling apollo-miner in. At boot the
+# udev coldplug can win the race against apollo-miner (Requisite fails, the board
+# is not started by udev); miner_start.sh then starts the instances once
+# apollo-miner is up, with systemctl start --no-block.
+Requisite=apollo-miner.service
+
+# Stop and Restart of apollo-miner propagate here. On a restart the instances stop
+# before apollo-miner (After=), apollo-miner starts and miner_start.sh deletes the
+# stale stat files, then the instances start again (After=): they never write a
+# stat file that the cleanup could remove.
+PartOf=apollo-miner.service
+
+# A flapping port (a replug enumerates up to 4 times in 20 s) must never trip the
+# default 5-in-10-s start limit and leave the board unstarted.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+# The checkout (it must exist for systemd to start us); usb_miner_run.sh itself
+# moves into the runtime dir (/var/lib/apollo/miner), where the miner writes its
+# stat files and miner_start.sh keeps miner_config, and runs the binaries from here.
+WorkingDirectory=/opt/apolloapi/backend/apollo-miner
+# usb_miner_run.sh settles, picks the binary and execs `screen -D -m -S miner`,
+# so screen is the main process and a miner that exits ends the unit.
+ExecStart=/opt/apolloapi/backend/apollo-miner/usb_miner_run.sh /dev/%I
+Restart=always
+# screen exits 1 when systemd stops it with SIGTERM: a Stop is not a failure.
+# 65: the board is still in its bootloader (IAP); a clean end, not a failed unit.
+SuccessExitStatus=1 65
+RestartSec=10s
+# 64: not a known board (an Apollo II still in its bootloader, a stranger on the
+# same VID:PID). Retrying would loop; the next add event starts a fresh attempt.
+# 65: in the bootloader (IAP); the SLV re-enumeration fires that add event, and
+# miner_start.sh skips IAP ports, so there is nothing to retry.
+RestartPreventExitStatus=64 65

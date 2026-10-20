@@ -7,6 +7,7 @@ const net = require('net');
 const pubsub = require('../graphql/pubsub');
 const TOPICS = require('../graphql/topics');
 const log = require('../logger')('service-monitor');
+const { getMinerBoards } = require('../minerBoards');
 
 const execAsync = promisify(exec);
 
@@ -345,6 +346,30 @@ class ServiceMonitor {
         }
       }
 
+      // A Solo Node has no internal miner: miner_start.sh keeps apollo-miner
+      // `active` on a placeholder while no USB board is plugged in. The
+      // application check says offline there, and without this the pair would
+      // read as "starting" (pending) for good. Read from the registry, refreshed
+      // here so the answer is not older than this tick.
+      let soloNodeNoBoards = false;
+      let soloNodeBooting = false;
+      if (serviceName === 'apollo-miner') {
+        try {
+          const registry = getMinerBoards();
+          await registry.refresh();
+          const snap = registry.snapshot();
+          // usbActiveCount: a booting or stuck board is attached but not mining yet,
+          // so it still reads as "no boards" here (offline, not a perpetual pending).
+          soloNodeNoBoards = snap.deviceFamily === 'solo-node' && snap.usbActiveCount === 0;
+          // A board still in its bootloader (IAP, < 2 min) is about to mine, and Start
+          // is allowed meanwhile: the miner reads as starting (pending), not offline.
+          // `stuck` (IAP over 2 min) is not booting, so it stays offline.
+          soloNodeBooting = soloNodeNoBoards && (snap.usbBootingCount || 0) > 0;
+        } catch (error) {
+          log.warn({ err: error, service: serviceName }, 'board registry unavailable');
+        }
+      }
+
       // Standard systemctl check for local services
       const status = (await this._systemctlStatus(serviceName)) ?? 'unknown';
 
@@ -589,6 +614,28 @@ class ServiceMonitor {
       // If within grace period, keep as pending regardless of other checks
       if (isWithinGracePeriod) {
         finalStatus = 'pending';
+      }
+      // THE booting rule (one place): Solo Node, no active board but at least one
+      // booting, unit up (active or activating) and no fresh stat file: pending.
+      // No timer of its own: it ends when the board turns active (normal path),
+      // stuck after 2 minutes (falls to the offline rule below), or disconnected.
+      // The request's grace window is irrelevant: it only widens pending, never
+      // turns it into an error.
+      else if (
+        soloNodeBooting &&
+        (status === 'active' || status === 'activating') &&
+        applicationOnline !== 'online'
+      ) {
+        finalStatus = 'pending';
+      }
+      // Solo Node, no active USB board, unit up on the placeholder: there is
+      // nothing to start or wait for, so offline. A fresh stat file (app check
+      // online) still wins: that is a real miner, whatever the registry saw.
+      // This also answers a Start pressed with no board: the unit is `active`,
+      // the request counts as arrived, and the UI settles on offline instead
+      // of spinning. Auto-restart only fires on systemd `failed`, untouched.
+      else if (soloNodeNoBoards && status === 'active' && applicationOnline !== 'online') {
+        finalStatus = 'offline';
       }
       // Special handling for services with application check (miner, node)
       else if (applicationOnline) {

@@ -164,6 +164,16 @@ for unit in \
 done
 install -m 755 "${APOLLO_DIR}/backend/rc.local" /etc/rc.local
 
+# USB miner hotplug: the per-port template unit (never enabled: udev starts the
+# instances) and the udev rule that asks for them.
+install -m 644 \
+    "${APOLLO_DIR}/backend/systemd/apollo-usb-miner@.service" \
+    "/etc/systemd/system/apollo-usb-miner@.service"
+install -d -m 755 /etc/udev/rules.d
+install -m 644 \
+    "${APOLLO_DIR}/backend/udev/99-apollo-usb-miner.rules" \
+    /etc/udev/rules.d/99-apollo-usb-miner.rules
+
 # Persistent journald on the eMMC, so an abrupt hang leaves evidence (see
 # backend/systemd/journald-apollo.conf). No restart: this is a factory-capture
 # flow that leaves services stopped — the config file is on the image and applies
@@ -196,5 +206,6 @@ systemctl enable \
     rc-local.service \
     swap.service
 systemctl disable ckpool.service >/dev/null 2>&1 || true
+udevadm control --reload-rules
 
 echo -e "${GREEN} ---> Factory image update complete; services remain stopped${NC}"

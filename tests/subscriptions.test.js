@@ -37,6 +37,7 @@ describe('Subscription resolvers', () => {
     { name: 'solo',     topic: 'SOLO',     payloadKey: 'solo'     },
     { name: 'services', topic: 'SERVICES', payloadKey: 'services' },
     { name: 'settings', topic: 'SETTINGS', payloadKey: 'settings' },
+    { name: 'minerBoards', topic: 'MINER_BOARDS', payloadKey: 'minerBoards' },
   ];
 
   const allFields = [...fields.map((f) => f.name), 'automation'];

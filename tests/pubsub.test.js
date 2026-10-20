@@ -4,7 +4,7 @@
 describe('TOPICS constants', () => {
   const TOPICS = require('../src/graphql/topics');
 
-  const expected = ['MINER', 'NODE', 'MCU', 'SOLO', 'SERVICES', 'SETTINGS', 'AUTOMATION'];
+  const expected = ['MINER', 'NODE', 'MCU', 'SOLO', 'SERVICES', 'SETTINGS', 'AUTOMATION', 'MINER_BOARDS'];
 
   it('exports the expected topic keys', () => {
     for (const key of expected) {

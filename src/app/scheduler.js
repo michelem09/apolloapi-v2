@@ -4,6 +4,7 @@ const services = require('../services');
 const pubsub = require('../graphql/pubsub');
 const TOPICS = require('../graphql/topics');
 const log = require('../logger')('scheduler');
+const { getMinerBoards } = require('../minerBoards');
 
 /**
  * Parse hashrate string (e.g., "810M", "3.2T", "1.5G") to GH/s
@@ -121,8 +122,21 @@ async function fetchStatistics() {
     const { stats } = await services.miner.getStats();
     if (!stats || stats.length === 0) return;
 
+    // Only active boards are in totals and time series. A disconnected or
+    // stuck board has a stale stat file, and a booting one (miner stopped, board
+    // in its bootloader) has none that is fresh: counting them would keep
+    // hashrate the device does not have.
+    const notActive = new Set(
+      getMinerBoards()
+        .snapshot()
+        .boards.filter((b) => b.status !== 'active')
+        .map((b) => b.id)
+    );
+    const liveStats = stats.filter((s) => !notActive.has(s.uuid));
+    if (liveStats.length === 0) return;
+
     // Process data for each board
-    const boards = stats.map((board) => {
+    const boards = liveStats.map((board) => {
       const {
         master: {
           boardsI: voltage,
@@ -389,6 +403,14 @@ const settledSection = (outcome) =>
     : { result: null, error: { message: outcome.reason?.message ?? String(outcome.reason) } };
 
 async function pushMinerStats() {
+  // `mining` on a board only changes when someone reads the stat file's mtime,
+  // so this cycle is the reader. It publishes (via the registry listener) only
+  // when the snapshot actually changed.
+  try {
+    await getMinerBoards().refresh();
+  } catch (e) {
+    log.error({ err: e }, 'pubsub: MINER_BOARDS refresh failed');
+  }
   const [stats, online] = await Promise.allSettled([
     withTimeout(services.miner.getStats(),    8000, 'miner.getStats'),
     withTimeout(services.miner.checkOnline(), 8000, 'miner.checkOnline'),
@@ -408,6 +430,44 @@ async function pushMinerStats() {
   });
 
   log.debug('pubsub: miner published');
+}
+
+/**
+ * Publish the board registry snapshot. Used for the initial fill on WS connect
+ * and by the registry listener on every change.
+ */
+function publishMinerBoards(snapshot) {
+  pubsub.publish(TOPICS.MINER_BOARDS, {
+    minerBoards: { result: snapshot, error: null },
+  });
+  log.debug('pubsub: miner boards published');
+}
+
+async function pushMinerBoards() {
+  try {
+    publishMinerBoards(getMinerBoards().snapshot());
+  } catch (e) {
+    log.error({ err: e }, 'pubsub: miner boards push failed');
+    pubsub.publish(TOPICS.MINER_BOARDS, {
+      minerBoards: { result: null, error: { message: e.message } },
+    });
+  }
+}
+
+let stopBoardsListener = null;
+// On change, not on cadence: the registry's own watcher/expiry timer and the
+// refresh() in pushMinerStats are the triggers.
+function startMinerBoards() {
+  if (stopBoardsListener) return;
+  const registry = getMinerBoards();
+  stopBoardsListener = registry.onChange(publishMinerBoards);
+  registry.start();
+}
+
+function stopMinerBoards() {
+  if (stopBoardsListener) stopBoardsListener();
+  stopBoardsListener = null;
+  getMinerBoards().stop();
 }
 
 /**
@@ -536,6 +596,9 @@ async function startAllSchedulers() {
     // Initialize DB rows for service status
     await initServiceStatusRows();
 
+    // The board registry first: the monitor and the stats read its snapshot.
+    startMinerBoards();
+
     // Start service monitor - this is the single source of truth for status updates
     await startServiceMonitor();
 
@@ -584,6 +647,7 @@ async function startAllSchedulers() {
     // Warm the signal caches (weather fetch, etc.) at boot so the conditions are
     // ready by the time a client lands, instead of cold on the first page load.
     evaluateAutomation().catch(() => {});
+    pushMinerBoards().catch(() => {});
   } catch (error) {
     log.error({ err: error }, 'failed to initialize schedulers');
   }
@@ -602,7 +666,11 @@ module.exports = {
   // Called by action resolvers (start/stop/restart) to immediately push the updated
   // service status to all connected subscribers instead of waiting for the periodic timer.
   pushServicesStatus,
+  pushMinerBoards,
+  startMinerBoards,
+  stopMinerBoards,
   pushAllStats: () => Promise.allSettled([
+    pushMinerBoards(),
     pushMinerStats(),
     pushMcuStats(),
     pushNodeStats(),

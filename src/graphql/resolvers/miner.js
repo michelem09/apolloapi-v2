@@ -65,6 +65,15 @@ module.exports = {
       }
     },
 
+    boards: async (_, __, { services }) => {
+      try {
+        const result = await services.miner.getBoards();
+        return { result, error: null };
+      } catch (error) {
+        return { result: null, error: { message: error.message } };
+      }
+    },
+
     online: async (_, __, { services }) => {
       try {
         const result = await services.miner.checkOnline();

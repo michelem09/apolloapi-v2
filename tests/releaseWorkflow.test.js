@@ -99,18 +99,48 @@ describe('release artifact binaries', () => {
     'utf8'
   );
 
+  const usbRun = realFs.readFileSync(
+    path.join(repo, 'backend', 'apollo-miner', 'usb_miner_run.sh'),
+    'utf8'
+  );
+  const launchedBy = (script) => [
+    ...new Set([...script.matchAll(/"\$BIN_DIR"\/([\w.-]+)/g)].map((m) => m[1])),
+  ];
+
   it('stages every binary miner_start.sh launches', () => {
-    const launched = [
-      ...new Set(
-        [...minerStart.matchAll(/"\$BIN_DIR"\/([\w.-]+)/g)].map((m) => m[1])
-      ),
-    ];
+    const launched = launchedBy(minerStart);
     expect(launched).toEqual(
       expect.arrayContaining(['futurebit-miner', 'futurebit-miner-v2', 'futurebit-miner-v3', 'apollo-helper'])
     );
     launched.forEach((bin) => {
       expect(workflow).toMatch(new RegExp(`"\\$m/${bin.replace(/[.-]/g, '\\$&')}"`));
     });
+  });
+
+  it('stages every binary usb_miner_run.sh launches', () => {
+    // The USB instances run from the same BIN_DIR, so a binary missing from the
+    // artifact stops every USB board on the first OTA, exactly like -v3 did.
+    const launched = launchedBy(usbRun);
+    expect(launched).toEqual(expect.arrayContaining(['futurebit-miner', 'futurebit-miner-v2', 'apollo-helper']));
+    launched.forEach((bin) => {
+      expect(workflow).toMatch(new RegExp(`"\\$m/${bin.replace(/[.-]/g, '\\$&')}"`));
+    });
+  });
+
+  it('carries the USB hotplug unit, rule and instance script, and checks them in the stage', () => {
+    // backend/ travels whole (tar of the directory), so these are not copied one
+    // by one; the stage step verifies them, and the script keeps its execute bit.
+    const stage = workflow.slice(workflow.indexOf('- name: Stage the release tree'));
+    for (const f of [
+      'backend/apollo-miner/usb_miner_run.sh',
+      'backend/systemd/apollo-usb-miner@.service',
+      'backend/udev/99-apollo-usb-miner.rules',
+    ]) {
+      expect(stage).toContain(f);
+      expect(realFs.existsSync(path.join(repo, f))).toBe(true);
+    }
+    expect(stage).toContain('[ -x "$STAGE/backend/apollo-miner/usb_miner_run.sh" ]');
+    expect(realFs.statSync(path.join(repo, 'backend/apollo-miner/usb_miner_run.sh')).mode & 0o111).not.toBe(0);
   });
 });
 

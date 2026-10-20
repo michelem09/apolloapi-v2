@@ -24,7 +24,7 @@ check() {
 }
 
 bin="$tmp/bin"; mkdir -p "$bin"
-for c in systemctl install pgrep sqlite3 chown systemd-run; do
+for c in systemctl install pgrep sqlite3 chown systemd-run udevadm; do
     cat > "$bin/$c" <<EOS
 #!/bin/sh
 echo "$c \$*" >> "$tmp/calls.log"
@@ -198,6 +198,16 @@ check "the runtime installer runs once"                    "1" "$(grep -c '^inst
 check "…before any unit is installed"                      "1" "$( [ -n "$rt" ] && [ -n "$first_unit" ] && [ "$rt" -lt "$first_unit" ] && echo 1 || echo 0 )"
 check "…and before any service is stopped"                 "1" "$( [ -n "$rt" ] && [ -n "$first_stop2" ] && [ "$rt" -lt "$first_stop2" ] && echo 1 || echo 0 )"
 check "the bootstrap runs on the runtime's node"           "1" "$(grep -c "^sudo -u futurebit env .* $app/backend/runtime/node/bin/node $app/src/bootstrap.js" "$tmp/calls.log")"
+
+# USB miner hotplug: the template unit and the rule are laid down with the units,
+# and udev is told about the rule after daemon-reload.
+run_update
+check "the USB miner template unit is installed" "1" "$(grep -c "^install -m 644 $app/backend/systemd/apollo-usb-miner@.service /etc/systemd/system/apollo-usb-miner@.service" "$tmp/calls.log")"
+check "the USB miner udev rule is installed"    "1" "$(grep -c "^install -m 644 $app/backend/udev/99-apollo-usb-miner.rules /etc/udev/rules.d/99-apollo-usb-miner.rules" "$tmp/calls.log")"
+rule_at=$(grep -n '99-apollo-usb-miner.rules' "$tmp/calls.log" | head -1 | cut -d: -f1)
+reload_at=$(grep -n '^udevadm control --reload-rules' "$tmp/calls.log" | head -1 | cut -d: -f1)
+check "udev rules are reloaded after the rule is laid down" "1" "$( [ -n "$rule_at" ] && [ -n "$reload_at" ] && [ "$reload_at" -gt "$rule_at" ] && echo 1 || echo 0 )"
+check "the template unit is never enabled"      "0" "$(grep -c '^systemctl enable.*apollo-usb-miner' "$tmp/calls.log")"
 
 FAKE_RUNTIME_FAILS=1 run_update
 check "runtime install fails: nothing is stopped"          "0" "$(grep -c '^systemctl stop' "$tmp/calls.log")"

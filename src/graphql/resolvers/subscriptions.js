@@ -37,5 +37,9 @@ module.exports = {
         error: payload.automation?.error || null,
       }),
     },
+    minerBoards: {
+      subscribe: () => pubsub.asyncIterator([TOPICS.MINER_BOARDS]),
+      resolve: (payload) => payload.minerBoards,
+    },
   },
 };
