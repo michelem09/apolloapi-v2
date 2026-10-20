@@ -453,6 +453,39 @@ describe('Settings API', () => {
       expect(systemctl.mock.calls).toEqual([['restart', '--no-block', 'node.service']]);
     });
 
+    // A save must not start a ckpool the user stopped (the v2.1.4 rule, kept here by
+    // _applyServiceLifecycle): only turning solo mining on starts it, a conf change
+    // restarts it only if it is running. A wallet change is not even a ckpool field.
+    it('a ckpool conf change leaves a stopped ckpool stopped', async () => {
+      jest.spyOn(settingsService, '_isServiceActive').mockResolvedValue(false);
+      const systemctl = jest.spyOn(settingsService, '_runSystemctl').mockResolvedValue(undefined);
+
+      await settingsService._applyServiceLifecycle(
+        { nodeEnableTor: false, nodeEnableSoloMining: true },
+        { nodeEnableTor: false, nodeEnableSoloMining: true },
+        false,
+        true // ckpool config changed: the flag the stopped check has to override
+      );
+
+      expect(systemctl).not.toHaveBeenCalled();
+    });
+
+    it('a ckpool conf change restarts a running ckpool', async () => {
+      jest
+        .spyOn(settingsService, '_isServiceActive')
+        .mockImplementation(async (service) => service === 'ckpool.service');
+      const systemctl = jest.spyOn(settingsService, '_runSystemctl').mockResolvedValue(undefined);
+
+      await settingsService._applyServiceLifecycle(
+        { nodeEnableTor: false, nodeEnableSoloMining: true },
+        { nodeEnableTor: false, nodeEnableSoloMining: true },
+        false,
+        true
+      );
+
+      expect(systemctl.mock.calls).toEqual([['restart', '--no-block', 'ckpool.service']]);
+    });
+
     it('update() hands a refusal to the UI as the service error payload, not as "Command failed"', async () => {
       const transition = require('../src/services/transition');
       const resolvers = require('../src/graphql/resolvers/settings');
