@@ -24,7 +24,6 @@ rm -f "${MINER_STOPPED_MARKER:-/run/apollo-miner.stopped}"
 
 settings=""
 settings3=""
-[[ -r miner_config  ]] && settings=$(<miner_config)
 [[ -r miner_config3 ]] && settings3=$(<miner_config3)
 
 # The Apollo III binary writes apollo-miner-3.json next to ITSELF, not into its
@@ -46,6 +45,15 @@ stage_v3_binary()
     else
         echo "$src"
     fi
+}
+
+# The legacy binaries start only after the 35 s wait below, and a settings save
+# (new pool, new payout address) can rewrite miner_config during it. Read it
+# after the wait, right before the boards start, never at the top.
+load_settings()
+{
+    settings=""
+    [[ -r miner_config ]] && settings=$(<miner_config)
 }
 
 start_hashboards()
@@ -70,7 +78,8 @@ start_hashboards()
 
 start_external_hashboards()
 {
-    local ports=(/dev/ttyACM*)
+    # Glob overridable so the test can fake a plugged-in USB board.
+    local ports=(${APOLLO_USB_PORTS:-/dev/ttyACM*})
     if [[ -e ${ports[0]} ]]; then
         start_hashboards "${ports[@]}"
     fi
@@ -85,10 +94,12 @@ case "${BOARD_NAME:-}" in
         miner_v3=$(stage_v3_binary)
         screen -dmS miner "$miner_v3" $settings3
         sleep 35
+        load_settings
         ;;
     "Solo Node")
         # Solo Node only needs to wait for external USB miners.
         sleep 35
+        load_settings
         ;;
     *)
         # Reset the internal hashboard.
@@ -97,6 +108,7 @@ case "${BOARD_NAME:-}" in
         gpio write 0 1
 
         sleep 35
+        load_settings
 
         # Start the internal hashboard.
         boardType=$("$BIN_DIR"/apollo-helper -s /dev/ttyS1)

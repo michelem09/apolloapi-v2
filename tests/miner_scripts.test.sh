@@ -81,6 +81,22 @@ check "a stop killed half-way leaves no marker" 0 "$([ -e "$MINER_STOPPED_MARKER
 stop --if-owed
 check "...so --if-owed does it again" 2 "$(resets)"
 
+# 4c. miner_config rewritten during the 35 s wait is the one the boards start with.
+# The sleep stub rewrites it, standing in for a settings save mid-wait.
+printf '#!/bin/bash\n[ -n "${SLEEP_WRITES:-}" ] && printf -- "-user NEW" > "$APOLLO_STATE_DIR/miner/miner_config"\nexit 0\n' > "$tmp/bin/sleep"
+chmod +x "$tmp/bin/sleep"
+touch "$tmp/usb0"
+for board in "Solo Node" "Apollo 3" "FutureBit Apollo II"; do
+    printf 'BOARD_NAME="%s"\n' "$board" > "$ARMBIAN_RELEASE_FILE"
+    fresh; mkdir -p "$tmp/state/miner"; printf -- '-user OLD' > "$tmp/state/miner/miner_config"
+    SLEEP_WRITES=1 APOLLO_USB_PORTS="$tmp/usb0" start
+    check "$board: the USB board starts with the miner_config written during the wait" 1 \
+        "$(grep -c "^screen .*-comport $tmp/usb0 .*-user NEW" "$LOG")"
+    check "$board: ...and not with the stale one" 0 "$(grep -c -- '-user OLD' "$LOG")"
+done
+check "Apollo II: the internal board gets it too" 1 "$(grep -c '^screen .*-comport /dev/ttyS1 .*-user NEW' "$LOG")"
+: > "$ARMBIAN_RELEASE_FILE"; rm -f "$tmp/state/miner/miner_config"
+
 # Past the start script: the real sleep is back (step 6 needs the waiting to be real).
 rm -f "$tmp/bin/sleep"
 
