@@ -100,6 +100,31 @@ for board in "Solo Node" "Apollo 3" "FutureBit Apollo II"; do
     check "$board: no USB board in screen" 0 "$(grep -c '^screen .*-comport '"$tmp"'/ttyACM' "$LOG")"
     check "$board: no systemctl start without --no-block" 0 "$(grep '^systemctl start' "$LOG" | grep -vc -- '--no-block')"
 done
+# 4d. A port whose board is still in its bootloader (USB product "BCO IAP #...") is
+# skipped: probing it only fails, and the SLV hotplug starts the instance. The
+# product is read from sysfs, like the udev rule and src/minerBoards.js do.
+fakeusb() {  # name product
+    mkdir -p "$tmp/sys/$1" "$tmp/usbdev/$1/if"
+    printf '%s\n' "$2" > "$tmp/usbdev/$1/product"
+    ln -sfn "$tmp/usbdev/$1/if" "$tmp/sys/$1/device"
+}
+fakeusb ttyACM0 "BCO IAP #0000AA"; fakeusb ttyACM1 "BCO SLV #0000BB"
+printf 'BOARD_NAME="Solo Node"\n' > "$ARMBIAN_RELEASE_FILE"
+fresh; APOLLO_SYS_TTY_DIR="$tmp/sys" APOLLO_USB_PORTS="$USBS" start
+check "IAP port: no instance enqueued" 0 "$(grep -c 'apollo-usb-miner@ttyACM0' "$LOG")"
+check "IAP port: the SLV port next to it is enqueued" 1 "$(grep -c '^systemctl start --no-block apollo-usb-miner@ttyACM1.service$' "$LOG")"
+fresh; UNIT_MISSING=1 APOLLO_SYS_TTY_DIR="$tmp/sys" APOLLO_USB_PORTS="$USBS" start
+check "IAP port, no unit: not started in screen" 0 "$(grep '^screen' "$LOG" | grep -c "ttyACM0")"
+check "IAP port, no unit: not probed" 0 "$(grep -c "^apollo-helper -s $tmp/ttyACM0" "$LOG")"
+# No sysfs entry (a dev machine, an unreadable product): not IAP, started as before.
+fresh; APOLLO_SYS_TTY_DIR="$tmp/nosys" APOLLO_USB_PORTS="$USBS" start
+check "no sysfs: ttyACM0 enqueued" 1 "$(grep -c '^systemctl start --no-block apollo-usb-miner@ttyACM0.service$' "$LOG")"
+# "IAP" must be a word: a product that merely contains the letters is a miner.
+fakeusb ttyACM0 "BCO CAPITAL #1"
+fresh; APOLLO_SYS_TTY_DIR="$tmp/sys" APOLLO_USB_PORTS="$USBS" start
+check "product containing IAP letters inside a word: enqueued" 1 "$(grep -c 'apollo-usb-miner@ttyACM0' "$LOG")"
+fakeusb ttyACM0 "BCO IAP #0000AA"
+
 # Unit file not installed (git deploy): the old way, in screen, same binary choice
 # (the apollo-helper stub answers Apollo-2), and nothing is enqueued.
 for board in "Solo Node" "Apollo 3"; do

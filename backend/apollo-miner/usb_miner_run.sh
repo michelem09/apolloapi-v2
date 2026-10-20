@@ -2,7 +2,8 @@
 # Runs one USB hashboard in the foreground, as the main process of
 # apollo-usb-miner@<port>.service. Usage: usb_miner_run.sh /dev/ttyACMx
 #
-# Exit codes: 0 port gone or already served by a running miner (nothing to run),
+# Exit codes: 0 port gone, still in the bootloader (IAP) or already served by a
+# running miner (nothing to run),
 # 64 unknown board (the unit does not retry), anything else is the miner's/screen's
 # own status.
 
@@ -19,6 +20,25 @@ sleep "${APOLLO_USB_SETTLE_S:-8}"
 
 if [[ ! -e "$port" ]]; then
     echo "$port is gone"
+    exit 0
+fi
+
+# The board is in its bootloader (USB product "BCO IAP #<serial>", ~30 s after
+# power-up, then it re-enumerates as SLV). Same test as the udev rule and
+# src/minerBoards.js (product read from the USB device above the tty interface).
+# Probing it now only fails ("Unknown board"); the SLV add event starts it.
+usb_port_is_iap()
+{
+    local name="${1##*/}" dev product
+    dev=$(realpath "${APOLLO_SYS_TTY_DIR:-/sys/class/tty}/${name}/device" 2>/dev/null) || return 1
+    product=$(cat "${dev}/../product" 2>/dev/null) || return 1
+    [[ "$product" =~ (^|[^[:alnum:]_])IAP([^[:alnum:]_]|$) ]]
+}
+
+if usb_port_is_iap "$port"; then
+    # Exit 0, not 64: Restart=always retries after RestartSec, and the udev add of
+    # the SLV firmware starts a fresh instance anyway. Whichever comes first wins.
+    echo "$port is still in its bootloader (IAP)"
     exit 0
 fi
 
