@@ -8,6 +8,7 @@ const { getMinerRuntimeDir, getApolloIIIStatsDir, getCkpoolLogsDir } = require('
 const log = require('../logger')('miner');
 const transition = require('./transition');
 const { getMinerBoards } = require('../minerBoards');
+const { getDeviceFamily } = require('../deviceFamily');
 
 // Import the dev miner service for development mode
 const devMinerService =
@@ -90,7 +91,7 @@ class MinerService {
           this.knex,
           'miner',
           'online',
-          () => this._execCommand('sudo systemctl start --no-block apollo-miner'),
+          async () => this._execCommand(await this._startCommand()),
           { notify: () => this._notifyServicesStatus() }
         );
       }
@@ -99,6 +100,23 @@ class MinerService {
       throw transition.refused('miner', 'start', error);
     }
     await this._afterAccepted(source, 'online');
+  }
+
+  // Solo Node only: apollo-miner stays `active` on a placeholder while USB boards
+  // idle, and `systemctl start` on an active unit does nothing, so the next monitor
+  // tick would read offline again. Restart re-runs miner_start.sh, which queues the
+  // instances for the attached ports. Never on Apollo II/III: there a restart also
+  // resets the internal board, and start on an active unit is the user's no-op.
+  async _startCommand() {
+    if (getDeviceFamily() === 'solo-node') {
+      try {
+        await this._execCommand('systemctl is-active apollo-miner');
+        return 'sudo systemctl restart --no-block apollo-miner';
+      } catch (_) {
+        // not active (exit 3/4): a plain start
+      }
+    }
+    return 'sudo systemctl start --no-block apollo-miner';
   }
 
   // Stop the miner

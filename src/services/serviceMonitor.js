@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const os = require('os');
+const { performance } = require('perf_hooks');
 const pubsub = require('../graphql/pubsub');
 const TOPICS = require('../graphql/topics');
 const log = require('../logger')('service-monitor');
@@ -16,6 +17,9 @@ const execAsync = promisify(exec);
 const AUTO_RESTART_ERROR_AFTER_MS = 90000;
 // Solo Node: a board active but not mining this long (counted from the later of unit
 // active-since and board active-since) is idle, not starting. Normal start: 18-21 s.
+// The rule also needs the monitor itself to have seen no board mining for this long
+// (see soloNotMiningSince): a board that mined for an hour and has one stale stat
+// file tick is not idle.
 const SOLO_IDLE_BOARDS_GRACE_MS = 90000;
 
 const UPDATE_UNIT = 'apollo-update.service';
@@ -37,6 +41,10 @@ class ServiceMonitor {
     this.services = services || {};
     this.monitoring = false;
     this.interval = null;
+    // Monotonic ms (performance.now) since the monitor first saw active USB boards
+    // with none mining, null while any board mines or the state differs. In memory
+    // only: an API restart starts the count again (pending for up to 90 s).
+    this.soloNotMiningSince = null;
     this.config = this.loadConfig();
     this.checkInterval = this.config.checkInterval || 10000; // 10 seconds default
     this.systemdServices = this.config.services || [
@@ -383,6 +391,10 @@ class ServiceMonitor {
           ) {
             const sinces = activeUsb.map((b) => Date.parse(b.since)).filter(Number.isFinite);
             soloNodeIdleBoardsSince = sinces.length ? Math.max(...sinces) : null;
+            if (this.soloNotMiningSince === null) this.soloNotMiningSince = performance.now();
+          } else {
+            // Any board mining (or no active board at all): the not-mining count restarts.
+            this.soloNotMiningSince = null;
           }
         } catch (error) {
           log.warn({ err: error, service: serviceName }, 'board registry unavailable');
@@ -405,7 +417,10 @@ class ServiceMonitor {
           if (Number.isFinite(enterUs) && enterUs > 0) {
             const unitActiveForMs = os.uptime() * 1000 - enterUs / 1000;
             const boardsForMs = Date.now() - soloNodeIdleBoardsSince;
-            soloNodeIdleBoards = Math.min(unitActiveForMs, boardsForMs) > SOLO_IDLE_BOARDS_GRACE_MS;
+            const notMiningForMs =
+              this.soloNotMiningSince === null ? 0 : performance.now() - this.soloNotMiningSince;
+            soloNodeIdleBoards =
+              Math.min(unitActiveForMs, boardsForMs, notMiningForMs) > SOLO_IDLE_BOARDS_GRACE_MS;
           }
         } catch (error) {
           // unknown clock: keep pending
@@ -680,9 +695,11 @@ class ServiceMonitor {
       // board running the miner firmware but none mining, and both the unit and
       // the boards have been that way longer than SOLO_IDLE_BOARDS_GRACE_MS (the
       // later of the two clocks anchors it; a normal start takes 18-21 s from
-      // active to mining, so inside the window it stays pending). Past it the
-      // miner reads offline, so Start/Restart are usable again instead of a
-      // spinner forever. A fresh stat file (online) still wins.
+      // active to mining, so inside the window it stays pending), and the monitor
+      // has not seen any board mining for that long either. Past it the miner reads
+      // offline: Stop/Restart stay disabled in the UI while offline, so it is Start
+      // that gets the way out (miner.start() restarts an active unit on a Solo
+      // Node). A fresh stat file (online) still wins.
       else if (soloNodeIdleBoards && status === 'active' && applicationOnline !== 'online') {
         finalStatus = 'offline';
       }

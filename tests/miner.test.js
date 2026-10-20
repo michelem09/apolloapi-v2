@@ -269,3 +269,58 @@ describe('miner start/restart do not block the API on the 35s device wait', () =
     exec.mockRestore();
   });
 });
+
+// Solo Node: apollo-miner stays `active` on a placeholder while USB boards idle, and
+// `systemctl start` on an active unit changes nothing: Start must restart it there.
+describe('miner.start() on an active unit', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const { resetDeviceFamilyCache } = require('../src/deviceFamily');
+  let dir;
+  let prev;
+  const setBoard = (name) => {
+    fs.writeFileSync(path.join(dir, 'armbian-release'), `BOARD_NAME="${name}"\n`);
+    resetDeviceFamilyCache();
+  };
+  const run = async (isActive) => {
+    const minerService = require('../src/services/miner')(knex, {});
+    const exec = jest.spyOn(minerService, '_execCommand').mockImplementation(async (c) => {
+      if (/is-active/.test(c) && !isActive) throw Object.assign(new Error('inactive'), { code: 3 });
+      return '';
+    });
+    await minerService.start();
+    const calls = exec.mock.calls.map((c) => c[0]);
+    exec.mockRestore();
+    return calls;
+  };
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'famstart-'));
+    prev = process.env.ARMBIAN_RELEASE_FILE;
+    process.env.ARMBIAN_RELEASE_FILE = path.join(dir, 'armbian-release');
+  });
+  afterEach(() => {
+    if (prev === undefined) delete process.env.ARMBIAN_RELEASE_FILE;
+    else process.env.ARMBIAN_RELEASE_FILE = prev;
+    resetDeviceFamilyCache();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('Solo Node, unit active: restart', async () => {
+    setBoard('Solo Node');
+    expect((await run(true)).pop()).toBe('sudo systemctl restart --no-block apollo-miner');
+  });
+  it('Solo Node, unit inactive: start', async () => {
+    setBoard('Solo Node');
+    expect((await run(false)).pop()).toBe('sudo systemctl start --no-block apollo-miner');
+  });
+  it('Apollo II, unit active: still start (never a restart of the internal board)', async () => {
+    setBoard('FutureBit Apollo II');
+    const calls = await run(true);
+    expect(calls).toEqual(['sudo systemctl start --no-block apollo-miner']);
+  });
+  it('Apollo III, unit active: still start', async () => {
+    setBoard('Apollo 3');
+    expect(await run(true)).toEqual(['sudo systemctl start --no-block apollo-miner']);
+  });
+});
