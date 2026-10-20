@@ -31,7 +31,7 @@ export RESULTS
 # Hand-written assertions. The shared version-ordering fixture adds one per case
 # on top, counted below so a growing table does not need this number edited —
 # while a scenario that dies before asserting still fails the suite.
-HAND_WRITTEN_ASSERTIONS=102
+HAND_WRITTEN_ASSERTIONS=105
 VERSION_FIXTURE="$REPO/apolloui-v2/src/lib/version-order.fixture.txt"
 if [ ! -f "$VERSION_FIXTURE" ]; then
   printf '\033[0;31mmissing %s\033[0m — the UI submodule is not checked out\n' "$VERSION_FIXTURE"
@@ -532,6 +532,58 @@ EOF
   else
     ok "verify_all_stopped aborts when a unit is still active"
   fi
+)
+
+# --- an active USB miner instance also blocks the update ---------------------
+(
+  make_device
+  cat > "$STUBS/systemctl" <<'EOF'
+#!/bin/bash
+[ "$1" = "is-active" ] && exit 1
+if [ "$1" = "list-units" ]; then
+  echo "apollo-usb-miner@ttyACM0.service loaded active running USB miner"
+  exit 0
+fi
+exit 0
+EOF
+  cat > "$STUBS/pgrep" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+  chmod +x "$STUBS/systemctl" "$STUBS/pgrep"
+  if ( set -Eeuo pipefail; verify_all_stopped ) >/dev/null 2>&1; then
+    bad "verify_all_stopped aborts when a USB miner instance is still active" "it returned success"
+  else
+    ok "verify_all_stopped aborts when a USB miner instance is still active"
+  fi
+)
+
+# --- trigger_usb_miners re-announces only the hashboards, one device each ----
+# udevadm ORs repeated --property-match, so the old vendor+model pair re-added
+# every STMicro tty. The ids come from the USB device above each tty.
+(
+  make_device
+  cat > "$STUBS/udevadm" <<'EOS'
+#!/bin/bash
+echo "$*" >> "$SYSTEMCTL_LOG"
+EOS
+  chmod +x "$STUBS/udevadm"
+  SYS="$ROOT/sys/class/tty"; mkdir -p "$SYS" "$ROOT/usb"
+  mkdev() {  # usb-dir vid pid tty
+    mkdir -p "$ROOT/usb/$1/if"; echo "$2" > "$ROOT/usb/$1/idVendor"; echo "$3" > "$ROOT/usb/$1/idProduct"
+    mkdir -p "$SYS/$4"; ln -s "$ROOT/usb/$1/if" "$SYS/$4/device"
+  }
+  mkdev 1-1 0483 5740 ttyACM0
+  mkdev 1-3 0483 3748 ttyACM2    # STMicro, but not a hashboard
+  mkdev 1-4 1a86 5740 ttyACM3    # other vendor, same product id
+  mkdev 1-2 0483 5740 ttyACM4
+  : > "$SYSTEMCTL_LOG"
+  APOLLO_SYS_TTY_DIR="$SYS" trigger_usb_miners
+  check "only the two hashboards are triggered, one udevadm call each" \
+    "$(sort "$SYSTEMCTL_LOG" | tr '\n' '|')" \
+    "trigger --action=add $SYS/ttyACM0|trigger --action=add $SYS/ttyACM4|"
+  check "no property-match and no whole-subsystem trigger" \
+    "$(grep -c -e 'property-match' -e 'subsystem-match' "$SYSTEMCTL_LOG")" "0"
 )
 
 # --- backups are pruned -------------------------------------------------------

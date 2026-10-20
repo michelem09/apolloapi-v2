@@ -716,14 +716,24 @@ restore_units() {
 }
 
 # Replays the udev add event for already-attached USB hashboards (0483:5740), so
-# the instances start without a replug or a reboot. Targeted, never the whole tty
-# subsystem: other serial devices (a Zigbee stick on the Solo Node) have no business
-# being re-announced. Best effort, like the reload.
+# the instances start without a replug or a reboot. One trigger per matching tty:
+# udevadm ORs repeated --property-match, so a vendor+model pair re-adds every
+# STMicro tty (a Zigbee stick on the Solo Node has no business being re-announced).
+# The ids are read from the USB device above the tty, as usb_port_is_iap does in
+# miner_start.sh. Best effort, like the reload.
 trigger_usb_miners() {
   have udevadm || return 0
-  udevadm trigger --action=add --subsystem-match=tty \
-    --property-match=ID_VENDOR_ID=0483 --property-match=ID_MODEL_ID=5740 \
-    >/dev/null 2>&1 || err "Could not re-announce the attached USB miners"
+  local sysdir="${APOLLO_SYS_TTY_DIR:-/sys/class/tty}" tty name dev
+  for tty in "$sysdir"/ttyACM*; do
+    [ -e "$tty" ] || continue
+    name="${tty##*/}"
+    dev=$(realpath "$tty/device/.." 2>/dev/null) || continue
+    [ "$(cat "$dev/idVendor" 2>/dev/null)" = "0483" ] || continue
+    [ "$(cat "$dev/idProduct" 2>/dev/null)" = "5740" ] || continue
+    udevadm trigger --action=add "$tty" >/dev/null 2>&1 \
+      || err "Could not re-announce the USB miner $name"
+  done
+  return 0
 }
 
 # New or removed rules are not seen by udevd until told. Best effort: a sandbox
@@ -773,6 +783,14 @@ verify_all_stopped() {
       die "$u.service did not stop; aborting update"
     fi
   done
+  # The USB miner instances are PartOf=apollo-miner and stop with it; one that is
+  # still active would hold a board's serial port through the swap.
+  local usb_active
+  usb_active=$(systemctl list-units 'apollo-usb-miner@*' --state=active --no-legend --plain 2>/dev/null \
+    | awk '{print $1}' || true)
+  if [ -n "$usb_active" ]; then
+    die "${usb_active%%$'\n'*} did not stop; aborting update"
+  fi
   # A unit can report inactive while its daemon survives: ckpool_stop.sh always
   # exits 0 (having nothing left to stop is a success, and a ckpool that outlives
   # its TERM/KILL waits is only reported on stdout), so the stop can report

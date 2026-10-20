@@ -25,7 +25,9 @@ const MAX_AUTOMATION_EVENTS = 50;
 const SECTION_TIMEOUT_MS = 15000;
 
 // systemd units worth having when something went wrong.
-const UNITS = ['apollo-api', 'apollo-ui-v2', 'apollo-miner', 'node', 'ckpool'];
+// The USB miner instances are one unit per board (apollo-usb-miner@ttyACMn);
+// journalctl -u takes the glob, so every instance, present or gone, is in one read.
+const UNITS = ['apollo-api', 'apollo-ui-v2', 'apollo-miner', 'apollo-usb-miner@*', 'node', 'ckpool'];
 
 class DiagnosticsService {
   constructor(knex, deps = {}) {
@@ -125,7 +127,7 @@ class DiagnosticsService {
             const collected = {};
             for (const unit of UNITS) {
               collected[unit] = await this._section(`log:${unit}`, () =>
-                this._journal(`-u ${unit}`, lines)
+                this._journal(`-u '${unit}'`, lines)
               );
             }
             // The point of the persistent journal (see LOGGING_REDESIGN §2.7): after

@@ -224,6 +224,23 @@ describe('diagnostic bundle', () => {
     expect(parsed.versions.installed).toBe('2.2.0'); // unaffected
   });
 
+  it('reads the journal of every USB miner instance, quoted, and still scrubs it', async () => {
+    const svc = createDiagnostics(null, okDeps());
+    svc._isProduction = () => true;
+    const calls = [];
+    svc._journal = jest.fn(async (args) => {
+      calls.push(args);
+      return { content: args.includes('apollo-usb-miner@*') ? 'usb miner start password=hunter2secret' : 'ok' };
+    });
+    svc._command = jest.fn(async () => 'x');
+
+    const parsed = JSON.parse((await svc.bundle()).content);
+
+    expect(calls).toContain("-u 'apollo-usb-miner@*'");
+    expect(parsed.logs['apollo-usb-miner@*'].content).toContain('usb miner start');
+    expect(JSON.stringify(parsed)).not.toContain('hunter2secret');
+  });
+
   it('does not hang when a section never resolves', async () => {
     jest.useFakeTimers();
     try {

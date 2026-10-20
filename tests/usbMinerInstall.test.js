@@ -95,8 +95,11 @@ describe('backend/update (OTA)', () => {
     expect(trigger).toBeGreaterThan(miner);
     expect(health).toBe(trigger + 1);
     const def = lines.slice(at(/^trigger_usb_miners\(\) \{/)).join('\n');
-    // Targeted at the hashboard VID:PID, never the whole tty subsystem.
-    expect(def).toMatch(/--property-match=ID_VENDOR_ID=0483 --property-match=ID_MODEL_ID=5740/);
+    // One trigger per matching device: udevadm ORs property-matches, so those (and
+    // a whole-subsystem trigger) re-add every STMicro tty. Behaviour: rollback.test.sh.
+    expect(def).not.toMatch(/property-match|subsystem-match/);
+    expect(def).toMatch(/idVendor/);
+    expect(def).toMatch(/idProduct/);
   });
 });
 
