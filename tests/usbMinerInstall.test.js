@@ -37,6 +37,15 @@ describe.each(INSTALL_PATHS)('%s', (file) => {
   });
 });
 
+describe('update_system', () => {
+  // set -Eeuo pipefail + ERR trap: an unprotected udevadm failure would abort the update.
+  it('never lets a failing udevadm reload abort the update', () => {
+    const reloads = code('update_system').filter((l) => /udevadm control --reload-rules/.test(l));
+    expect(reloads.length).toBeGreaterThan(0);
+    for (const l of reloads) expect(l).toMatch(/\|\|\s*true\s*$/);
+  });
+});
+
 describe('uninstall-v2', () => {
   const lines = code('uninstall-v2');
   it('removes the unit and the rule, then reloads udev', () => {
