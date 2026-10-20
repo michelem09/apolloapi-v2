@@ -355,7 +355,7 @@ systemctl enable \
     rc-local.service \
     swap.service
 systemctl disable ckpool.service >/dev/null 2>&1 || true
-udevadm control --reload-rules
+udevadm control --reload-rules || true
 
 restore_solo_intent
 
