@@ -82,7 +82,7 @@ describe('_getMinerStats drops boards the registry forgot', () => {
   });
 });
 
-describe('fetchStatistics skips disconnected boards', () => {
+describe('fetchStatistics skips boards that are not active', () => {
   it('leaves them out of the inserted rows and totals', async () => {
     jest.resetModules();
     jest.unmock('../src/app/scheduler');
@@ -95,7 +95,7 @@ describe('fetchStatistics skips disconnected boards', () => {
       fans: { int_0: { rpm: [1000] } },
     });
     jest.doMock('../src/services', () => ({
-      miner: { getStats: jest.fn().mockResolvedValue({ stats: [mk('LIVE', 100), mk('DEAD', 900)] }) },
+      miner: { getStats: jest.fn().mockResolvedValue({ stats: [mk('LIVE', 100), mk('DEAD', 900), mk('BOOT', 700), mk('STUCK', 800)] }) },
       serviceMonitor: null,
     }));
     const fakeKnex = jest.fn((table) => {
@@ -109,7 +109,7 @@ describe('fetchStatistics skips disconnected boards', () => {
     fakeKnex.raw = (q) => q;
     fakeKnex.transaction = async (fn) => fn(fakeKnex);
     jest.doMock('../src/db', () => ({ knex: fakeKnex }));
-    mockRegistry.snap = snapOf([board('LIVE'), board('DEAD', 'disconnected')]);
+    mockRegistry.snap = snapOf([board('LIVE'), board('DEAD', 'disconnected'), board('BOOT', 'booting'), board('STUCK', 'stuck')]);
     const scheduler = require('../src/app/scheduler');
     await scheduler.fetchStatistics();
     const rows = inserted.filter((r) => r && r.uuid);
@@ -169,6 +169,12 @@ describe('service monitor: Solo Node with no board', () => {
     mockRegistry.snap = snapOf([board('AAA')]);
     const res = await run('offline', idle);
     expect(res.status).toBe('pending');
+  });
+
+  it.each(['booting', 'stuck'])('a %s board is not an active one: still offline', async (st) => {
+    mockRegistry.snap = snapOf([board('AAA', st)]);
+    const res = await run('offline', idle);
+    expect(res.status).toBe('offline');
   });
 
   it('only on a Solo Node (Apollo II keeps pending)', async () => {

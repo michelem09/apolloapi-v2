@@ -21,6 +21,7 @@ const { getDeviceFamily } = require('./deviceFamily');
  */
 const DEBOUNCE_MS = 5 * 1000; // a replug enumerates up to 4 times in 20 s
 const EXPIRY_MS = 15 * 60 * 1000; // a disconnected board is forgotten after this
+const STUCK_MS = 2 * 60 * 1000; // a board in IAP (bootloader) this long is not coming up
 const MINING_MS = 15 * 1000; // same "fresh stat file" threshold as services/miner.js
 
 const iso = (ms) => (ms === null || ms === undefined ? null : new Date(ms).toISOString());
@@ -39,8 +40,10 @@ function parseStatFileName(file) {
   return { version: m[1] ? `v${m[1]}` : 'v1', id: m[2] };
 }
 
-// "BCO IAP #<serial>" is the bootloader phase of a board being updated. Negative
-// match only: the SLV/RD6 strings of other boards are not all known.
+// "BCO IAP #<serial>" is the bootloader phase: a board enumerates as IAP on
+// power-on and after every miner stop (which resets it), then re-enumerates as
+// "BCO SLV #<serial>" (the miner firmware) about 30 s later, with the SAME serial.
+// Negative match only: the SLV/RD6 strings of other boards are not all known.
 const isIap = (port) => /\bIAP\b/i.test(port.product || '');
 
 const portDev = (name) => `/dev/${name}`;
@@ -64,19 +67,24 @@ function buildSnapshot(boards, family) {
     hasMiner: family !== 'solo-node' || usb.length > 0,
     hasUsbMiners: usb.length > 0,
     usbCount: usb.length,
+    // Only `active` boards count: booting, stuck and disconnected are attached
+    // (hasUsbMiners / usbCount) but not mining.
     usbActiveCount: usb.filter((b) => b.status === 'active').length,
     deviceFamily: family,
   };
 }
 
 /**
- * Memory shape: { [id]: { uuid, serial, family, kind, port, since, lastSeen, absentSince } }
- * (times in ms). Returns { boards, memory, nextExpiryAt } where nextExpiryAt is the
+ * Memory shape: { [id]: { uuid, serial, family, kind, port, since, lastSeen, absentSince, iapSince } }
+ * (times in ms; iapSince = start of the continuous IAP phase, null otherwise). Returns { boards, memory, nextExpiryAt } where nextExpiryAt is the
  * earliest ISO instant at which the result changes with no new input (end of a
  * debounce window, or a disconnected board expiring), or null.
  */
 function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory = {}, now }) {
-  const livePorts = ports.filter((p) => /^ttyACM\d+$/.test(p.name) && !isIap(p));
+  // IAP ports are kept: the board is booting, not absent.
+  const livePorts = ports
+    .filter((p) => /^ttyACM\d+$/.test(p.name))
+    .map((p) => ({ ...p, iap: isIap(p) }));
 
   // One entry per uuid (the newest file wins).
   const entries = new Map();
@@ -101,7 +109,8 @@ function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory
       );
     }
     if (c) {
-      c.port = p;
+      // IAP and SLV of one board can be listed together for an instant: SLV wins.
+      if (!c.port || (c.port.iap && !p.iap)) c.port = p;
       claimed.add(p.name);
     } else {
       const id = p.serial || `port:${p.name}`;
@@ -131,11 +140,19 @@ function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory
     let lastSeen;
     let status = 'active';
     let expiresAt = null;
+    let iapSince = null;
 
     if (present) {
       const flap = prev && (prev.absentSince === null || now - prev.absentSince < DEBOUNCE_MS);
       since = flap ? prev.since : now;
       lastSeen = now;
+      if (c.port && c.port.iap) {
+        // Continuous since IAP was first seen; a gap longer than the debounce
+        // (disconnected in between) starts the count again.
+        iapSince = flap && prev.iapSince !== null && prev.iapSince !== undefined ? prev.iapSince : now;
+        since = iapSince;
+        status = 'booting';
+      }
     } else {
       // First observed absence is now; with no memory at all (API restart) the
       // miner exited when the port vanished, so the stat-file mtime dates it.
@@ -143,6 +160,12 @@ function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory
       absentSince = prev ? (prev.absentSince !== null ? prev.absentSince : now) : mtime;
       if (now - absentSince >= EXPIRY_MS) continue; // dropped, and forgotten
       lastSeen = prev ? prev.lastSeen : absentSince;
+      if (now - absentSince < DEBOUNCE_MS && prev && prev.iapSince !== null && prev.iapSince !== undefined) {
+        // Unplugged, or between IAP and SLV, but still inside the debounce:
+        // keeps its state, so the booting phase does not flash orange.
+        iapSince = prev.iapSince;
+        status = 'booting';
+      }
       if (now - absentSince >= DEBOUNCE_MS) {
         status = 'disconnected';
         since = absentSince;
@@ -152,6 +175,12 @@ function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory
         since = prev ? prev.since : absentSince;
         soon(absentSince + DEBOUNCE_MS);
       }
+    }
+
+    if (status === 'booting') {
+      // The 2-minute rule has its own timer: nothing else changes at that instant.
+      if (now - iapSince >= STUCK_MS) status = 'stuck';
+      else soon(iapSince + STUCK_MS);
     }
 
     const mining = Boolean(
@@ -179,6 +208,7 @@ function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory
       since,
       lastSeen,
       absentSince,
+      iapSince,
     };
   }
 
@@ -435,5 +465,6 @@ module.exports = {
   resetMinerBoards,
   DEBOUNCE_MS,
   EXPIRY_MS,
+  STUCK_MS,
   MINING_MS,
 };

@@ -276,6 +276,8 @@ class ServiceMonitor {
           const registry = getMinerBoards();
           await registry.refresh();
           const snap = registry.snapshot();
+          // usbActiveCount: a booting or stuck board is attached but not mining yet,
+          // so it still reads as "no boards" here (offline, not a perpetual pending).
           soloNodeNoBoards = snap.deviceFamily === 'solo-node' && snap.usbActiveCount === 0;
         } catch (error) {
           console.log(`Board registry unavailable for ${serviceName}: ${error.message}`);
