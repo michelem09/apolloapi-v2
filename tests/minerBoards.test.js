@@ -382,7 +382,9 @@ describe('deriveBoards booting / stuck', () => {
     const before = step(r0, STUCK_MS - 1, { ports: [iap()] });
     expect(byId(before, SERIAL).status).toBe('booting');
     const after = step(r0, STUCK_MS, { ports: [iap()] });
-    expect(byId(after, SERIAL)).toMatchObject({ status: 'stuck', since: new Date(T0).toISOString() });
+    // booting keeps the IAP start; stuck is "since" the moment it became stuck
+    expect(byId(before, SERIAL).since).toBe(new Date(T0).toISOString());
+    expect(byId(after, SERIAL)).toMatchObject({ status: 'stuck', since: new Date(T0 + STUCK_MS).toISOString() });
     expect(after.nextExpiryAt).toBeNull();
   });
 
@@ -414,5 +416,185 @@ describe('deriveBoards booting / stuck', () => {
       const r5 = step(r3, idle + 1000 + DEBOUNCE_MS + EXPIRY_MS, { ports: [] });
       expect(r5.boards).toEqual([]);
     }
+  });
+});
+
+describe('deriveBoards IAP start survives an API restart', () => {
+  const iapAt = (enumeratedAtMs) => port({ product: `BCO IAP #${SERIAL}`, enumeratedAtMs });
+  const slv = (over = {}) => port({ product: `BCO SLV #${SERIAL}`, ...over });
+  const step = (prev, at, args) => run({ ...args, memory: prev.memory, now: T0 + at });
+
+  test('empty memory: the count starts at the enumeration, not at now', () => {
+    const res = run({ ports: [iapAt(T0 - 30000)] });
+    expect(byId(res, SERIAL)).toMatchObject({ status: 'booting', since: new Date(T0 - 30000).toISOString() });
+    expect(res.nextExpiryAt).toBe(new Date(T0 - 30000 + STUCK_MS).toISOString());
+  });
+
+  test('empty memory, enumerated more than 2 minutes ago: stuck at once, since = the stuck instant', () => {
+    const res = run({ ports: [iapAt(T0 - 3 * 60000)] });
+    expect(byId(res, SERIAL)).toMatchObject({
+      status: 'stuck',
+      since: new Date(T0 - 3 * 60000 + STUCK_MS).toISOString(),
+    });
+  });
+
+  test('a restart mid-IAP keeps the original anchor of the previous run', () => {
+    const before = run({ ports: [iapAt(T0 - 60000)] });
+    const afterRestart = run({ ports: [iapAt(T0 - 60000)], now: T0 + 20000 }); // memory lost
+    expect(byId(afterRestart, SERIAL).since).toBe(byId(before, SERIAL).since);
+    expect(byId(afterRestart, SERIAL).status).toBe('booting');
+  });
+
+  test('a restart never turns a stuck board back into booting', () => {
+    const live = run({ ports: [iapAt(T0)] });
+    const stuck = step(live, STUCK_MS + 5000, { ports: [iapAt(T0)] });
+    expect(byId(stuck, SERIAL).status).toBe('stuck');
+    const restarted = run({ ports: [iapAt(T0)], now: T0 + STUCK_MS + 6000 }); // empty memory
+    expect(byId(restarted, SERIAL).status).toBe('stuck');
+    expect(byId(restarted, SERIAL).since).toBe(byId(stuck, SERIAL).since);
+  });
+
+  test('unreadable or future ctime: falls back to / is clamped to now', () => {
+    expect(byId(run({ ports: [iapAt(null)] }), SERIAL).since).toBe(new Date(T0).toISOString());
+    expect(byId(run({ ports: [iapAt(undefined)] }), SERIAL).since).toBe(new Date(T0).toISOString());
+    expect(byId(run({ ports: [iapAt(T0 + 99999)] }), SERIAL).since).toBe(new Date(T0).toISOString());
+  });
+
+  test('with memory the anchor is the remembered one, whatever the ctime says', () => {
+    const r0 = run({ ports: [iapAt(T0)] });
+    const r1 = step(r0, 10000, { ports: [iapAt(T0 + 10000)] });
+    expect(byId(r1, SERIAL).since).toBe(new Date(T0).toISOString());
+  });
+});
+
+describe('deriveBoards since of a board that left the bootloader', () => {
+  const iap = (over = {}) => port({ product: `BCO IAP #${SERIAL}`, ...over });
+  const slv = (over = {}) => port({ product: `BCO SLV #${SERIAL}`, ...over });
+  const step = (prev, at, args) => run({ ...args, memory: prev.memory, now: T0 + at });
+
+  test('booting -> SLV: since is the moment it came up, not the IAP start', () => {
+    const r0 = run({ ports: [iap()] });
+    const r1 = step(r0, 30000, { ports: [slv()] });
+    expect(byId(r1, SERIAL)).toMatchObject({ status: 'active', since: new Date(T0 + 30000).toISOString() });
+    // and it stays put while the board keeps mining
+    expect(byId(step(r1, 40000, { ports: [slv()] }), SERIAL).since).toBe(new Date(T0 + 30000).toISOString());
+  });
+
+  test('booting -> gap -> SLV inside the debounce: since is the SLV moment', () => {
+    const r0 = run({ ports: [iap()] });
+    const r1 = step(r0, 30000, { ports: [] });
+    const r2 = step(r1, 31000, { ports: [slv()] });
+    expect(byId(r2, SERIAL)).toMatchObject({ status: 'active', since: new Date(T0 + 31000).toISOString() });
+  });
+
+  test('stuck -> SLV: since is the moment it came up', () => {
+    const r0 = run({ ports: [iap()] });
+    const r1 = step(r0, STUCK_MS + 5000, { ports: [iap()] });
+    const r2 = step(r1, STUCK_MS + 6000, { ports: [slv()] });
+    expect(byId(r2, SERIAL)).toMatchObject({ status: 'active', since: new Date(T0 + STUCK_MS + 6000).toISOString() });
+  });
+
+  test('a replug flap of an active board keeps its since (no IAP involved)', () => {
+    const r0 = run({ ports: [slv()] });
+    const r1 = step(r0, 1000, { ports: [] });
+    const r2 = step(r1, 2000, { ports: [slv()] });
+    expect(byId(r2, SERIAL).since).toBe(new Date(T0).toISOString());
+  });
+});
+
+describe('deriveBoards serial-less IAP port, then SLV with a serial', () => {
+  const iapNoSerial = () => port({ serial: null, product: 'BCO IAP #' });
+  const slv = (over = {}) => port({ product: `BCO SLV #${SERIAL}`, ...over });
+  const step = (prev, at, args) => run({ ...args, memory: prev.memory, now: T0 + at });
+
+  test('the serial-less entry is absorbed: one board, no ghost', () => {
+    const r0 = run({ ports: [iapNoSerial()] });
+    expect(r0.boards.map((b) => b.id)).toEqual(['port:ttyACM0']);
+    const r1 = step(r0, 30000, { ports: [slv()] });
+    expect(r1.boards.map((b) => b.id)).toEqual([SERIAL]);
+    expect(byId(r1, SERIAL)).toMatchObject({ status: 'active', serial: SERIAL });
+    expect(Object.keys(r1.memory)).toEqual([SERIAL]);
+  });
+
+  test('absorbed across the gap between the two enumerations too', () => {
+    const r0 = run({ ports: [iapNoSerial()] });
+    const r1 = step(r0, 30000, { ports: [] });
+    const r2 = step(r1, 31000, { ports: [slv()] });
+    expect(r2.boards.map((b) => b.id)).toEqual([SERIAL]);
+  });
+
+  test('the booting clock carries over to the board that absorbed it', () => {
+    const r0 = run({ ports: [iapNoSerial()] });
+    const r1 = step(r0, 10000, { ports: [port({ product: `BCO IAP #${SERIAL}` })] });
+    expect(byId(r1, SERIAL)).toMatchObject({ status: 'booting', since: new Date(T0).toISOString() });
+  });
+
+  test('not absorbed once the debounce has passed: it is a disconnected board', () => {
+    const r0 = run({ ports: [iapNoSerial()] });
+    const r1 = step(r0, 1000, { ports: [] });
+    const r2 = step(r1, 1000 + DEBOUNCE_MS, { ports: [slv()] });
+    expect(r2.boards.map((b) => b.id).sort()).toEqual([SERIAL, 'port:ttyACM0'].sort());
+  });
+
+  test('a serial-less entry on another port is left alone', () => {
+    const r0 = run({ ports: [iapNoSerial()] });
+    const r1 = step(r0, 1000, { ports: [iapNoSerial(), slv({ name: 'ttyACM1' })] });
+    expect(r1.boards.map((b) => b.id).sort()).toEqual([SERIAL, 'port:ttyACM0'].sort());
+  });
+});
+
+describe('MinerBoards after an API restart', () => {
+  let dir;
+  const quiet = { warn() {}, debug() {}, info() {}, error() {} };
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'boards-restart-'));
+    for (const d of ['stats', 'dev', 'sys']) fs.mkdirSync(path.join(dir, d));
+    const usbdev = path.join(dir, 'sys', 'usbdev');
+    fs.mkdirSync(path.join(usbdev, 'if0'), { recursive: true });
+    fs.writeFileSync(path.join(usbdev, 'serial'), `${SERIAL}\n`);
+    fs.writeFileSync(path.join(usbdev, 'product'), `BCO IAP #${SERIAL}\n`);
+    fs.writeFileSync(path.join(usbdev, 'idVendor'), '0483\n');
+    fs.writeFileSync(path.join(usbdev, 'idProduct'), '5740\n');
+    fs.mkdirSync(path.join(dir, 'sys', 'ttyACM0'));
+    fs.symlinkSync(path.join(usbdev, 'if0'), path.join(dir, 'sys', 'ttyACM0', 'device'));
+    fs.writeFileSync(path.join(dir, 'dev', 'ttyACM0'), '');
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const make = (enumeratedAt) =>
+    new MinerBoards({
+      env: {
+        APOLLO_MINER_STATS_DIR: path.join(dir, 'stats'),
+        APOLLO_USB_DEV_DIR: path.join(dir, 'dev'),
+        APOLLO_USB_SYS_DIR: path.join(dir, 'sys'),
+        ARMBIAN_RELEASE_FILE: path.join(dir, 'release'),
+      },
+      logger: quiet,
+      enumeratedAt,
+    });
+
+  test('the first snapshot of a new process is stuck when the board enumerated long ago, and never booting', () => {
+    const now = Date.now();
+    const enumerated = now - 5 * 60000;
+    const first = make(() => enumerated);
+    first.refreshSync({ now: enumerated + 1000 });
+    first.refreshSync({ now: enumerated + STUCK_MS + 1000 });
+    expect(first.snapshot().boards[0].status).toBe('stuck');
+
+    const restarted = make(() => enumerated); // memory lost
+    const seen = [];
+    restarted.onChange((s) => seen.push(s.boards.map((b) => b.status).join()));
+    restarted.refreshSync({ now });
+    restarted.refreshSync({ now: now + 1000 });
+    restarted.refreshSync({ now: now + 60000 });
+    expect(restarted.snapshot().boards[0].status).toBe('stuck');
+    expect(seen).toEqual(['stuck']);
+    expect(restarted.snapshot().boards[0].since).toBe(new Date(enumerated + STUCK_MS).toISOString());
+  });
+
+  test('the default source is the ctime of the device node', () => {
+    const reg = make(null);
+    const ctime = fs.statSync(path.join(dir, 'dev', 'ttyACM0')).ctimeMs;
+    expect(reg._enumeratedAt(path.join(dir, 'dev'), 'ttyACM0')).toBe(ctime);
+    expect(reg._enumeratedAt(path.join(dir, 'dev'), 'ttyACM9')).toBeNull();
   });
 });

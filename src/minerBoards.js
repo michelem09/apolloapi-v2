@@ -44,7 +44,9 @@ function parseStatFileName(file) {
 // power-on and after every miner stop (which resets it), then re-enumerates as
 // "BCO SLV #<serial>" (the miner firmware) about 30 s later, with the SAME serial.
 // Negative match only: the SLV/RD6 strings of other boards are not all known.
-const isIap = (port) => /\bIAP\b/i.test(port.product || '');
+// One criterion in four places (this file, the udev rule, miner_start.sh and
+// usb_miner_run.sh): the word IAP, case-sensitive, in the USB product string.
+const isIap = (port) => /\bIAP\b/.test(port.product || '');
 
 const portDev = (name) => `/dev/${name}`;
 
@@ -82,6 +84,13 @@ function buildSnapshot(boards, family) {
  * earliest ISO instant at which the result changes with no new input (end of a
  * debounce window, or a disconnected board expiring), or null.
  */
+// When the board enumerated, from the port collector (the ctime of its device
+// node), clamped to the clock; `now` when unknown.
+const enumeratedAt = (port, now) => {
+  const t = port.enumeratedAtMs;
+  return typeof t === 'number' && Number.isFinite(t) ? Math.min(t, now) : now;
+};
+
 function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory = {}, now }) {
   // IAP ports are kept: the board is booting, not absent.
   const livePorts = ports
@@ -119,7 +128,21 @@ function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory
       cands.set(id, { id, entry: null, port: p });
     }
   }
-  for (const id of Object.keys(memory)) {
+  // A port whose serial could not be read is listed as `port:<name>`; when the
+  // same port comes back with a real serial (IAP -> SLV) inside the debounce, it
+  // is the same board: the serial-less entry is absorbed instead of left behind
+  // as a disconnected ghost.
+  const mem = { ...memory };
+  for (const c of cands.values()) {
+    if (!c.port || c.id.startsWith('port:') || mem[c.id]) continue;
+    const ghostId = `port:${c.port.name}`;
+    const ghost = mem[ghostId];
+    if (ghost && (ghost.absentSince === null || ghost.absentSince === undefined || now - ghost.absentSince < DEBOUNCE_MS)) {
+      mem[c.id] = { ...ghost, uuid: c.id };
+      delete mem[ghostId];
+    }
+  }
+  for (const id of Object.keys(mem)) {
     if (!cands.has(id)) cands.set(id, { id, entry: null, port: null });
   }
 
@@ -131,7 +154,7 @@ function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory
   };
 
   for (const c of cands.values()) {
-    const prev = memory[c.id];
+    const prev = mem[c.id];
     const kind = prev && !c.entry && !c.port ? prev.kind : classifyKind({ ...c, family });
     const boardFamily = (c.entry && c.entry.version) || (prev && prev.family) || null;
     const port = c.port ? portDev(c.port.name) : (c.entry && c.entry.comport) || (prev && prev.port) || null;
@@ -143,17 +166,24 @@ function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory
     let status = 'active';
     let expiresAt = null;
     let iapSince = null;
+    let outSince = null;
 
     if (present) {
       const flap = prev && (prev.absentSince === null || now - prev.absentSince < DEBOUNCE_MS);
+      const wasIap = Boolean(prev) && prev.iapSince !== null && prev.iapSince !== undefined;
       since = flap ? prev.since : now;
       lastSeen = now;
       if (c.port && c.port.iap) {
         // Continuous since IAP was first seen; a gap longer than the debounce
-        // (disconnected in between) starts the count again.
-        iapSince = flap && prev.iapSince !== null && prev.iapSince !== undefined ? prev.iapSince : now;
+        // (disconnected in between) starts the count again. With no memory at all
+        // (API restart) the count starts when the board enumerated, not now.
+        if (flap && wasIap) iapSince = prev.iapSince;
+        else iapSince = prev ? now : enumeratedAt(c.port, now);
         since = iapSince;
         status = 'booting';
+      } else if (wasIap) {
+        // Left the bootloader: an active board is "since" the moment it came up.
+        since = now;
       }
     } else {
       // First observed absence is now; with no memory at all (API restart) the
@@ -181,8 +211,11 @@ function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory
 
     if (status === 'booting') {
       // The 2-minute rule has its own timer: nothing else changes at that instant.
-      if (now - iapSince >= STUCK_MS) status = 'stuck';
-      else soon(iapSince + STUCK_MS);
+      if (now - iapSince >= STUCK_MS) {
+        status = 'stuck';
+        // A stuck board is "since" the moment it became stuck; booting keeps the IAP start.
+        outSince = iapSince + STUCK_MS;
+      } else soon(iapSince + STUCK_MS);
     }
 
     const mining = Boolean(
@@ -197,7 +230,7 @@ function deriveBoards({ family = 'unknown', statEntries = [], ports = [], memory
       port,
       status,
       mining,
-      since: iso(since),
+      since: iso(outSince !== null ? outSince : since),
       lastSeen: iso(lastSeen),
       expiresAt: iso(expiresAt),
     });
@@ -238,8 +271,9 @@ function loadLogger() {
 }
 
 class MinerBoards {
-  constructor({ env = process.env, logger } = {}) {
+  constructor({ env = process.env, logger, enumeratedAt = null } = {}) {
     this.env = env;
+    if (enumeratedAt) this._enumeratedAt = enumeratedAt;
     this.log = logger || loadLogger();
     this.memory = {};
     this.last = buildSnapshot([], 'unknown');
@@ -313,6 +347,17 @@ class MinerBoards {
     return out;
   }
 
+  // Machine timestamp (ms) of a port's enumeration: devtmpfs creates the node at
+  // that moment, so its ctime dates it. The single source for IAP start after an
+  // API restart: swap this function if a better one turns up. null when unreadable.
+  _enumeratedAt(devDir, name) {
+    try {
+      return fs.statSync(path.join(devDir, name)).ctimeMs;
+    } catch (e) {
+      return null;
+    }
+  }
+
   _readPorts({ sysDir, devDir }) {
     const readTxt = (p) => {
       try {
@@ -334,7 +379,12 @@ class MinerBoards {
       } catch (e) {
         names = [];
       }
-      return names.map((name) => ({ name, serial: null, product: null }));
+      return names.map((name) => ({
+        name,
+        serial: null,
+        product: null,
+        enumeratedAtMs: this._enumeratedAt(devDir, name),
+      }));
     }
     const ports = [];
     for (const name of names) {
@@ -355,6 +405,7 @@ class MinerBoards {
         name,
         serial: readTxt(path.join(base, 'serial')),
         product: readTxt(path.join(base, 'product')),
+        enumeratedAtMs: this._enumeratedAt(devDir, name),
       });
     }
     return ports;
