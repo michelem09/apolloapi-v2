@@ -419,6 +419,130 @@ const verifyHealth = async ({ ssh, healthPath, fsImpl = fs, now = Date.now, slee
   }
 };
 
+// ------------------------------------------------------------- booting (IAP)
+
+// A board that is reset (`apollo-helper -s <port> -r`, what miner_stop.sh runs) comes
+// back as "BCO IAP #<serial>" at once and as SLV ~30 s later. The registry calls
+// that window `booting` (`stuck` after 2 minutes). The journey puts a free board
+// (miner stopped) into IAP on purpose, to see what the product does meanwhile.
+const MINER_DIR = '/opt/apolloapi/backend/apollo-miner';
+const RESET_TIMEOUT_S = 20;
+
+// Reset the board on `tty` into its bootloader. At the moment of the write, in the
+// shell: apollo-miner not active/activating (a reset during a real Stop is the flaky
+// case and not what is tested), the parent of the tty 0483:5740 (never the hub), its
+// product SLV, the chosen serial. A guard that refuses exits 1 and says `refused:`;
+// the helper failing or timing out exits 2 and says `apollo-helper failed`. Prints
+// `reset` on success.
+const resetCommand = (tty, { serial = null } = {}) => {
+  if (!/^ttyACM\d+$/.test(String(tty))) throw new Error(`refusing: "${tty}" is not a ttyACM port`);
+  return `t=${shq(tty)}; d=$(dirname "$(readlink -f "/sys/class/tty/$t/device")"); ` +
+    's=$(systemctl show apollo-miner -p ActiveState --value 2>/dev/null); ' +
+    'case "$s" in active|activating|reloading) { echo "refused: apollo-miner is $s: the reset is only done on a free port" >&2; exit 1; };; esac; ' +
+    'v=$(cat "$d/idVendor" 2>/dev/null); p=$(cat "$d/idProduct" 2>/dev/null); pr=$(cat "$d/product" 2>/dev/null); sn=$(cat "$d/serial" 2>/dev/null); ' +
+    `[ "$v:$p" = ${BOARD.vendor}:${BOARD.product} ] || { echo "refused: the parent of $t is $v:$p, not ${BOARD.vendor}:${BOARD.product}" >&2; exit 1; }; ` +
+    'case "$pr" in *SLV*) ;; *) { echo "refused: product reads \'$pr\', not SLV" >&2; exit 1; };; esac; ' +
+    (serial ? `[ "$sn" = ${shq(serial)} ] || { echo "refused: serial is '$sn', not the chosen board" >&2; exit 1; }; ` : '') +
+    `cd ${MINER_DIR} || exit 1; ` +
+    `timeout ${RESET_TIMEOUT_S} sudo -n ./apollo-helper -s "/dev/$t" -r >/dev/null 2>&1 || { echo "apollo-helper failed (exit $?) on /dev/$t" >&2; exit 2; }; ` +
+    'echo reset';
+};
+
+// Why a reset command failed: a guard that refused is a failed precondition (the
+// journey fails); the helper failing or not answering means the board never reached
+// its bootloader, which is no verdict on the product (the journey skips the part).
+const classifyResetError = (err) => {
+  const text = String(err?.stderr || err?.message || err || '');
+  if (/refused:/i.test(text)) return { skip: false, reason: text.trim().split('\n').pop() };
+  if (/apollo-helper failed|timed out|timeout|exit 124/i.test(text)) {
+    return { skip: true, reason: `the reset did not reach the bootloader: ${text.trim().split('\n').pop()}` };
+  }
+  return { skip: false, reason: text.trim().split('\n').pop() || 'the reset command failed' };
+};
+
+// The board in a registry payload, by id or by USB serial (its id may change while
+// it re-enumerates).
+const boardMatching = (boards, { id = null, serial = null } = {}) =>
+  usbBoards(boards).find((b) => (id && b.id === id) || (serial && b.serial && String(b.serial).toLowerCase() === String(serial).toLowerCase())) || null;
+const isBooting = (board) => !!board && board.status === 'booting';
+
+// After the reset: the registry must say `booting` within the wait. What the bus
+// showed (a product reading IAP) tells a reset that never happened from a registry
+// that did not notice one:
+//   booting seen                 -> go on
+//   neither IAP nor booting seen -> skip, the reset did not reach the bootloader
+//   IAP on the bus, never booting -> FAIL, a product defect
+const classifyBootWait = ({ sawIap = false, sawBooting = false, waitedMs = null } = {}) => {
+  const after = waitedMs === null ? '' : ` within ${Math.round(waitedMs / 1000)} s`;
+  if (sawBooting) return { verdict: 'proceed' };
+  if (!sawIap) return { verdict: 'skip', reason: `the reset did not reach the bootloader: the board never read IAP on the bus and the registry never said booting${after}` };
+  return { verdict: 'fail', reason: `the board read IAP on the bus but the registry never said booting${after}` };
+};
+
+// "3 USB miners connected, 1 starting" -> 1; no such part -> null.
+const startingCount = (tooltipText) => {
+  const m = /(\d+)\s+starting\b/i.exec(String(tooltipText || ''));
+  return m ? Number(m[1]) : null;
+};
+
+// Samples taken every ~second from the Start click: { t: ms since the click, status:
+// the miner status the service monitor publishes, board: the registry status of the
+// board }. "Collapsed" for the report: offline x2 -> pending x14 -> online x3.
+const collapseSequence = (statuses) => {
+  const out = [];
+  for (const s of statuses) {
+    const last = out[out.length - 1];
+    if (last && last.s === s) last.n += 1; else out.push({ s, n: 1 });
+  }
+  return out.map((x) => `${x.s}×${x.n}`).join(' → ');
+};
+
+// While a board boots, a Start must read `pending` and NEVER `offline`, from the click
+// until the board is active. The first `graceMs` are not judged (the click is not the
+// mutation, and the monitor publishes on its own tick: the status is still the stopped
+// one) but an offline there is reported. The sample that first reads the board active
+// and anything after it are not judged either (the miner is online by then).
+// proved is false when no sample saw the board still booting: the window was missed
+// and nothing was shown.
+const pendingNeverOffline = (samples, { graceMs = 2000 } = {}) => {
+  const all = Array.isArray(samples) ? samples : [];
+  const firstActive = all.findIndex((s) => s.board === 'active');
+  const window = firstActive === -1 ? all : all.slice(0, firstActive);
+  const sequence = collapseSequence(all.map((s) => s.status ?? '?'));
+  const graceOffline = window.filter((s) => s.t < graceMs && s.status === 'offline').length;
+  const judged = window.filter((s) => s.t >= graceMs);
+  const bad = judged.find((s) => s.status === 'offline');
+  if (bad) {
+    return { ok: false, proved: true, sequence, graceOffline, reason: `the miner read offline ${(bad.t / 1000).toFixed(1)} s after the Start click while the board was ${bad.board || 'not listed'} (sequence: ${sequence})` };
+  }
+  const bootingJudged = judged.filter((s) => s.board === 'booting');
+  if (bootingJudged.length === 0) {
+    return { ok: true, proved: false, sequence, graceOffline, reason: `no sample saw the board still booting after the first ${graceMs / 1000} s: the window was missed (sequence: ${sequence})` };
+  }
+  if (!bootingJudged.some((s) => s.status === 'pending')) {
+    return { ok: false, proved: true, sequence, graceOffline, reason: `the miner was never pending while the board booted (sequence: ${sequence})` };
+  }
+  return { ok: true, proved: true, sequence, graceOffline };
+};
+
+// The journal from the Start click to the board mining. The IAP port must have been
+// skipped (miner_start.sh / usb_miner_run.sh print "is still in its bootloader (IAP)")
+// or not have been on the bus yet, and no instance may have hit an unknown board.
+// `portAtClick` is what sysfs said the moment Start was pressed: IAP, SLV or null.
+const judgeBootJournal = (text, { portAtClick = null } = {}) => {
+  const t = String(text || '');
+  const lines = t.split('\n').map((l) => l.trim()).filter(Boolean);
+  const unknown = lines.filter((l) => wedgedInJournal(l));
+  if (unknown.length) return { ok: false, reason: `an instance hit an unknown board: ${unknown.slice(-3).join(' | ')}` };
+  const skipped = lines.filter((l) => /still in its bootloader \(IAP\)/i.test(l));
+  if (skipped.length) return { ok: true, skippedIap: true, detail: `the IAP port was skipped (${skipped.length} line(s)), no "Unknown board"` };
+  if (portAtClick === 'IAP') {
+    return { ok: false, reason: 'the board read IAP at the Start click but the journal has no "is still in its bootloader (IAP)" line: the port was not skipped or the script said nothing' };
+  }
+  return { ok: true, skippedIap: false, detail: `the port was ${portAtClick || 'not on the bus'} at the click: nothing to skip, no "Unknown board"` };
+};
+
+
 const createUsbRig = ({ ssh, markerPath, healthPath = null, fsImpl = fs, waitUntil = null }) => {
   // Where the board really is, and proof that it is the board. Throws, writes nothing.
   const inspect = async (tty, expectSerial = null) => {
@@ -478,9 +602,39 @@ const createUsbRig = ({ ssh, markerPath, healthPath = null, fsImpl = fs, waitUnt
     await ssh(`sudo -n udevadm trigger --action=add --settle /sys/class/tty/${tty}`, { timeoutMs: 60000 });
     return port.tty;
   };
+
+  // Put the (free) board into its bootloader: the same reset miner_stop.sh does. Only
+  // with the miner not active, on the chosen board; writes the health file first, so
+  // the round's restore checks the board is back to SLV even if the journey dies.
+  // Throws an Error with .skip=true when the helper itself failed or timed out.
+  const resetToIap = async (tty, expectSerial) => {
+    if (!expectSerial) throw new Error('resetToIap needs the board serial');
+    const minerState = (await ssh('systemctl show apollo-miner -p ActiveState --value || true')).trim();
+    if (['active', 'activating', 'reloading'].includes(minerState)) {
+      throw new Error(`refusing: apollo-miner is ${minerState}: the reset is only done on a free port — nothing written`);
+    }
+    // Any refusal here (not SLV, not the board, not bound) is a failed precondition.
+    await inspect(tty, expectSerial);
+    if (healthPath) fsImpl.writeFileSync(healthPath, JSON.stringify({ serial: expectSerial, since: Math.floor(Date.now() / 1000) }), { mode: 0o600 });
+    let out;
+    try {
+      out = await ssh(resetCommand(tty, { serial: expectSerial }), { timeoutMs: (RESET_TIMEOUT_S + 15) * 1000 });
+    } catch (err) {
+      const c = classifyResetError(err);
+      const e = new Error(c.reason);
+      e.skip = c.skip;
+      throw e;
+    }
+    if (String(out).trim() !== 'reset') {
+      const e = new Error(`the reset answered "${String(out).trim()}"`);
+      e.skip = false;
+      throw e;
+    }
+    return true;
+  };
   const replug = () => replugFromMarker({ ssh, markerPath, healthPath, fsImpl, waitUntil });
   const isUnplugged = () => readMarker(fsImpl, markerPath) !== null;
-  return { inspect, unplug, reemit, replug, isUnplugged };
+  return { inspect, unplug, reemit, replug, isUnplugged, resetToIap };
 };
 
 // ------------------------------------------------------------ API, device
@@ -583,4 +737,13 @@ module.exports = {
   activeUnitNames,
   hashboardsBadge,
   isTransient,
+  resetCommand,
+  classifyResetError,
+  boardMatching,
+  isBooting,
+  classifyBootWait,
+  startingCount,
+  collapseSequence,
+  pendingNeverOffline,
+  judgeBootJournal,
 };

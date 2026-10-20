@@ -668,3 +668,210 @@ test('the journey never emits a deauthorize anywhere: no builder in usb.js produ
   assert.doesNotMatch(src, /echo 0 \|/);
   assert.doesNotMatch(spec, /authorizeCommand|echo 0/);
 });
+
+// ------------------------------------------------------------------ booting (IAP)
+
+const { execFileSync, spawnSync } = require('child_process');
+
+test('resetCommand: only a ttyACM port, quoted, the helper under timeout, and it parses', () => {
+  const cmd = U.resetCommand('ttyACM1', { serial: 'S1' });
+  assert.match(cmd, /t='ttyACM1'/);
+  assert.match(cmd, /timeout 20 sudo -n \.\/apollo-helper -s "\/dev\/\$t" -r/);
+  assert.match(cmd, /sn" = 'S1'/);
+  for (const bad of ['ttyS1', '../ttyACM0', 'ttyACM1; reboot', '/dev/ttyACM0', '', null]) {
+    assert.throws(() => U.resetCommand(bad), /not a ttyACM port/);
+  }
+  execFileSync('bash', ['-n', '-c', cmd]);
+  try { execFileSync('dash', ['-n', '-c', cmd]); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+});
+
+test('resetCommand run for real: refused on an active miner and on a port that is not a board, writes nothing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usb-rst-'));
+  const stub = (state) => {
+    const f = path.join(dir, 'systemctl');
+    fs.writeFileSync(f, `#!/bin/sh\necho ${state}\n`, { mode: 0o755 });
+  };
+  const run = (cmd) => spawnSync('bash', ['-c', cmd], { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` }, encoding: 'utf8' });
+  const cmd = U.resetCommand('ttyACM9', { serial: 'S1' });
+  for (const s of ['active', 'activating']) {
+    stub(s);
+    const r = run(cmd);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, new RegExp(`refused: apollo-miner is ${s}`));
+  }
+  // Free miner, but /sys/class/tty/ttyACM9 is no board (nothing there): the parent check refuses.
+  stub('inactive');
+  const r = run(cmd);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /refused: the parent of ttyACM9 is :, not 0483:5740/);
+  assert.doesNotMatch(r.stdout, /reset/);
+});
+
+test('classifyResetError: a refusing guard fails, a helper that failed or timed out skips', () => {
+  assert.deepEqual(U.classifyResetError({ stderr: 'refused: apollo-miner is active: the reset is only done on a free port\n' }),
+    { skip: false, reason: 'refused: apollo-miner is active: the reset is only done on a free port' });
+  const failed = U.classifyResetError({ message: 'Command failed', stderr: 'apollo-helper failed (exit 124) on /dev/ttyACM0\n' });
+  assert.equal(failed.skip, true);
+  assert.match(failed.reason, /did not reach the bootloader.*apollo-helper failed/);
+  // A stranger (ssh down) is neither: it fails, it does not hide behind a skip.
+  assert.equal(U.classifyResetError(new Error('Permission denied (publickey)')).skip, false);
+});
+
+const bootRig = ({ minerState = 'inactive', out = 'reset', helperErr = null } = {}) => {
+  const log = [];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usb-rig-'));
+  const healthPath = path.join(dir, 'usb.health');
+  const ssh = async (cmd) => {
+    log.push(cmd);
+    if (/apollo-helper/.test(cmd)) { if (helperErr) throw helperErr; return `${out}\n`; }
+    if (/systemctl show apollo-miner/.test(cmd) && !/ttyACM/.test(cmd)) return `${minerState}\n`;
+    if (/^readlink -f \/sys\/class\/tty\/ttyACM0\/device/.test(cmd)) return `${IFACE}\n`;
+    if (/idVendor/.test(cmd)) return '0483\n5740\n';
+    if (/\/product/.test(cmd)) return 'BCO SLV #S1\n';
+    if (/\/serial/.test(cmd)) return 'S1\n';
+    if (/^test -e/.test(cmd)) return 'yes\n';
+    return '';
+  };
+  return { rig: U.createUsbRig({ ssh, markerPath: path.join(dir, 'm'), healthPath }), log, healthPath };
+};
+
+test('resetToIap: runs the helper once on a free port and leaves the health file for the restore', async () => {
+  const { rig, log, healthPath } = bootRig();
+  assert.equal(await rig.resetToIap('ttyACM0', 'S1'), true);
+  assert.equal(log.filter((c) => /apollo-helper/.test(c)).length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(healthPath, 'utf8')).serial, 'S1');
+  assert.equal(rig.isUnplugged(), false, 'a reset is not an unbind: no marker');
+});
+
+test('resetToIap: nothing is written with the miner running, or without the serial', async () => {
+  for (const minerState of ['active', 'activating']) {
+    const { rig, log, healthPath } = bootRig({ minerState });
+    await assert.rejects(rig.resetToIap('ttyACM0', 'S1'), /apollo-miner is/);
+    assert.equal(log.filter((c) => /apollo-helper/.test(c)).length, 0);
+    assert.equal(fs.existsSync(healthPath), false);
+  }
+  await assert.rejects(bootRig().rig.resetToIap('ttyACM0', null), /needs the board serial/);
+});
+
+test('resetToIap: a helper that fails or times out carries skip=true; a wrong answer does not', async () => {
+  const e = Object.assign(new Error('Command failed'), { stderr: 'apollo-helper failed (exit 124) on /dev/ttyACM0' });
+  await assert.rejects(bootRig({ helperErr: e }).rig.resetToIap('ttyACM0', 'S1'), (err) => err.skip === true && /bootloader/.test(err.message));
+  await assert.rejects(bootRig({ out: 'weird' }).rig.resetToIap('ttyACM0', 'S1'), (err) => err.skip === false && /answered "weird"/.test(err.message));
+});
+
+test('classifyBootWait: skip only when neither the bus nor the registry showed the bootloader', () => {
+  assert.equal(U.classifyBootWait({ sawBooting: true, sawIap: true }).verdict, 'proceed');
+  assert.equal(U.classifyBootWait({ sawBooting: true }).verdict, 'proceed');
+  const skip = U.classifyBootWait({ waitedMs: 10000 });
+  assert.equal(skip.verdict, 'skip');
+  assert.match(skip.reason, /reset did not reach the bootloader.*within 10 s/);
+  // IAP on the bus and a registry that does not notice is the product's defect.
+  const fail = U.classifyBootWait({ sawIap: true, waitedMs: 10000 });
+  assert.equal(fail.verdict, 'fail');
+  assert.match(fail.reason, /read IAP.*never said booting/);
+});
+
+test('boardMatching and isBooting read the registry payload: by id or serial, USB only', () => {
+  const boards = [
+    { id: 'int', kind: 'internal', serial: null, status: 'active' },
+    { id: 'u1', kind: 'usb', serial: 'S1', status: 'booting' },
+    { id: 'u2', kind: 'usb', serial: 'S2', status: 'active' },
+  ];
+  assert.equal(U.boardMatching(boards, { id: 'u1' }).serial, 'S1');
+  // The id changed while it re-enumerated: the serial finds it.
+  assert.equal(U.boardMatching(boards, { id: 'old', serial: 's1' }).id, 'u1');
+  assert.equal(U.boardMatching(boards, { id: 'int' }), null);
+  assert.equal(U.boardMatching(boards, { id: 'nope', serial: 'nope' }), null);
+  assert.equal(U.boardMatching(boards, {}), null);
+  assert.equal(U.isBooting(boards[1]), true);
+  for (const b of [boards[2], { status: 'stuck' }, { status: 'disconnected' }, null]) assert.equal(U.isBooting(b), false);
+});
+
+test('startingCount reads the tooltip', () => {
+  assert.equal(U.startingCount('2 USB miners connected, 1 starting'), 1);
+  assert.equal(U.startingCount('0 USB miners connected, 1 starting'), 1);
+  assert.equal(U.startingCount('1 USB miner connected'), null);
+  assert.equal(U.startingCount('2 USB miners disconnected'), null);
+  assert.equal(U.startingCount(''), null);
+});
+
+const S = (...xs) => xs.map(([t, status, board]) => ({ t, status, board }));
+
+test('collapseSequence', () => {
+  assert.equal(U.collapseSequence(['offline', 'offline', 'pending', 'pending', 'pending', 'online']), 'offline×2 → pending×3 → online×1');
+  assert.equal(U.collapseSequence([]), '');
+});
+
+test('pendingNeverOffline: pending all the way until the board is active passes and proves it', () => {
+  const r = U.pendingNeverOffline(S([100, 'offline', 'booting'], [1100, 'pending', 'booting'], [2100, 'pending', 'booting'], [3100, 'pending', 'booting'], [4100, 'online', 'active']));
+  assert.equal(r.ok, true);
+  assert.equal(r.proved, true);
+  assert.equal(r.graceOffline, 1);
+  assert.equal(r.sequence, 'offline×1 → pending×3 → online×1');
+});
+
+test('pendingNeverOffline: an offline after the grace fails, whatever came before and after', () => {
+  const r = U.pendingNeverOffline(S([100, 'pending', 'booting'], [2600, 'pending', 'booting'], [3600, 'offline', 'booting'], [4600, 'pending', 'booting'], [5600, 'online', 'active']));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /offline 3\.6 s after the Start click while the board was booting/);
+  // Mutation of the rule: the grace is the only thing that excuses an offline.
+  assert.equal(U.pendingNeverOffline(S([500, 'offline', 'booting'], [1500, 'pending', 'booting'], [2500, 'pending', 'booting']), { graceMs: 0 }).ok, false);
+  assert.equal(U.pendingNeverOffline(S([500, 'offline', 'booting'], [2500, 'pending', 'booting'])).ok, true);
+});
+
+test('pendingNeverOffline: offline in the sample that reads the board active, or after it, is not judged', () => {
+  const r = U.pendingNeverOffline(S([2100, 'pending', 'booting'], [3100, 'pending', 'booting'], [4100, 'offline', 'active'], [5100, 'offline', 'active']));
+  assert.equal(r.ok, true);
+  assert.equal(r.proved, true);
+});
+
+test('pendingNeverOffline: never pending while booting fails; a missed window proves nothing', () => {
+  const never = U.pendingNeverOffline(S([2100, 'unknown', 'booting'], [3100, 'unknown', 'booting'], [4100, 'online', 'active']));
+  assert.equal(never.ok, false);
+  assert.match(never.reason, /never pending while the board booted/);
+  // The board was already active at the first sample, or the samples are empty: not a pass, not proved.
+  for (const samples of [S([100, 'online', 'active']), S([3000, 'online', 'active']), []]) {
+    const r = U.pendingNeverOffline(samples);
+    assert.equal(r.ok, true);
+    assert.equal(r.proved, false);
+    assert.match(r.reason, /window was missed/);
+  }
+  // Booting only inside the grace is also nothing judged.
+  assert.equal(U.pendingNeverOffline(S([100, 'pending', 'booting'], [1100, 'pending', 'booting'], [3100, 'online', 'active'])).proved, false);
+});
+
+test('pendingNeverOffline: a board that never turns active keeps being judged to the end', () => {
+  const r = U.pendingNeverOffline(S([2100, 'pending', 'booting'], [30000, 'pending', 'stuck'], [61000, 'offline', 'stuck']));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /while the board was stuck/);
+});
+
+test('judgeBootJournal: the skipped IAP line passes, an Unknown board fails, silence on an IAP port fails', () => {
+  const skipped = '2026-10-20T10:00:01 miner_start.sh: /dev/ttyACM0 is still in its bootloader (IAP): the SLV hotplug starts it\n2026-10-20T10:00:40 Started apollo-usb-miner@ttyACM0.service';
+  const ok = U.judgeBootJournal(skipped, { portAtClick: 'IAP' });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.skippedIap, true);
+  const unknown = U.judgeBootJournal(`${skipped}\nusb_miner_run.sh: unknown USB board on /dev/ttyACM0\nMain process exited, code=exited, status=64/n/a`, { portAtClick: 'IAP' });
+  assert.equal(unknown.ok, false);
+  assert.match(unknown.reason, /unknown board/i);
+  assert.equal(U.judgeBootJournal('apollo-helper: Unknown board', { portAtClick: null }).ok, false);
+  // IAP at the click and no word about it: the port was not skipped.
+  const quiet = U.judgeBootJournal('Started apollo-miner.service', { portAtClick: 'IAP' });
+  assert.equal(quiet.ok, false);
+  assert.match(quiet.reason, /no "is still in its bootloader/);
+  // The port was not on the bus yet (or already SLV): nothing to skip, nothing wrong.
+  for (const p of [null, 'SLV']) {
+    const r = U.judgeBootJournal('Started apollo-miner.service', { portAtClick: p });
+    assert.equal(r.ok, true);
+    assert.equal(r.skippedIap, false);
+  }
+  // exit 65 is the clean "still in IAP" end, not an unknown board.
+  assert.equal(U.judgeBootJournal('Main process exited, code=exited, status=65/n/a\nis still in its bootloader (IAP)', { portAtClick: 'IAP' }).ok, true);
+});
+
+test('the spec wires the booting part: reset helper, sampling, journal check, no authorized write', () => {
+  const spec = fs.readFileSync(path.join(__dirname, '..', 'journeys', 'specs', '13-usb-miner.spec.js'), 'utf8');
+  for (const needle of ['rig.resetToIap', 'U.classifyBootWait', 'U.pendingNeverOffline', 'U.judgeBootJournal', 'bootStartSequence', 'usb-miners-indicator', 'chakra-spinner']) {
+    assert.ok(spec.includes(needle), `the spec does not use ${needle}`);
+  }
+});

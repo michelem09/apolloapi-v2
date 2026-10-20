@@ -44,13 +44,33 @@ const U = require('../usb');
 // a udev add event re-emitted while stopped: it does NOT start, Start from the UI: it mines;
 // 5 (--with usb-expiry) 15 minutes unplugged: the board disappears and a Solo Node
 // UI goes back to solo-only without a reload.
+//
+// Booting (Solo Node only, after step 4b, before 5): the miner is stopped and the board
+// put into its bootloader on purpose, with `apollo-helper -s <port> -r` over ssh (what
+// miner_stop.sh does; sudo -n, the chosen board only, never the hub, only with
+// apollo-miner not active). 6a the registry says `booting` within ~10 s; 6b the UI shows
+// a spinner in the indicator, "n starting" in its tooltip, and Start is enabled; 6c Start
+// pressed while it still boots: the miner status is sampled every ~1 s and must read
+// `pending`, never `offline`, until the board is active (the sequence goes in the report);
+// the journal shows miner_start.sh skipped the IAP port (or the port was not there yet)
+// and no instance hit "Unknown board"; 6d active within ~60 s, mining within ~60 s more,
+// one process on the port. SKIPPED (a finding, the rest of the journey goes on) when the
+// reset did not reach the bootloader: the helper failed or timed out, or neither the bus
+// nor the registry ever showed IAP/booting. FAILS when the bus reads IAP and the registry
+// never says booting, and on any broken expectation after that. The miner is started
+// again if the part was skipped, so step 5 finds it running; the round stops it at the end.
 
 const BOARDS = `{ Miner { boards { result {
   boards { id serial kind port status mining since expiresAt }
   hasMiner hasUsbMiners usbCount usbActiveCount deviceFamily
 } error { message } } } }`;
 
+const SERVICE = `{ Services { stats(input: { serviceName: "apollo-miner" }) {
+  result { data { serviceName status requestedStatus } } error { message }
+} } }`;
+
 const MS = 1000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
   if (j.local) j.skip('needs a device: sysfs, systemd and the process list are the evidence');
@@ -467,6 +487,171 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
     });
     await j.verify('it still ends up mining within 90 s (a failure here is a product defect)', () =>
       mustMine(quickEpoch, 90 * MS, 'Stop then quick Start'));
+
+
+    // ---------------------------------------------------------------- 6: booting
+    // The board in its bootloader (IAP) for ~30 s after a reset. Solo Node only: its
+    // miner status rule ("pending, never offline, while a board boots") is the Solo
+    // Node's; an Apollo II would start its internal board anyway.
+    let bootSkip = null;
+    if (!solo) {
+      bootSkip = 'the booting part is Solo Node only (the pending-never-offline rule is the Solo Node monitor\'s)';
+    } else {
+      const minerStatus = async () => {
+        const out = (await j.gql(SERVICE)).Services.stats;
+        j.must(!out.error, `Services.stats: ${out.error?.message}`);
+        const rows = out.result?.data || [];
+        return (rows.find((r) => r.serviceName === 'apollo-miner') || rows[0] || {}).status ?? null;
+      };
+      const boardNow = async () => U.boardMatching((await readBoards()).boards, { id: boardId, serial });
+      const isOn = async (loc) => (await loc.isEnabled()) && (await loc.getAttribute('aria-disabled')) !== 'true';
+      // Start is the plain button, or the item of the Options menu (left open for the caller).
+      const startControl = async () => {
+        const direct = btn('Start');
+        if ((await direct.count()) && (await direct.first().isVisible())) return { loc: direct.first(), via: 'button' };
+        const opts = j.page.locator('button[aria-label="Options"]:visible').first();
+        if (await opts.count()) {
+          await opts.click();
+          const item = j.page.getByRole('menuitem', { name: /^Start$/ });
+          await item.waitFor({ state: 'visible', timeout: 5000 });
+          return { loc: item, via: 'Options menu' };
+        }
+        return null;
+      };
+
+      // ---- the board is stopped and settled (SLV), alone
+      let bootStopAt = 0;
+      await j.step('Stop from the UI (the board is about to be put in its bootloader)', async () => {
+        bootStopAt = Date.now();
+        await btn('Stop').click();
+      });
+      await j.verify('the instance and the miner stop', async () => {
+        const r = await j.waitUntil(async () => { const x = await running(); return x.units.length === 0 && x.procs.length === 0; },
+          { timeoutMs: 60 * MS, everyMs: 2000 });
+        j.must(r.ok, `after Stop: ${JSON.stringify((await running()).units)} still active`);
+        const m = await j.waitUntil(async () => ['inactive', 'failed'].includes(await minerUnit()), { timeoutMs: 120 * MS, everyMs: 3000 });
+        j.must(m.ok, `apollo-miner is ${await minerUnit()} after Stop`);
+      });
+      await j.verify('the board finished the reset the stop caused (SLV, stable)', () => settled(bootStopAt, 35 * MS));
+      await j.verify('precondition: miner stopped, exactly one USB board active', async () => {
+        const n = await activeUsbCount();
+        if (n !== 1) { bootSkip = `needs exactly one active USB board, the API lists ${n}`; return bootSkip; }
+        return describe(await boardNow());
+      });
+
+      // ---- the reset
+      let resetAt = 0;
+      let bootEpoch = 0;
+      if (!bootSkip) {
+        await j.verify('reset the board into its bootloader: apollo-helper -r on a free port', async () => {
+          await refreshTty();
+          try {
+            await rig.resetToIap(tty, serial);
+          } catch (err) {
+            if (err.skip) { bootSkip = err.message; return `SKIPPED: ${err.message}`; }
+            throw err;
+          }
+          resetAt = Date.now();
+          return `/dev/${tty} reset`;
+        });
+      }
+      if (!bootSkip) {
+        await j.verify('the registry says booting within ~10 s of the reset', async () => {
+          let sawIap = false;
+          let sawBooting = false;
+          let polls = 0;
+          const r = await j.waitUntil(async () => {
+            polls += 1;
+            try {
+              const [b, p] = await Promise.all([boardNow(), readPort().catch(() => null)]);
+              if (p && p.state === 'IAP') sawIap = true;
+              if (U.isBooting(b)) sawBooting = true;
+            } catch (err) { if (!U.isTransient(err)) throw err; }
+            return sawBooting;
+          }, { timeoutMs: 10 * MS, everyMs: 500 });
+          const c = U.classifyBootWait({ sawIap, sawBooting, waitedMs: Date.now() - resetAt });
+          if (c.verdict === 'skip') { bootSkip = c.reason; return `SKIPPED: ${c.reason}`; }
+          j.must(c.verdict === 'proceed', c.reason);
+          return `booting after ${Math.round((Date.now() - resetAt) / MS)} s (${polls} polls, bus ${sawIap ? 'read IAP' : 'did not read IAP'})`;
+        });
+      }
+
+      // ---- the UI while it boots (the IAP window is ~30 s: no screenshots in between)
+      if (!bootSkip) {
+        await j.step('UI while booting: spinner in the indicator, "starting" in the tooltip, Start enabled', async () => {
+          await waitUi('the spinner in the USB indicator', async () => (await indicator().locator('.chakra-spinner').count()) > 0, 15 * MS);
+          const tip = await tooltip();
+          j.must(/starting/i.test(tip) && (U.startingCount(tip) ?? 0) >= 1, `the tooltip does not say a board is starting: ${JSON.stringify(tip)}`);
+          const ctl = await startControl();
+          j.must(!!ctl, 'no Start control on the page (neither the button nor the Options menu)');
+          j.must(await isOn(ctl.loc), `Start (${ctl.via}) is disabled while a board boots`);
+          if (ctl.via !== 'button') await j.page.keyboard.press('Escape');
+          j.note('bootingStartControl', ctl.via);
+        });
+      }
+
+      // ---- Start while it boots
+      const samples = [];
+      let portAtClick;
+      let clickAt = 0;
+      if (!bootSkip) {
+        await j.step('press Start in the UI while the board is still booting', async () => {
+          bootEpoch = Number(await j.ssh('date +%s')) - 1;
+          const ctl = await startControl();
+          j.must(!!ctl, 'no Start control on the page');
+          clickAt = Date.now();
+          await ctl.loc.click({ timeout: 5000 });
+        });
+        await j.verify('the miner reads pending, never offline, from the click until the board is active', async () => {
+          let next = clickAt;
+          for (;;) {
+            const t = Date.now() - clickAt;
+            let status = null;
+            let b = null;
+            try {
+              [status, b] = await Promise.all([minerStatus(), boardNow()]);
+            } catch (err) { if (!U.isTransient(err)) throw err; }
+            samples.push({ t, status, board: b ? b.status : null });
+            if (portAtClick === undefined) portAtClick = (await readPort().catch(() => null))?.state ?? null;
+            if ((b && b.status === 'active') || t > 60 * MS) break;
+            next += MS;
+            await sleep(Math.max(0, next - Date.now()));
+          }
+          const r = U.pendingNeverOffline(samples);
+          j.note('bootStartSequence', r.sequence);
+          j.note('bootStartSamples', samples.length);
+          j.must(r.ok, r.reason);
+          const last = samples[samples.length - 1];
+          j.must(last.board === 'active', `the board was ${last.board} 60 s after the Start click (sequence: ${r.sequence})`);
+          if (!r.proved) j.finding(`booting: ${r.reason}: nothing proved about pending/offline`);
+          if (r.graceOffline) j.finding(`booting: the miner read offline in the first 2 s after the click (${r.graceOffline} sample(s)): the stopped state before the monitor ticked`);
+          return `${r.sequence}; ${samples.length} samples, board active ${Math.round(last.t / MS)} s after the click${r.proved ? '' : ' (window missed, not proved)'}`;
+        });
+        await j.verify('journal: miner_start.sh skipped the IAP port (or it was not there yet), no "Unknown board"', async () => {
+          const r = U.judgeBootJournal(await j.ssh(U.journalCommand(bootEpoch)), { portAtClick });
+          j.must(r.ok, r.reason);
+          return `${r.detail} (sysfs at the click: ${portAtClick || 'not on the bus'})`;
+        });
+        await j.verify('the board mines within 60 s of being active: one process on its port', async () => {
+          const msg = await mustMine(bootEpoch, 60 * MS, 'after the Start during boot');
+          const onPort = await usbProcs();
+          j.must(onPort.length === 1, `${onPort.length} futurebit-miner process(es) on /dev/${tty}, expected 1`);
+          return msg;
+        });
+      }
+    }
+
+    if (bootSkip) {
+      j.note('bootingSkipped', bootSkip);
+      j.finding(`booting part SKIPPED, proved nothing: ${bootSkip}`);
+      // Step 5 needs the miner running; the stop above (if it ran) left it off.
+      if (solo && (await minerUnit()) !== 'active') {
+        await j.step('start the miner again (the booting part was skipped)', async () => {
+          await j.gqlWrite('mutation { Miner { start { error { message } } } }');
+        });
+        await j.verify('the board mines again', () => mustMine(Math.floor(Date.now() / MS) - 5, 150 * MS, 'after the skipped booting part'));
+      }
+    }
 
     // ---------------------------------------------------------------- 5: expiry
     if (longStep) {
