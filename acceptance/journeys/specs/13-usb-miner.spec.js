@@ -65,9 +65,8 @@ const BOARDS = `{ Miner { boards { result {
   hasMiner hasUsbMiners usbCount usbActiveCount deviceFamily
 } error { message } } } }`;
 
-const SERVICE = `{ Services { stats(input: { serviceName: "apollo-miner" }) {
-  result { data { serviceName status requestedStatus } } error { message }
-} } }`;
+// The API names the miner service `miner`, not its unit name (journey 12 learnt it).
+const SERVICE = '{ Services { stats { result { data { serviceName status requestedStatus } } error { message } } } }';
 
 const MS = 1000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -501,7 +500,7 @@ test('usb-miner: unplug and replug a USB hashboard', async ({ j }) => {
         const out = (await j.gql(SERVICE)).Services.stats;
         j.must(!out.error, `Services.stats: ${out.error?.message}`);
         const rows = out.result?.data || [];
-        return (rows.find((r) => r.serviceName === 'apollo-miner') || rows[0] || {}).status ?? null;
+        return rows.find((r) => r.serviceName === 'miner')?.status ?? null;
       };
       const boardNow = async () => U.boardMatching((await readBoards()).boards, { id: boardId, serial });
       const isOn = async (loc) => (await loc.isEnabled()) && (await loc.getAttribute('aria-disabled')) !== 'true';
