@@ -37,6 +37,16 @@ describe.each(INSTALL_PATHS)('%s', (file) => {
   });
 });
 
+describe('update_system', () => {
+  // update_system on this line has no `set -e`: the `|| true` is kept as a guard for
+  // when one is added (the v2.2 script has set -Eeuo pipefail + ERR trap), not a fix.
+  it('never lets a failing udevadm reload abort the update', () => {
+    const reloads = code('update_system').filter((l) => /udevadm control --reload-rules/.test(l));
+    expect(reloads.length).toBeGreaterThan(0);
+    for (const l of reloads) expect(l).toMatch(/\|\|\s*true\s*$/);
+  });
+});
+
 describe('uninstall-v2', () => {
   const lines = code('uninstall-v2');
   it('removes the unit and the rule, then reloads udev', () => {

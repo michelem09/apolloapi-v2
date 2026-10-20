@@ -148,7 +148,7 @@ bash $APOLLO_DIR/backend/utils/install-journald.sh
 
 echo -e "${YELLOW} ---> Reloading systemd${NC}"
 systemctl daemon-reload
-udevadm control --reload-rules
+udevadm control --reload-rules || true
 
 echo -e "${YELLOW} ---> Rebooting${NC}"
 

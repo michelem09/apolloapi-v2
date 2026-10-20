@@ -4,6 +4,8 @@ const moment = require('moment');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
+const os = require('os');
+const { performance } = require('perf_hooks');
 const pubsub = require('../graphql/pubsub');
 const TOPICS = require('../graphql/topics');
 const { getMinerBoards } = require('../minerBoards');
@@ -12,6 +14,12 @@ const execAsync = promisify(exec);
 
 // Past this, a unit that keeps restarting without ever staying up is an error.
 const AUTO_RESTART_ERROR_AFTER_MS = 90000;
+// Solo Node: a board active but not mining this long (counted from the later of unit
+// active-since and board active-since) is idle, not starting. Normal start: 18-21 s.
+// The rule also needs the monitor itself to have seen no board mining for this long
+// (see soloNotMiningSince): a board that mined for an hour and has one stale stat
+// file tick is not idle.
+const SOLO_IDLE_BOARDS_GRACE_MS = 90000;
 
 class ServiceMonitor {
   constructor(knex, services) {
@@ -19,6 +27,10 @@ class ServiceMonitor {
     this.services = services || {};
     this.monitoring = false;
     this.interval = null;
+    // Monotonic ms (performance.now) since the monitor first saw active USB boards
+    // with none mining, null while any board mines or the state differs. In memory
+    // only: an API restart starts the count again (pending for up to 90 s).
+    this.soloNotMiningSince = null;
     this.config = this.loadConfig();
     this.checkInterval = this.config.checkInterval || 10000; // 10 seconds default
     this.systemdServices = this.config.services || [
@@ -272,6 +284,10 @@ class ServiceMonitor {
       // here so the answer is not older than this tick.
       let soloNodeNoBoards = false;
       let soloNodeBooting = false;
+      // Boards that are `active` (running the miner firmware) while none of them
+      // mines: the instance may not have started (unknown board, unit or udev rule
+      // missing at plug time). Holds the ms since the later of their `since`.
+      let soloNodeIdleBoardsSince = null;
       if (serviceName === 'apollo-miner') {
         try {
           const registry = getMinerBoards();
@@ -284,6 +300,21 @@ class ServiceMonitor {
           // is allowed meanwhile: the miner reads as starting (pending), not offline.
           // `stuck` (IAP over 2 min) is not booting, so it stays offline.
           soloNodeBooting = soloNodeNoBoards && (snap.usbBootingCount || 0) > 0;
+          const activeUsb = (snap.boards || []).filter((b) => b.kind === 'usb' && b.status === 'active');
+          if (
+            snap.deviceFamily === 'solo-node' &&
+            !soloNodeNoBoards &&
+            (snap.usbBootingCount || 0) === 0 &&
+            activeUsb.length > 0 &&
+            activeUsb.every((b) => !b.mining)
+          ) {
+            const sinces = activeUsb.map((b) => Date.parse(b.since)).filter(Number.isFinite);
+            soloNodeIdleBoardsSince = sinces.length ? Math.max(...sinces) : null;
+            if (this.soloNotMiningSince === null) this.soloNotMiningSince = performance.now();
+          } else {
+            // Any board mining (or no active board at all): the not-mining count restarts.
+            this.soloNotMiningSince = null;
+          }
         } catch (error) {
           console.log(`Board registry unavailable for ${serviceName}: ${error.message}`);
         }
@@ -304,6 +335,29 @@ class ServiceMonitor {
         } else {
           // For other exit codes, try to get status from stdout if available
           status = error.stdout ? error.stdout.trim() : 'unknown';
+        }
+      }
+
+      // THE idle-boards rule's clock: how long the unit has been `active`, from
+      // systemd's monotonic stamp against the boot clock. Unknown (not a number,
+      // not active, no systemd): the rule stays off and the miner reads pending.
+      let soloNodeIdleBoards = false;
+      if (soloNodeIdleBoardsSince !== null && status === 'active') {
+        try {
+          const { stdout } = await execAsync(
+            `systemctl show ${serviceName} --property=ActiveEnterTimestampMonotonic --value`
+          );
+          const enterUs = Number(String(stdout).trim());
+          if (Number.isFinite(enterUs) && enterUs > 0) {
+            const unitActiveForMs = os.uptime() * 1000 - enterUs / 1000;
+            const boardsForMs = Date.now() - soloNodeIdleBoardsSince;
+            const notMiningForMs =
+              this.soloNotMiningSince === null ? 0 : performance.now() - this.soloNotMiningSince;
+            soloNodeIdleBoards =
+              Math.min(unitActiveForMs, boardsForMs, notMiningForMs) > SOLO_IDLE_BOARDS_GRACE_MS;
+          }
+        } catch (error) {
+          // unknown clock: keep pending
         }
       }
 
@@ -510,6 +564,18 @@ class ServiceMonitor {
       // the request counts as arrived, and the UI settles on offline instead
       // of spinning. Auto-restart only fires on systemd `failed`, untouched.
       else if (soloNodeNoBoards && status === 'active' && applicationOnline !== 'online') {
+        finalStatus = 'offline';
+      }
+      // THE idle-boards rule (one place): Solo Node, unit active, at least one
+      // board running the miner firmware but none mining, and both the unit and
+      // the boards have been that way longer than SOLO_IDLE_BOARDS_GRACE_MS (the
+      // later of the two clocks anchors it; a normal start takes 18-21 s from
+      // active to mining, so inside the window it stays pending), and the monitor
+      // has not seen any board mining for that long either. Past it the miner reads
+      // offline: Stop/Restart stay disabled in the UI while offline, so it is Start
+      // that gets the way out (miner.start() restarts an active unit on a Solo
+      // Node). A fresh stat file (online) still wins.
+      else if (soloNodeIdleBoards && status === 'active' && applicationOnline !== 'online') {
         finalStatus = 'offline';
       }
       // Special handling for services with application check (miner, node)
