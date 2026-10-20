@@ -62,9 +62,10 @@ describe('apollo-miner on a Solo Node with a booting board', () => {
   it('booting + unit active: pending', async () => {
     expect(await poll('active', ['booting'])).toBe('pending');
   });
-  it('booting + unit activating: pending', async () => {
-    expect(await poll('activating', ['booting'])).toBe('pending');
-  });
+  // No "booting + unit activating" case on purpose: activating with the app offline
+  // is pending through the generic path, rule or no rule, so such a test cannot fail
+  // (checked by mutation: it stayed green with the booting rule removed). The rule
+  // only changes the outcome for `active`, which the case above pins.
   it('booting + unit inactive: offline', async () => {
     expect(await poll('inactive', ['booting'])).toBe('offline');
   });
