@@ -6,6 +6,7 @@ const {
   MinerBoards,
   DEBOUNCE_MS,
   EXPIRY_MS,
+  STUCK_MS,
 } = require('../src/minerBoards');
 
 const T0 = Date.parse('2026-10-19T10:00:00Z');
@@ -59,8 +60,10 @@ describe('deriveBoards classification', () => {
     ]);
   });
 
-  test('IAP (bootloader) ports are ignored; a missing product is not', () => {
-    expect(run({ ports: [port({ product: 'BCO IAP #1' })] }).boards).toEqual([]);
+  test('an IAP (bootloader) port is a booting board; a missing product is active', () => {
+    expect(run({ ports: [port({ product: 'BCO IAP #1' })] }).boards).toEqual([
+      expect.objectContaining({ id: SERIAL, kind: 'usb', status: 'booting', mining: false }),
+    ]);
     expect(run({ ports: [port({ product: null })] }).boards).toHaveLength(1);
     expect(run({ ports: [port({ product: 'Apollo RD6' })] }).boards).toHaveLength(1);
   });
@@ -229,12 +232,12 @@ describe('MinerBoards.refresh', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  const plug = () => {
+  const plug = (product = 'BCO SLV #1') => {
     // sysfs layout: <sys>/ttyACM0/device is the interface, serial/product on its parent
     const usbdev = path.join(dir, 'sys', 'usbdev');
     fs.mkdirSync(path.join(usbdev, 'if0'), { recursive: true });
     fs.writeFileSync(path.join(usbdev, 'serial'), `${SERIAL}\n`);
-    fs.writeFileSync(path.join(usbdev, 'product'), 'BCO SLV #1\n');
+    fs.writeFileSync(path.join(usbdev, 'product'), `${product}\n`);
     fs.writeFileSync(path.join(usbdev, 'idVendor'), '0483\n');
     fs.writeFileSync(path.join(usbdev, 'idProduct'), '5740\n');
     fs.mkdirSync(path.join(dir, 'sys', 'ttyACM0'));
@@ -305,6 +308,25 @@ describe('MinerBoards.refresh', () => {
     expect(seen).toEqual(['active/true', 'active/false', 'disconnected/false', '']);
   });
 
+  test('a board stuck in IAP is published by its own timer, with no other event', () => {
+    jest.useFakeTimers({ now: Date.now() });
+    try {
+      plug(`BCO IAP #${SERIAL}`);
+      const seen = [];
+      reg.onChange((s) => seen.push(s.boards.map((b) => b.status).join()));
+      reg.start();
+      expect(seen).toEqual(['booting']);
+      jest.advanceTimersByTime(STUCK_MS - 1000);
+      expect(seen).toEqual(['booting']);
+      jest.advanceTimersByTime(2000);
+      expect(seen).toEqual(['booting', 'stuck']);
+      expect(reg.snapshot()).toMatchObject({ usbCount: 1, usbActiveCount: 0, hasUsbMiners: true });
+    } finally {
+      reg.stop();
+      jest.useRealTimers();
+    }
+  });
+
   test('empty machine: no boards, settles, tolerant of missing dirs', async () => {
     fs.rmSync(path.join(dir, 'stats'), { recursive: true });
     fs.rmSync(path.join(dir, 'sys'), { recursive: true });
@@ -318,5 +340,76 @@ describe('MinerBoards.refresh', () => {
     expect(() => reg.start()).not.toThrow();
     reg.stop();
     reg.stop();
+  });
+});
+
+describe('deriveBoards booting / stuck', () => {
+  const iap = (over = {}) => port({ product: `BCO IAP #${SERIAL}`, ...over });
+  const slv = (over = {}) => port({ product: `BCO SLV #${SERIAL}`, ...over });
+  const step = (prev, at, args) => run({ ...args, memory: prev.memory, now: T0 + at });
+
+  test('IAP only, no stat file: booting, counted as attached but not active', () => {
+    const res = run({ ports: [iap()] });
+    expect(res.boards).toHaveLength(1);
+    expect(res.boards[0]).toMatchObject({ status: 'booting', since: new Date(T0).toISOString() });
+    const snap = require('../src/minerBoards').buildSnapshot(res.boards, 'solo-node');
+    expect(snap).toMatchObject({ hasUsbMiners: true, hasMiner: true, usbCount: 1, usbActiveCount: 0 });
+  });
+
+  test('IAP -> SLV: active with the same id, no disconnected in between', () => {
+    const r0 = run({ statEntries: [usbEntry()], ports: [iap()] });
+    expect(byId(r0, SERIAL).status).toBe('booting');
+    // the gap between the two enumerations: nothing listed for a moment
+    const r1 = step(r0, 30000, { statEntries: [usbEntry()], ports: [] });
+    expect(byId(r1, SERIAL).status).toBe('booting');
+    const r2 = step(r1, 30300, { statEntries: [usbEntry()], ports: [slv()] });
+    expect(r2.boards).toHaveLength(1);
+    expect(byId(r2, SERIAL).status).toBe('active');
+  });
+
+  test('IAP and SLV listed together: SLV wins', () => {
+    const res = run({ ports: [iap({ name: 'ttyACM0' }), slv({ name: 'ttyACM1' })] });
+    expect(res.boards).toHaveLength(1);
+    expect(res.boards[0]).toMatchObject({ status: 'active', port: '/dev/ttyACM1' });
+  });
+
+  test('IAP for more than 2 minutes: stuck, and the timer is scheduled at the boundary', () => {
+    const r0 = run({ ports: [iap()] });
+    expect(r0.nextExpiryAt).toBe(new Date(T0 + STUCK_MS).toISOString());
+    const before = step(r0, STUCK_MS - 1, { ports: [iap()] });
+    expect(byId(before, SERIAL).status).toBe('booting');
+    const after = step(r0, STUCK_MS, { ports: [iap()] });
+    expect(byId(after, SERIAL)).toMatchObject({ status: 'stuck', since: new Date(T0).toISOString() });
+    expect(after.nextExpiryAt).toBeNull();
+  });
+
+  test('stuck -> SLV: active again', () => {
+    const r0 = run({ ports: [iap()] });
+    const r1 = step(r0, STUCK_MS + 5000, { ports: [iap()] });
+    expect(byId(r1, SERIAL).status).toBe('stuck');
+    expect(byId(step(r1, STUCK_MS + 6000, { ports: [slv()] }), SERIAL).status).toBe('active');
+  });
+
+  test('the 2 minutes count from the IAP start, also across a stop (SLV -> IAP) cycle', () => {
+    const r0 = run({ ports: [slv()] });
+    const r1 = step(r0, 60000, { ports: [iap()] });
+    expect(byId(r1, SERIAL)).toMatchObject({ status: 'booting', since: new Date(T0 + 60000).toISOString() });
+    expect(byId(step(r1, 60000 + STUCK_MS - 1, { ports: [iap()] }), SERIAL).status).toBe('booting');
+  });
+
+  test('unplug while booting / stuck: disconnected after the debounce, then forgotten', () => {
+    for (const idle of [1000, STUCK_MS + 1000]) {
+      const r0 = run({ ports: [iap()] });
+      const r1 = step(r0, idle, { ports: [iap()] });
+      const r2 = step(r1, idle + 1000, { ports: [] });
+      expect(['booting', 'stuck']).toContain(byId(r2, SERIAL).status);
+      const r3 = step(r2, idle + 1000 + DEBOUNCE_MS, { ports: [] });
+      expect(byId(r3, SERIAL)).toMatchObject({ status: 'disconnected' });
+      // replugged later as IAP: the 2 minutes start again
+      const r4 = step(r3, idle + 60000, { ports: [iap()] });
+      expect(byId(r4, SERIAL)).toMatchObject({ status: 'booting' });
+      const r5 = step(r3, idle + 1000 + DEBOUNCE_MS + EXPIRY_MS, { ports: [] });
+      expect(r5.boards).toEqual([]);
+    }
   });
 });

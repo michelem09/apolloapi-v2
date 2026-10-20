@@ -120,15 +120,17 @@ async function fetchStatistics() {
     const { stats } = await services.miner.getStats();
     if (!stats || stats.length === 0) return;
 
-    // Disconnected boards are out of totals and time series: their stat file is
-    // stale, and counting it would keep hashrate the device no longer has.
-    const disconnected = new Set(
+    // Only active boards are in totals and time series. A disconnected or
+    // stuck board has a stale stat file, and a booting one (miner stopped, board
+    // in its bootloader) has none that is fresh: counting them would keep
+    // hashrate the device does not have.
+    const notActive = new Set(
       getMinerBoards()
         .snapshot()
-        .boards.filter((b) => b.status === 'disconnected')
+        .boards.filter((b) => b.status !== 'active')
         .map((b) => b.id)
     );
-    const liveStats = stats.filter((s) => !disconnected.has(s.uuid));
+    const liveStats = stats.filter((s) => !notActive.has(s.uuid));
     if (liveStats.length === 0) return;
 
     // Process data for each board
