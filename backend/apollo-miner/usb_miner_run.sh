@@ -2,10 +2,13 @@
 # Runs one USB hashboard in the foreground, as the main process of
 # apollo-usb-miner@<port>.service. Usage: usb_miner_run.sh /dev/ttyACMx
 #
-# Exit codes: 0 port gone, still in the bootloader (IAP) or already served by a
-# running miner (nothing to run),
-# 64 unknown board (the unit does not retry), anything else is the miner's/screen's
-# own status.
+# Exit codes: 0 port gone or already served by a running miner (nothing to run),
+# 64 unknown board (the unit does not retry, and ends failed),
+# 65 still in the bootloader (IAP): the unit does not retry and counts it as a
+#    clean end (SuccessExitStatus), so no failed unit is left behind. The SLV
+#    re-enumeration fires a udev add that starts a fresh instance, and a Start from
+#    the UI goes through miner_start.sh, which skips IAP ports: nothing to retry.
+# anything else is the miner's/screen's own status.
 
 # Paths and the settle time are overridable so tests/usb_miner_scripts.test.sh can
 # run the script for real.
@@ -36,10 +39,10 @@ usb_port_is_iap()
 }
 
 if usb_port_is_iap "$port"; then
-    # Exit 0, not 64: Restart=always retries after RestartSec, and the udev add of
-    # the SLV firmware starts a fresh instance anyway. Whichever comes first wins.
+    # 65, not 0: Restart=always would otherwise start this check again every
+    # RestartSec for as long as the board stays in IAP (a stuck one: forever).
     echo "$port is still in its bootloader (IAP)"
-    exit 0
+    exit 65
 fi
 
 # Another miner already drives this port: a rollback to an older miner_start.sh

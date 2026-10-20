@@ -24,6 +24,18 @@ const port = (over = {}) => ({ name: 'ttyACM0', serial: SERIAL, product: 'BCO SL
 const run = (args) => deriveBoards({ family: 'solo-node', statEntries: [], ports: [], memory: {}, now: T0, ...args });
 const byId = (res, id) => res.boards.find((b) => b.id === id);
 
+describe('IAP criterion (shared table with the udev rule and the scripts)', () => {
+  const rows = fs
+    .readFileSync(path.join(__dirname, 'fixtures', 'iap_product_cases.tsv'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => l.split('\t'));
+  test.each(rows)('"%s" is IAP: %s', (product, want) => {
+    const [b] = run({ ports: [port({ product })] }).boards;
+    expect(b.status).toBe(want === 'yes' ? 'booting' : 'active');
+  });
+});
+
 describe('deriveBoards classification', () => {
   test('v1 / v2 on ttyS1 are internal, ttyACM are usb, v3 internal', () => {
     const res = run({

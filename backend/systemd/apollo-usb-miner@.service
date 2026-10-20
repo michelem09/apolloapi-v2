@@ -35,8 +35,11 @@ WorkingDirectory=/opt/apolloapi/backend/apollo-miner
 ExecStart=/opt/apolloapi/backend/apollo-miner/usb_miner_run.sh /dev/%I
 Restart=always
 # screen exits 1 when systemd stops it with SIGTERM: a Stop is not a failure.
-SuccessExitStatus=1
+# 65: the board is still in its bootloader (IAP); a clean end, not a failed unit.
+SuccessExitStatus=1 65
 RestartSec=10s
 # 64: not a known board (an Apollo II still in its bootloader, a stranger on the
 # same VID:PID). Retrying would loop; the next add event starts a fresh attempt.
-RestartPreventExitStatus=64
+# 65: in the bootloader (IAP); the SLV re-enumeration fires that add event, and
+# miner_start.sh skips IAP ports, so there is nothing to retry.
+RestartPreventExitStatus=64 65

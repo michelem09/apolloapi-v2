@@ -123,6 +123,13 @@ check "no sysfs: ttyACM0 enqueued" 1 "$(grep -c '^systemctl start --no-block apo
 fakeusb ttyACM0 "BCO CAPITAL #1"
 fresh; APOLLO_SYS_TTY_DIR="$tmp/sys" APOLLO_USB_PORTS="$USBS" start
 check "product containing IAP letters inside a word: enqueued" 1 "$(grep -c 'apollo-usb-miner@ttyACM0' "$LOG")"
+# The shared criterion table: same cases as the udev rule, minerBoards.js and usb_miner_run.sh.
+while IFS=$'\t' read -r product want; do
+    fakeusb ttyACM0 "$product"
+    fresh; APOLLO_SYS_TTY_DIR="$tmp/sys" APOLLO_USB_PORTS="$USBS" start
+    if [ "$want" = yes ]; then n=0; else n=1; fi
+    check "criterion '$product' (IAP: $want): enqueued $n" "$n" "$(grep -c 'apollo-usb-miner@ttyACM0' "$LOG")"
+done < "$DIR/tests/fixtures/iap_product_cases.tsv"
 fakeusb ttyACM0 "BCO IAP #0000AA"
 
 # Unit file not installed (git deploy): the old way, in screen, same binary choice
