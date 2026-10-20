@@ -101,9 +101,12 @@ describe('apollo-miner on a Solo Node with active boards that are not mining', (
   let online;
   let enterMonoUs;
   let uptimeSpy;
+  let mono; // the monitor's monotonic clock (performance.now), ms
   const NOW = 1_000_000 * 1000;
   beforeEach(async () => {
     online = 'offline';
+    mono = 5000;
+    jest.spyOn(require('perf_hooks').performance, 'now').mockImplementation(() => mono);
     uptimeSpy = jest.spyOn(require('os'), 'uptime').mockReturnValue(100000); // s
     jest.spyOn(Date, 'now').mockReturnValue(NOW);
     monitor = monitorFactory(knex, { miner: { checkOnline: async () => ({ online: { status: online } }) } });
@@ -143,15 +146,56 @@ describe('apollo-miner on a Solo Node with active boards that are not mining', (
   it('board long up but the unit only just became active: still pending', async () => {
     expect(await poll({ unitS: 20, boardS: 3600 })).toBe('pending');
   });
-  it('both past the window and nothing mining: offline', async () => {
-    expect(await poll({ unitS: 120, boardS: 120 })).toBe('offline');
+  // The monitor must also have SEEN nothing mining for the window: the first tick
+  // only starts the count.
+  it('both past the window and nothing mining: offline once the monitor has seen it for 90 s', async () => {
+    expect(await poll({ unitS: 120, boardS: 120 })).toBe('pending');
+    mono += 91000;
+    expect(await poll({ unitS: 211, boardS: 211 })).toBe('offline');
+  });
+  it('continuous not-mining under 90 s on the monitor clock stays pending', async () => {
+    await poll({ unitS: 600, boardS: 600 });
+    mono += 80000;
+    expect(await poll({ unitS: 680, boardS: 680 })).toBe('pending');
+  });
+  it('a board that mined for an hour and has one stale tick stays pending, not offline', async () => {
+    online = 'online';
+    expect(await poll({ unitS: 3600, boardS: 3600, mining: true })).toBe('online');
+    mono += 3600000;
+    online = 'offline';
+    expect(await poll({ unitS: 7200, boardS: 7200, mining: false })).toBe('pending');
+    // ... and only continuous idleness past the window turns it offline
+    mono += 91000;
+    expect(await poll({ unitS: 7291, boardS: 7291, mining: false })).toBe('offline');
+  });
+  it('a mining tick in between restarts the count', async () => {
+    await poll({ unitS: 600, boardS: 600 });
+    mono += 80000;
+    await poll({ unitS: 680, boardS: 680, mining: true });
+    mono += 80000;
+    expect(await poll({ unitS: 760, boardS: 760 })).toBe('pending');
+  });
+  it('an API restart (fresh monitor memory) is pending again up to 90 s', async () => {
+    await poll({ unitS: 600, boardS: 600 });
+    mono += 91000;
+    expect(await poll({ unitS: 691, boardS: 691 })).toBe('offline');
+    monitor = monitorFactory(knex, { miner: { checkOnline: async () => ({ online: { status: online } }) } });
+    expect(await poll({ unitS: 700, boardS: 700 })).toBe('pending');
+  });
+  it('two idle boards with different since: the LATER one anchors (max, not min)', async () => {
+    const young = { status: 'active', since: new Date(NOW - 20000).toISOString() };
+    await poll({ unitS: 600, boardS: 600, extra: [young] });
+    mono += 91000;
+    expect(await poll({ unitS: 691, boardS: 691, extra: [young] })).toBe('pending');
   });
   it('a fresh stat file still wins: online', async () => {
     online = 'online';
     expect(await poll({ unitS: 600, boardS: 600, mining: true })).toBe('online');
   });
   it('a booting board next to an idle one keeps it pending', async () => {
-    expect(await poll({ unitS: 600, boardS: 600, extra: [{ status: 'booting' }] })).toBe('pending');
+    await poll({ unitS: 600, boardS: 600, extra: [{ status: 'booting' }] });
+    mono += 91000;
+    expect(await poll({ unitS: 691, boardS: 691, extra: [{ status: 'booting' }] })).toBe('pending');
   });
   it('unknown unit clock: the rule stays off (pending)', async () => {
     global.__show = () => 'n/a';
