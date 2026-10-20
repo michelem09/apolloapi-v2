@@ -271,6 +271,7 @@ class ServiceMonitor {
       // read as "starting" (pending) for good. Read from the registry, refreshed
       // here so the answer is not older than this tick.
       let soloNodeNoBoards = false;
+      let soloNodeBooting = false;
       if (serviceName === 'apollo-miner') {
         try {
           const registry = getMinerBoards();
@@ -279,6 +280,10 @@ class ServiceMonitor {
           // usbActiveCount: a booting or stuck board is attached but not mining yet,
           // so it still reads as "no boards" here (offline, not a perpetual pending).
           soloNodeNoBoards = snap.deviceFamily === 'solo-node' && snap.usbActiveCount === 0;
+          // A board still in its bootloader (IAP, < 2 min) is about to mine, and Start
+          // is allowed meanwhile: the miner reads as starting (pending), not offline.
+          // `stuck` (IAP over 2 min) is not booting, so it stays offline.
+          soloNodeBooting = soloNodeNoBoards && (snap.usbBootingCount || 0) > 0;
         } catch (error) {
           console.log(`Board registry unavailable for ${serviceName}: ${error.message}`);
         }
@@ -483,6 +488,19 @@ class ServiceMonitor {
       
       // If within grace period, keep as pending regardless of other checks
       if (isWithinGracePeriod) {
+        finalStatus = 'pending';
+      }
+      // THE booting rule (one place): Solo Node, no active board but at least one
+      // booting, unit up (active or activating) and no fresh stat file: pending.
+      // No timer of its own: it ends when the board turns active (normal path),
+      // stuck after 2 minutes (falls to the offline rule below), or disconnected.
+      // The request's grace window is irrelevant: it only widens pending, never
+      // turns it into an error.
+      else if (
+        soloNodeBooting &&
+        (status === 'active' || status === 'activating') &&
+        applicationOnline !== 'online'
+      ) {
         finalStatus = 'pending';
       }
       // Solo Node, no active USB board, unit up on the placeholder: there is

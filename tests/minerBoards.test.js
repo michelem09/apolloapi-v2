@@ -201,6 +201,9 @@ describe('snapshot flags per family', () => {
     expect(snapOf('solo-node', { ports: [port()] })).toMatchObject({ hasMiner: true, hasUsbMiners: true, usbCount: 1, usbActiveCount: 1 });
     const disc = snapOf('solo-node', { statEntries: [usbEntry({ mtimeMs: T0 - 60000 })] });
     expect(disc).toMatchObject({ hasMiner: true, usbCount: 1, usbActiveCount: 0 });
+    expect(disc.usbBootingCount).toBe(0);
+    const boot = snapOf('solo-node', { ports: [port({ product: 'BCO IAP #1' })] });
+    expect(boot).toMatchObject({ usbActiveCount: 0, usbBootingCount: 1 });
   });
 
   test('other families always have a miner', () => {

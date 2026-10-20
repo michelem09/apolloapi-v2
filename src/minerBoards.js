@@ -70,6 +70,8 @@ function buildSnapshot(boards, family) {
     // Only `active` boards count: booting, stuck and disconnected are attached
     // (hasUsbMiners / usbCount) but not mining.
     usbActiveCount: usb.filter((b) => b.status === 'active').length,
+    // Booting = in the bootloader (IAP), under 2 minutes: about to become a miner.
+    usbBootingCount: usb.filter((b) => b.status === 'booting').length,
     deviceFamily: family,
   };
 }

@@ -88,6 +88,25 @@ check "already running: no screen" 0 "$(grep -c '^screen' "$LOG")"
 check "already running: no probe" 0 "$(grep -c '^apollo-helper' "$LOG")"
 check "already running: pgrep matches -comport of this port" 1 "$(grep -Fc -- "-comport ${PORT}( |\$)" "$LOG")"
 
+# 3d. Board still in its bootloader (product "BCO IAP #..."): exit 0 without probing
+# or starting; the unit's Restart=always and the SLV hotplug take it from there.
+mkdir -p "$tmp/sys/ttyACM0" "$tmp/usbdev/if"
+ln -sfn "$tmp/usbdev/if" "$tmp/sys/ttyACM0/device"
+export APOLLO_SYS_TTY_DIR="$tmp/sys"
+printf 'BCO IAP #0000AA\n' > "$tmp/usbdev/product"
+rc=$(BOARD="Apollo-BTC" run)
+check "IAP: exit 0" 0 "$rc"
+check "IAP: no probe" 0 "$(grep -c '^apollo-helper' "$LOG")"
+check "IAP: no screen" 0 "$(grep -c '^screen' "$LOG")"
+printf 'BCO SLV #0000AA\n' > "$tmp/usbdev/product"
+rc=$(BOARD="Apollo-BTC" run)
+check "SLV: started" 1 "$(grep -c '^screen -D -m -S miner' "$LOG")"
+printf 'BCO IAP #0000AA\n' > "$tmp/usbdev/product"
+rm -rf "$tmp/sys"
+rc=$(BOARD="Apollo-BTC" run)
+check "no sysfs entry: not IAP, started" 1 "$(grep -c '^screen -D -m -S miner' "$LOG")"
+unset APOLLO_SYS_TTY_DIR
+
 # 4. Binary per board type; the session is named miner, in the foreground.
 for pair in "Apollo-BTC:./futurebit-miner" "RD6:./futurebit-miner" "Apollo-2:./futurebit-miner-v2"; do
     board="${pair%%:*}"; bin="${pair#*:}"
