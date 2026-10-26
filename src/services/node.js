@@ -815,6 +815,9 @@ class NodeService {
       
       // Common patterns for pool names
       const poolPatterns = [
+        // ckpool on an Apollo signs every block /FutureBit-<btcsig>/, and the
+        // signature is user-editable: match the fixed prefix, as mempool.space does.
+        { pattern: /FutureBit/i, name: 'FutureBit Apollo Solo', slug: 'futurebitapollosolo', id: 148 },
         { pattern: /Foundry\s+USA\s+Pool/i, name: 'Foundry USA', slug: 'foundryusa', id: 111 },
         { pattern: /F2Pool/i, name: 'F2Pool', slug: 'f2pool', id: 36 },
         { pattern: /Antpool/i, name: 'Antpool', slug: 'antpool', id: 37 },
